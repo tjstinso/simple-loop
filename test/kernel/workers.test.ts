@@ -7,6 +7,7 @@ import { readProcessStartTime } from '../../src/util/proc.js';
 import {
   isProcessAlive,
   killProcessGroup,
+  killProcessGroupNow,
   liveChildrenFor,
   markChildExited,
   reapOwnOrphans,
@@ -212,5 +213,23 @@ describe('workers', () => {
     expect(reapOwnOrphans(db, 'w1', NOW + 1)).toEqual([id]);
     expect(await waitUntil(() => !alive(grandchild))).toBe(true);
     expect(liveChildrenFor(db, jobId, 1)).toEqual([]);
+  });
+
+  it('killProcessGroupNow sends SIGKILL to the group and refuses unsafe pgids', () => {
+    const spy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const stat = readFileSync('/proc/self/stat', 'utf8');
+      const own = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[2]);
+      for (const bad of [0, 1, -5, Number.NaN, own]) killProcessGroupNow(bad);
+      expect(spy).not.toHaveBeenCalled();
+      killProcessGroupNow(own + 12345);
+      expect(spy).toHaveBeenCalledWith(-(own + 12345), 'SIGKILL');
+      spy.mockImplementation(() => {
+        throw Object.assign(new Error('x'), { code: 'ESRCH' });
+      });
+      expect(() => killProcessGroupNow(own + 12345)).not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

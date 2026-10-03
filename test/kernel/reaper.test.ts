@@ -27,8 +27,8 @@ describe('reaper', () => {
   it('requeues a running job whose lease expired', () => {
     const db = mk();
     const job = claimed(db);
-    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, isAlive: () => false, killGroup: boom, killPid: boom });
-    expect(r).toEqual({ requeued: [job.id], deadLettered: [], killed: [] });
+    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: () => false, killGroup: boom, killPid: boom });
+    expect(r).toEqual({ requeued: [job.id], deadLettered: [], killed: [], errors: [] });
     expect(getJob(db, job.id)).toMatchObject({ status: 'queued', claimedBy: null, leaseExpiresAt: null });
   });
 
@@ -40,7 +40,7 @@ describe('reaper', () => {
     const r = reapExpired(db, {
       now: 2000,
       maxDeliveries: 3,
-      isAlive: (pid) => pid === 5001,
+      groupProbe: () => false, isAlive: (pid) => pid === 5001,
       killGroup: (pg) => {
         seen.push(`g${pg}:${status(db, job.id)}`);
       },
@@ -55,16 +55,16 @@ describe('reaper', () => {
   it('does not touch a job whose lease is still valid', () => {
     const db = mk();
     const job = claimed(db); // lease expires at 1100
-    const r = reapExpired(db, { now: 1100, maxDeliveries: 3, isAlive: alive, killGroup: boom, killPid: boom });
-    expect(r).toEqual({ requeued: [], deadLettered: [], killed: [] });
+    const r = reapExpired(db, { now: 1100, maxDeliveries: 3, groupProbe: () => false, isAlive: alive, killGroup: boom, killPid: boom });
+    expect(r).toEqual({ requeued: [], deadLettered: [], killed: [], errors: [] });
     expect(status(db, job.id)).toBe('running');
   });
 
   it('dead-letters with max_deliveries once delivery reaches maxDeliveries', () => {
     const db = mk();
     const job = claimed(db);
-    const r = reapExpired(db, { now: 2000, maxDeliveries: job.delivery, isAlive: () => false, killGroup: boom, killPid: boom });
-    expect(r).toEqual({ requeued: [], deadLettered: [job.id], killed: [] });
+    const r = reapExpired(db, { now: 2000, maxDeliveries: job.delivery, groupProbe: () => false, isAlive: () => false, killGroup: boom, killPid: boom });
+    expect(r).toEqual({ requeued: [], deadLettered: [job.id], killed: [], errors: [] });
     expect(getJob(db, job.id).status).toBe('failed');
     expect(getChain(db, job.chainId).status).toBe('dead_lettered');
     const dl = listDeadLetters(db)[0]!;
@@ -80,7 +80,7 @@ describe('reaper', () => {
     const r = reapExpired(db, {
       now: 2000,
       maxDeliveries: 3,
-      isAlive: (pid) => pid === 4001,
+      groupProbe: () => false, isAlive: (pid) => pid === 4001,
       killGroup: boom,
       killPid: (pid) => {
         pids.push(pid);
@@ -96,7 +96,7 @@ describe('reaper', () => {
     const db = mk();
     const job = claimed(db);
     registerWorker(db, { id: 'w1', pid: process.pid, pgid: process.pid, startTime: 5, host: 'h' }, 100);
-    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, isAlive: alive, killGroup: () => {}, killPid: boom });
+    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: alive, killGroup: () => {}, killPid: boom });
     expect(r.killed).toEqual([]);
     expect(r.requeued).toEqual([job.id]);
   });
@@ -107,7 +107,7 @@ describe('reaper', () => {
     const r = reapExpired(db, {
       now: 2000,
       maxDeliveries: 3,
-      isAlive: (pid) => pid === 4001,
+      groupProbe: () => false, isAlive: (pid) => pid === 4001,
       killGroup: boom,
       killPid: () => {
         db.prepare(`UPDATE jobs SET status = 'succeeded' WHERE id = ?`).run(job.id);
@@ -122,16 +122,97 @@ describe('reaper', () => {
     const db = mk();
     const job = claimed(db);
     db.prepare(`UPDATE jobs SET status = 'queued' WHERE id = ?`).run(job.id); // stale lease column kept
-    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, isAlive: alive, killGroup: boom, killPid: boom });
-    expect(r).toEqual({ requeued: [], deadLettered: [], killed: [] });
+    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: alive, killGroup: boom, killPid: boom });
+    expect(r).toEqual({ requeued: [], deadLettered: [], killed: [], errors: [] });
   });
 
   it('requeues a job that already has a result, keeping the result', () => {
     const db = mk();
     const job = claimed(db);
     recordResult(db, { jobId: job.id, delivery: job.delivery }, { ok: 1 });
-    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, isAlive: () => false, killGroup: boom, killPid: boom });
+    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: () => false, killGroup: boom, killPid: boom });
     expect(r.requeued).toEqual([job.id]);
     expect(getJob(db, job.id).result).toEqual({ ok: 1 });
+  });
+
+  // Two expired jobs; job 1's kill hook mutates job 2 after the reaper's snapshot.
+  function two(db: ReturnType<typeof mk>) {
+    const j1 = claimed(db, 'k1');
+    createChain(db, { engine: 'e', subjectKey: 'k2', engineState: {}, firstJob: first }, 100);
+    registerWorker(db, { id: 'w2', pid: 4002, pgid: 4002, startTime: 6, host: 'h' }, 100);
+    const j2 = claimNext(db, 'w2', 100, 1000)!;
+    return { j1, j2 };
+  }
+  function run(db: ReturnType<typeof mk>, j1Id: number, mutate: () => void, killed: number[]) {
+    return reapExpired(db, {
+      now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: () => true, killGroup: boom,
+      killPid: (pid) => {
+        killed.push(pid);
+        if (pid === 4001) mutate();
+      },
+    });
+  }
+
+  it('does not kill when the job heartbeat extended its lease after the snapshot', () => {
+    const db = mk();
+    const { j1, j2 } = two(db);
+    const killed: number[] = [];
+    const r = run(db, j1.id, () => db.prepare('UPDATE jobs SET lease_expires_at = 9999 WHERE id = ?').run(j2.id), killed);
+    expect(killed).toEqual([4001]);
+    expect(r.requeued).toEqual([j1.id]);
+    expect(status(db, j2.id)).toBe('running');
+  });
+
+  it('does not kill the worker when the job already succeeded or moved to a new delivery', () => {
+    for (const sql of [
+      `UPDATE jobs SET status = 'succeeded' WHERE id = ?`,
+      `UPDATE jobs SET delivery = delivery + 1 WHERE id = ?`,
+    ]) {
+      const db = mk();
+      const { j1, j2 } = two(db);
+      const killed: number[] = [];
+      const r = run(db, j1.id, () => db.prepare(sql).run(j2.id), killed);
+      expect(killed).toEqual([4001]);
+      expect(r.requeued).toEqual([j1.id]);
+      expect(r.killed).toEqual([4001]);
+    }
+  });
+
+  it('kills the group when the leader is dead but the probe says members remain', () => {
+    const db = mk();
+    const job = claimed(db);
+    recordChild(db, { workerId: 'w1', jobId: job.id, delivery: job.delivery, pid: 5001, pgid: 5001, startTime: 7 }, 110);
+    const groups: number[] = [];
+    const r = reapExpired(db, {
+      now: 2000, maxDeliveries: 3, isAlive: () => false, groupProbe: (pg) => pg === 5001,
+      killGroup: (pg) => { groups.push(pg); }, killPid: boom,
+    });
+    expect(groups).toEqual([5001]);
+    expect(r.killed).toEqual([5001]);
+    expect(r.requeued).toEqual([job.id]);
+  });
+
+  it('kills nothing when both the leader and the group are gone', () => {
+    const db = mk();
+    const job = claimed(db);
+    recordChild(db, { workerId: 'w1', jobId: job.id, delivery: job.delivery, pid: 5001, pgid: 5001, startTime: 7 }, 110);
+    const r = reapExpired(db, {
+      now: 2000, maxDeliveries: 3, isAlive: () => false, groupProbe: () => false, killGroup: boom, killPid: boom,
+    });
+    expect(r.killed).toEqual([]);
+    expect(r.requeued).toEqual([job.id]);
+    expect(liveChildrenFor(db, job.id, job.delivery)).toEqual([]);
+  });
+
+  it('records an error and continues when a kill throws, and later jobs are still reaped', () => {
+    const db = mk();
+    const { j1, j2 } = two(db);
+    const r = reapExpired(db, {
+      now: 2000, maxDeliveries: 3, isAlive: () => true, groupProbe: () => false, killGroup: boom,
+      killPid: (pid) => { if (pid === 4001) throw new Error('EPERM'); },
+    });
+    expect(r.errors).toEqual([{ jobId: j1.id, error: 'EPERM' }]);
+    expect(status(db, j1.id)).toBe('running');
+    expect(r.requeued).toEqual([j2.id]);
   });
 });

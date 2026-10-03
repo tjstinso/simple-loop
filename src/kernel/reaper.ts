@@ -4,7 +4,7 @@ import { requeueJob } from './queue.js';
 import {
   groupHasMembers,
   isProcessAlive,
-  killProcessGroup,
+  killProcessGroupNow,
   liveChildrenFor,
   markChildExited,
 } from './workers.js';
@@ -14,14 +14,18 @@ export interface ReapReport {
   deadLettered: number[];
   /** Pids and pgids that were signalled. */
   killed: number[];
+  /** Jobs whose kill or write threw; their state was left untouched. */
+  errors: { jobId: number; error: string }[];
 }
 
 export interface ReapDeps {
   now: number;
   maxDeliveries: number;
   isAlive?: typeof isProcessAlive;
-  /** Kills a child's whole process group. Never used for a worker. */
-  killGroup?: typeof killProcessGroup;
+  /** Kills a child's whole process group (default: synchronous SIGKILL). Never used for a worker. */
+  killGroup?: (pgid: number) => void;
+  /** True when the process group still has members (default: a real probe). */
+  groupProbe?: (pgid: number) => boolean;
   /** Kills a single pid (the claiming worker). */
   killPid?: (pid: number) => void;
 }
@@ -44,9 +48,10 @@ export function killPidDefault(pid: number): void {
  */
 export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
   const isAlive = deps.isAlive ?? isProcessAlive;
-  const killGroup = deps.killGroup ?? killProcessGroup;
+  const killGroup = deps.killGroup ?? killProcessGroupNow;
+  const groupProbe = deps.groupProbe ?? groupHasMembers;
   const killPid = deps.killPid ?? killPidDefault;
-  const report: ReapReport = { requeued: [], deadLettered: [], killed: [] };
+  const report: ReapReport = { requeued: [], deadLettered: [], killed: [], errors: [] };
 
   const expired = db
     .prepare(
@@ -55,7 +60,23 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
     )
     .all(deps.now) as { id: number; delivery: number; claimed_by: string | null }[];
 
-  for (const job of expired) {
+  const reapOne = (job: { id: number; delivery: number; claimed_by: string | null }): void => {
+    // Re-verify against the live row: the snapshot may be stale (heartbeat, finished, reclaimed).
+    const live = db
+      .prepare('SELECT status, delivery, claimed_by, lease_expires_at FROM jobs WHERE id = ?')
+      .get(job.id) as
+      | { status: string; delivery: number; claimed_by: string | null; lease_expires_at: number | null }
+      | undefined;
+    if (
+      !live ||
+      live.status !== 'running' ||
+      live.delivery !== job.delivery ||
+      live.claimed_by !== job.claimed_by ||
+      live.lease_expires_at === null ||
+      live.lease_expires_at >= deps.now
+    ) {
+      return;
+    }
     const children = liveChildrenFor(db, job.id, job.delivery);
     const worker =
       job.claimed_by === null
@@ -66,7 +87,7 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
 
     // 1. Kill before any state change.
     for (const child of children) {
-      if (isAlive(child.pid, child.startTime) || groupHasMembers(child.pgid)) {
+      if (isAlive(child.pid, child.startTime) || groupProbe(child.pgid)) {
         killGroup(child.pgid);
         report.killed.push(child.pgid);
       }
@@ -87,7 +108,7 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
     const current = db.prepare('SELECT status, delivery FROM jobs WHERE id = ?').get(job.id) as
       | { status: string; delivery: number }
       | undefined;
-    if (!current || current.status !== 'running' || current.delivery !== job.delivery) continue;
+    if (!current || current.status !== 'running' || current.delivery !== job.delivery) return;
 
     if (job.delivery >= deps.maxDeliveries) {
       try {
@@ -106,6 +127,14 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
       }
     } else if (requeueJob(db, job.id, { delivery: job.delivery })) {
       report.requeued.push(job.id);
+    }
+  };
+
+  for (const job of expired) {
+    try {
+      reapOne(job);
+    } catch (e) {
+      report.errors.push({ jobId: job.id, error: e instanceof Error ? e.message : String(e) });
     }
   }
   return report;

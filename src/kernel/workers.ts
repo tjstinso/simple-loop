@@ -154,6 +154,16 @@ export function killProcessGroup(pgid: number, graceMs = 2000): void {
   setTimeout(() => signal('SIGKILL'), graceMs).unref();
 }
 
+/** Synchronous SIGKILL to the whole process group. Same pgid guard as killProcessGroup; ignores ESRCH. */
+export function killProcessGroupNow(pgid: number): void {
+  if (!isSignalablePgid(pgid)) return;
+  try {
+    process.kill(-pgid, 'SIGKILL');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e;
+  }
+}
+
 export function groupHasMembers(pgid: number): boolean {
   if (!isSignalablePgid(pgid)) return false;
   try {
