@@ -153,6 +153,12 @@ export interface Engine<S = unknown> {
    * Errors are swallowed: the retry stands.
    */
   afterRetry?(chain: ChainView<S>, job: Job): Promise<void>;
+  /**
+   * Optional: called by `Kernel.cancelChain` (no job) and `Kernel.discardDeadLetter` (the discarded
+   * job) after the chain was cancelled, with the cancelled chain view (for example to clear status
+   * markers on the subject). Errors go to `KernelDeps.onError`; the cancellation stands.
+   */
+  afterCancel?(chain: ChainView<S>, job?: Job): Promise<void>;
   /** Called after every delivery, whatever its outcome. */
   cleanup(chain: ChainView<S>, job: Job): Promise<void>;
   /** Optional periodic maintenance, called on the kernel's maintenance interval. */

@@ -105,3 +105,75 @@ describe('Kernel.retryDeadLetter', () => {
     s.close();
   });
 });
+
+describe('Kernel.cancelChain and discardDeadLetter', () => {
+  function setup() {
+    const db = openDb(':memory:');
+    migrate(db, []);
+    const engine = makeEchoEngine('echo');
+    const seen: Array<{ chain: ChainView<any>; job?: Job }> = [];
+    engine.afterCancel = async (chain, job) => {
+      seen.push({ chain, job });
+    };
+    const engines = new EngineRegistry();
+    engines.register(engine);
+    const policies = new PolicyStore([
+      { id: 'echo-default', kind: 'echo', match: { labels: [] }, runner: 'fake', config: {}, default: true },
+    ]);
+    const reported: Array<{ err: unknown; context: string }> = [];
+    const kernel = createKernel({
+      ...base(), db, engines, policies, clock: () => 5_000,
+      onError: (err, context) => reported.push({ err, context }),
+    });
+    return { db, kernel, engine, seen, reported, close: () => db.close() };
+  }
+
+  it('Kernel.cancelChain cancels the chain and calls afterCancel with the cancelled chain view', async () => {
+    const s = setup();
+    const { chain, job } = await s.kernel.enqueue('echo', { key: 'k' });
+    await s.kernel.cancelChain(chain.id);
+    expect(getChain(s.db, chain.id).status).toBe('cancelled');
+    expect(getJob(s.db, job.id).status).toBe('cancelled');
+    expect(s.seen).toEqual([
+      { chain: { id: chain.id, engine: 'echo', subjectKey: 'echo:k', status: 'cancelled', state: { count: 0 } }, job: undefined },
+    ]);
+    s.close();
+  });
+
+  it('Kernel.cancelChain keeps the cancellation and reports a hook error to onError', async () => {
+    const s = setup();
+    const boom = new Error('labels failed');
+    s.engine.afterCancel = async () => {
+      throw boom;
+    };
+    const { chain } = await s.kernel.enqueue('echo', { key: 'k' });
+    await s.kernel.cancelChain(chain.id);
+    expect(getChain(s.db, chain.id).status).toBe('cancelled');
+    expect(s.reported).toEqual([{ err: boom, context: `afterCancel for chain ${chain.id}` }]);
+    s.close();
+  });
+
+  it('Kernel.cancelChain rejects (nothing changed, no hook) when a job is running', async () => {
+    const s = setup();
+    const { chain } = await s.kernel.enqueue('echo', { key: 'k' });
+    claimNext(s.db, 'w1', 1, 60_000);
+    await expect(s.kernel.cancelChain(chain.id)).rejects.toThrow(/running/);
+    expect(getChain(s.db, chain.id).status).toBe('active');
+    expect(s.seen).toEqual([]);
+    s.close();
+  });
+
+  it('Kernel.discardDeadLetter cancels the chain and calls afterCancel with the dead-lettered job', async () => {
+    const s = setup();
+    const { chain, job } = await s.kernel.enqueue('echo', { key: 'k' });
+    claimNext(s.db, 'w1', 1, 60_000);
+    deadLetter(s.db, { jobId: job.id, reason: 'runner_error', error: 'boom' }, 2);
+    await s.kernel.discardDeadLetter(job.id);
+    expect(getChain(s.db, chain.id).status).toBe('cancelled');
+    expect(listDeadLetters(s.db, { unresolved: true })).toEqual([]);
+    expect(s.seen).toHaveLength(1);
+    expect(s.seen[0]!.chain.status).toBe('cancelled');
+    expect(s.seen[0]!.job).toMatchObject({ id: job.id, status: 'failed' });
+    s.close();
+  });
+});

@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { discardDeadLetter, listDeadLetters } from '../kernel/dlq.js';
+import { listDeadLetters } from '../kernel/dlq.js';
 import type { Kernel } from '../kernel/kernel.js';
 import type { ChainView } from '../kernel/types.js';
 import { routeEngine } from '../router/router.js';
@@ -21,6 +21,7 @@ const USAGE = `Usage:
   factory [--config <path>] dlq list
   factory [--config <path>] dlq retry <job-id>
   factory [--config <path>] dlq discard <job-id>
+  factory [--config <path>] cancel <chain-id>
 Options:
   --config <path>   config file (default ./factory.config.json)
   -h, --help        print this help`;
@@ -29,10 +30,10 @@ class UsageError extends Error {}
 
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-function parseJobId(raw: string | undefined): number {
-  if (raw === undefined || !/^[0-9]+$/.test(raw)) throw new UsageError('invalid job id');
+function parseId(raw: string | undefined, what: 'job' | 'chain'): number {
+  if (raw === undefined || !/^[0-9]+$/.test(raw)) throw new UsageError(`invalid ${what} id`);
   const id = Number(raw);
-  if (!Number.isSafeInteger(id) || id < 1) throw new UsageError('invalid job id');
+  if (!Number.isSafeInteger(id) || id < 1) throw new UsageError(`invalid ${what} id`);
   return id;
 }
 
@@ -72,7 +73,6 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
   const { stdout, stderr } = deps;
   const [cmd, ...rest] = argv;
   const { kernel } = rt;
-  const clock = kernel.deps.clock;
 
   switch (cmd) {
     case 'submit': {
@@ -142,13 +142,13 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       }
       if (sub === 'retry' || sub === 'discard') {
         if (args.length !== 1) throw new UsageError(`dlq ${sub} takes exactly one job id`);
-        const id = parseJobId(args[0]);
+        const id = parseId(args[0], 'job');
         try {
           if (sub === 'retry') {
             await kernel.retryDeadLetter(id);
             stdout(`requeued job ${id}`);
           } else {
-            discardDeadLetter(rt.db, id, clock());
+            await kernel.discardDeadLetter(id);
             stdout(`discarded job ${id}`);
           }
           return 0;
@@ -158,6 +158,18 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         }
       }
       throw new UsageError('dlq needs a subcommand: list, retry or discard');
+    }
+    case 'cancel': {
+      if (rest.length !== 1) throw new UsageError('cancel takes exactly one chain id');
+      const id = parseId(rest[0], 'chain');
+      try {
+        await kernel.cancelChain(id);
+        stdout(`cancelled chain ${id}`);
+        return 0;
+      } catch (e) {
+        stderr(`error: ${message(e)}`);
+        return 1;
+      }
     }
     default:
       throw new UsageError(cmd === undefined ? 'missing command' : `unknown command: ${cmd}`);
@@ -200,7 +212,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   const built = runtime === undefined;
   try {
     if (command[0] === undefined) return usageError('missing command');
-    if (!['submit', 'worker', 'status', 'dlq'].includes(command[0])) {
+    if (!['submit', 'worker', 'status', 'dlq', 'cancel'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));

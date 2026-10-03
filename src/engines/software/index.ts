@@ -7,7 +7,13 @@ import { runSoftwareEffect } from './effects.js';
 import type { GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
-import { ExecutionResultSchema, LABEL_IN_PROGRESS, ReviewVerdictSchema } from './schemas.js';
+import {
+  ExecutionResultSchema,
+  LABEL_IN_PROGRESS,
+  LABEL_NEEDS_HUMAN,
+  LABEL_READY_FOR_MERGE,
+  ReviewVerdictSchema,
+} from './schemas.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 import { softwareSubmit } from './submit.js';
 import { softwareTransition } from './transition.js';
@@ -141,6 +147,17 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       // The retried chain is back in progress: undo surfaceDeadLetter's labels on the issue.
       const s = chain.state;
       await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_IN_PROGRESS], [LABEL_DEAD_LETTER]);
+    },
+
+    async afterCancel(chain: ChainView<SoftwareState>) {
+      // The chain was ended by hand (`factory cancel` or `dlq discard`): no factory status applies any more.
+      const s = chain.state;
+      await deps.host.setLabels(s.repo, s.issueNumber, [], [
+        LABEL_IN_PROGRESS,
+        LABEL_NEEDS_HUMAN,
+        LABEL_DEAD_LETTER,
+        LABEL_READY_FOR_MERGE,
+      ]);
     },
 
     async cleanup(chain, job) {

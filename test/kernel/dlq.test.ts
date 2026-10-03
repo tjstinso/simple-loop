@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { openDb, migrate } from '../../src/kernel/db.js';
-import { claimNext, createChain, getChain, getJob, recordResult } from '../../src/kernel/queue.js';
+import { claimNext, commitTransition, createChain, getChain, getJob, listJobsForChain, recordResult } from '../../src/kernel/queue.js';
 import {
   DeadLetterStateError,
+  cancelChain,
   deadLetter,
   discardDeadLetter,
   listDeadLetters,
@@ -190,5 +191,50 @@ describe('dead-letter queue', () => {
     deadLetter(db, { jobId: b.job.id, reason: 'timeout', error: 'y' }, 201);
     discardDeadLetter(db, a.job.id, 300);
     expect(listUnsurfacedDeadLetters(db).map((d) => d.jobId)).toEqual([b.job.id]);
+  });
+
+  it('cancelChain cancels a waiting chain and its queued jobs and frees the subject key', () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    commitTransition(
+      db,
+      { jobId: job.id, delivery: job.delivery },
+      { chainId: chain.id, engineState: { s: 1 }, chainStatus: 'waiting', newJobs: [{ type: 'next', attempt: 1, policyId: 'p' }] },
+      150,
+    );
+    const cancelled = cancelChain(db, chain.id, 300);
+    expect(cancelled).toMatchObject({ id: chain.id, status: 'cancelled' });
+    expect(getChain(db, chain.id).status).toBe('cancelled');
+    expect(listJobsForChain(db, chain.id).map((j) => j.status)).toEqual(['succeeded', 'cancelled']);
+    expect(() => createChain(db, { engine: 'e', subjectKey: 'k1', engineState: {}, firstJob: first }, 400)).not.toThrow();
+  });
+
+  it("cancelChain resolves the chain's unresolved dead letters", () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    deadLetter(db, { jobId: job.id, reason: 'runner_error', error: 'x' }, 200);
+    cancelChain(db, chain.id, 300);
+    expect(getChain(db, chain.id).status).toBe('cancelled');
+    expect(listDeadLetters(db, { unresolved: true })).toEqual([]);
+    expect(listDeadLetters(db)[0]!.resolvedAt).toBe(300);
+    expect(getJob(db, job.id).status).toBe('failed');
+  });
+
+  it('cancelChain refuses a chain with a running job and writes nothing', () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    expect(() => cancelChain(db, chain.id, 300)).toThrow(new RegExp(`job ${job.id} is running`));
+    expect(getChain(db, chain.id).status).toBe('active');
+    expect(getJob(db, job.id).status).toBe('running');
+  });
+
+  it('cancelChain refuses an unknown, completed or already cancelled chain', () => {
+    const db = mk();
+    expect(() => cancelChain(db, 99, 1)).toThrow(/chain 99 not found/);
+    const { chain } = createChain(db, { engine: 'e', subjectKey: 'c', engineState: {}, firstJob: first }, 100);
+    db.prepare("UPDATE chains SET status = 'completed' WHERE id = ?").run(chain.id);
+    expect(() => cancelChain(db, chain.id, 1)).toThrow(/is completed/);
+    db.prepare("UPDATE chains SET status = 'cancelled' WHERE id = ?").run(chain.id);
+    expect(() => cancelChain(db, chain.id, 1)).toThrow(/is cancelled/);
   });
 });

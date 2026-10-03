@@ -131,6 +131,47 @@ describe('factory cli', () => {
     expect(h.chain(chain.id).status).toBe('cancelled');
   });
 
+  it('dlq discard clears the factory labels from the issue through the afterCancel hook', async () => {
+    const { h, deps } = setup();
+    const chain = await deadLetter(h, 9);
+    expect(h.issueLabels(9)).toContain(LABEL_DEAD_LETTER);
+    expect(await run(['dlq', 'discard', String(h.jobs(chain.id)[0]!.id)], deps)).toBe(0);
+    expect(h.issueLabels(9)).toEqual([]);
+  });
+
+  it('cancel ends a waiting chain and prints cancelled chain <id>', async () => {
+    const { h, out, err, deps } = setup();
+    const { chain } = await h.submit(10);
+    h.scriptExecute((input) => {
+      h.write(input, 'a.txt', 'a\n');
+      return ok('done');
+    });
+    h.scriptReview([{ verdict: 'approve', feedback: 'lgtm' }]);
+    await h.runUntilIdle();
+    expect(h.chain(chain.id).status).toBe('waiting');
+    expect(await run(['cancel', String(chain.id)], deps)).toBe(0);
+    expect(err).toEqual([]);
+    expect(out).toEqual([`cancelled chain ${chain.id}`]);
+    expect(h.chain(chain.id).status).toBe('cancelled');
+  });
+
+  it('cancel exits 2 for a missing or invalid id and 1 when the cancel is refused', async () => {
+    const { h, err, deps } = setup();
+    expect(await run(['cancel'], deps)).toBe(2);
+    expect(await run(['cancel', 'x'], deps)).toBe(2);
+    expect(await run(['cancel', '0'], deps)).toBe(2);
+    expect(err.join('\n')).toContain('Usage');
+    err.length = 0;
+    expect(await run(['cancel', '99'], deps)).toBe(1);
+    expect(err).toEqual(['error: chain 99 not found']);
+    const { chain } = await h.submit(11);
+    h.claim(); // its execute job is running
+    err.length = 0;
+    expect(await run(['cancel', String(chain.id)], deps)).toBe(1);
+    expect(err.join('\n')).toMatch(/^error: .*running/);
+    expect(h.chain(chain.id).status).toBe('active');
+  });
+
   it('dlq retry fails with exit 1 when there is no dead letter', async () => {
     const { err, deps } = setup();
     expect(await run(['dlq', 'retry', '99'], deps)).toBe(1);

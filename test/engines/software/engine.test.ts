@@ -120,6 +120,20 @@ describe('software engine', () => {
     expect(host.calls.at(-1)).toEqual({ method: 'setLabels', args: [REPO, 7, [LABEL_IN_PROGRESS], ['factory:dead-letter']] });
   });
 
+  it('afterCancel removes the factory status labels from the issue and keeps the others', async () => {
+    const { host, engine } = make();
+    host.addIssue({
+      number: 7, title: 't', body: 'b',
+      labels: [LABEL_IN_PROGRESS, 'factory:needs-human', 'factory:dead-letter', 'factory:ready-for-merge', 'bug'],
+    });
+    await engine.afterCancel!({ ...chain(), status: 'cancelled' });
+    expect(host.getLabels(7)).toEqual(['bug']);
+    expect(host.calls.at(-1)).toEqual({
+      method: 'setLabels',
+      args: [REPO, 7, [], [LABEL_IN_PROGRESS, 'factory:needs-human', 'factory:dead-letter', 'factory:ready-for-merge']],
+    });
+  });
+
   it('describe renders repo, phase, attempt and profile', () => {
     expect(make().engine.describe(chain())).toBe('acme/widgets#7 phase=reviewing attempt=2 profile=supervised');
   });

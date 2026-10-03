@@ -1,9 +1,9 @@
 import type Database from 'better-sqlite3';
 import { migrate, openDb } from './db.js';
-import { retryDeadLetter } from './dlq.js';
+import { cancelChain, discardDeadLetter, retryDeadLetter } from './dlq.js';
 import { report } from './process-delivery.js';
 import { createChain, getChain } from './queue.js';
-import type { Chain, ChainView, Job, KernelDeps } from './types.js';
+import type { Chain, ChainView, Engine, Job, KernelDeps } from './types.js';
 import { startWorker, type Worker, type WorkerOptions } from './worker-loop.js';
 
 export interface Kernel {
@@ -20,6 +20,14 @@ export interface Kernel {
    * passed to `deps.onError` and otherwise swallowed; the retry stands. Rejects (nothing changed) when the retry itself is refused.
    */
   retryDeadLetter(jobId: number): Promise<Job>;
+  /**
+   * Cancel a chain that is not running (`cancelChain` in dlq.ts: queued jobs cancelled, dead letters
+   * resolved, subject key freed), then call the engine's optional `afterCancel` hook. Rejects
+   * (nothing changed) when a job of the chain is running or the chain is already finished.
+   */
+  cancelChain(chainId: number): Promise<Chain>;
+  /** `dlq discard`: cancel the dead-lettered job's chain, then call `afterCancel` with that job. */
+  discardDeadLetter(jobId: number): Promise<void>;
   startWorker(opts?: WorkerOptions): Worker;
   close(): void;
 }
@@ -46,6 +54,31 @@ export function createKernel(
   }
   const deps: KernelDeps = { ...rest, db };
 
+  /** The chain view for an engine hook: the validated state when it parses, else the raw state. */
+  const viewOf = (chainId: number): { view: ChainView<unknown>; engine: Engine<any> } => {
+    const chain = getChain(db, chainId);
+    const engine = deps.engines.get(chain.engine);
+    const parsed = engine.stateSchema.safeParse(chain.engineState);
+    const view: ChainView<unknown> = {
+      id: chain.id,
+      engine: chain.engine,
+      subjectKey: chain.subjectKey,
+      status: chain.status,
+      state: parsed.success ? parsed.data : chain.engineState,
+    };
+    return { view, engine };
+  };
+
+  /** Runs an engine's afterCancel hook; errors are reported, never thrown. */
+  const afterCancel = async (chainId: number, job?: Job): Promise<void> => {
+    try {
+      const { view, engine } = viewOf(chainId);
+      if (engine.afterCancel) await engine.afterCancel(view, job);
+    } catch (e) {
+      report(deps, e, `afterCancel for chain ${chainId}`);
+    }
+  };
+
   return {
     deps,
     async enqueue(engineId, input) {
@@ -71,24 +104,22 @@ export function createKernel(
     async retryDeadLetter(jobId) {
       const job = retryDeadLetter(db, jobId, deps.clock());
       try {
-        const chain = getChain(db, job.chainId);
-        const engine = deps.engines.get(chain.engine);
-        if (engine.afterRetry) {
-          const parsed = engine.stateSchema.safeParse(chain.engineState);
-          const view: ChainView<unknown> = {
-            id: chain.id,
-            engine: chain.engine,
-            subjectKey: chain.subjectKey,
-            status: chain.status,
-            state: parsed.success ? parsed.data : chain.engineState,
-          };
-          await engine.afterRetry(view, job);
-        }
+        const { view, engine } = viewOf(job.chainId);
+        if (engine.afterRetry) await engine.afterRetry(view, job);
       } catch (e) {
         // Best effort: the retry already committed.
         report(deps, e, `afterRetry for job ${jobId}`);
       }
       return job;
+    },
+    async cancelChain(chainId) {
+      const chain = cancelChain(db, chainId, deps.clock());
+      await afterCancel(chainId);
+      return chain;
+    },
+    async discardDeadLetter(jobId) {
+      const job = discardDeadLetter(db, jobId, deps.clock());
+      await afterCancel(job.chainId, job);
     },
     startWorker: (o) => startWorker(deps, o),
     close() {

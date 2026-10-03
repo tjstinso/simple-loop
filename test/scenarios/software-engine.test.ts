@@ -378,6 +378,32 @@ describe('software engine scenarios', () => {
     expect(h.chain(chain.id).state.phase).toBe('awaiting_merge');
   });
 
+  it('cancel ends a waiting chain, clears its issue labels, and the same issue can be resubmitted', async () => {
+    const h = harness();
+    const url = `https://github.com/o/r/issues/${N}`;
+    const { chain } = await h.submit(N);
+    writesPerAttempt(h);
+    h.scriptReview([
+      { verdict: 'request_changes', feedback: 'a' },
+      { verdict: 'request_changes', feedback: 'b' },
+      { verdict: 'request_changes', feedback: 'c' },
+    ]);
+    await h.runUntilIdle();
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human' } });
+    await expect(h.kernel.enqueue('software', { issueUrl: url })).rejects.toBeInstanceOf(DuplicateChainError);
+
+    await h.kernel.cancelChain(chain.id);
+    expect(h.chain(chain.id).status).toBe('cancelled');
+    expect(h.issueLabels(N)).toEqual([]);
+
+    const again = await h.kernel.enqueue('software', { issueUrl: url });
+    expect(again.chain.id).not.toBe(chain.id);
+    expect(again.chain.status).toBe('active');
+    h.scriptReview([{ verdict: 'approve', feedback: 'ok now' }]);
+    await h.runUntilIdle();
+    expect(h.chain(again.chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
+  });
+
   it('a second submit for an open chain is rejected', async () => {
     const h = harness();
     const { chain } = await h.submit(N);

@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
-import { getJob } from './queue.js';
-import type { DeadLetter, DeadLetterReason, Job } from './types.js';
+import { getChain, getJob } from './queue.js';
+import type { Chain, DeadLetter, DeadLetterReason, Job } from './types.js';
 
 type Db = Database.Database;
 
@@ -149,12 +149,47 @@ export function retryDeadLetter(db: Db, jobId: number, now: number): Job {
     .immediate();
 }
 
-/** Cancel the chain (freeing its subject key) and resolve the dead letter; the job stays failed. */
-export function discardDeadLetter(db: Db, jobId: number, now: number): void {
-  db.transaction(() => {
-    const dl = findUnresolved(db, jobId);
-    if (!dl) throw new Error(`no unresolved dead letter for job ${jobId}`);
-    db.prepare(`UPDATE chains SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, dl.chain_id);
-    db.prepare('UPDATE dead_letters SET resolved_at = ? WHERE id = ?').run(now, dl.id);
-  }).immediate();
+/**
+ * Cancel the chain (freeing its subject key) and resolve the dead letter; the job stays failed.
+ * Returns the failed job (for the engine's `afterCancel` hook).
+ */
+export function discardDeadLetter(db: Db, jobId: number, now: number): Job {
+  return db
+    .transaction((): Job => {
+      const dl = findUnresolved(db, jobId);
+      if (!dl) throw new Error(`no unresolved dead letter for job ${jobId}`);
+      db.prepare(`UPDATE chains SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, dl.chain_id);
+      db.prepare('UPDATE dead_letters SET resolved_at = ? WHERE id = ?').run(now, dl.id);
+      return getJob(db, jobId);
+    })
+    .immediate();
+}
+
+/**
+ * End a chain by hand (for example a `waiting` chain whose PR a human merged or closed), in one
+ * transaction: the chain becomes `cancelled` (freeing its subject key), its queued jobs `cancelled`,
+ * and its unresolved dead letters resolved. Refuses (throws, writes nothing) an unknown chain, a
+ * chain that is already completed or cancelled, and a chain with a `running` job (stop its worker or
+ * wait for the delivery to finish first). Returns the cancelled chain.
+ */
+export function cancelChain(db: Db, chainId: number, now: number): Chain {
+  return db
+    .transaction((): Chain => {
+      const chain = db.prepare('SELECT status FROM chains WHERE id = ?').get(chainId) as { status: string } | undefined;
+      if (!chain) throw new Error(`chain ${chainId} not found`);
+      if (chain.status === 'completed' || chain.status === 'cancelled') {
+        throw new Error(`cannot cancel chain ${chainId}: it is ${chain.status}`);
+      }
+      const running = db
+        .prepare(`SELECT id FROM jobs WHERE chain_id = ? AND status = 'running' ORDER BY id LIMIT 1`)
+        .get(chainId) as { id: number } | undefined;
+      if (running) {
+        throw new Error(`cannot cancel chain ${chainId}: job ${running.id} is running; stop its worker or wait for it to finish`);
+      }
+      db.prepare(`UPDATE jobs SET status = 'cancelled', updated_at = ? WHERE chain_id = ? AND status = 'queued'`).run(now, chainId);
+      db.prepare(`UPDATE chains SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, chainId);
+      db.prepare('UPDATE dead_letters SET resolved_at = ? WHERE chain_id = ? AND resolved_at IS NULL').run(now, chainId);
+      return getChain(db, chainId);
+    })
+    .immediate();
 }
