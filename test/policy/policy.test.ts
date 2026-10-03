@@ -93,4 +93,28 @@ describe('shipped policies', () => {
     const review = loadPolicies(join(import.meta.dirname, '../../policies')).find((x) => x.kind === 'review')!;
     expect((review.config as { settingSources?: string }).settingSources).toBe('user');
   });
+
+  const shipped = () => loadPolicies(join(import.meta.dirname, '../../policies'));
+  const promptOf = (kind: string) => (shipped().find((x) => x.kind === kind)!.config as { prompt: string }).prompt;
+
+  it('each shipped prompt has exactly one json fence, it is valid JSON, and it comes last', () => {
+    for (const kind of ['execute', 'review']) {
+      const prompt = promptOf(kind);
+      const fences = [...prompt.matchAll(/```json\n([\s\S]*?)\n```/g)];
+      expect(fences, kind).toHaveLength(1);
+      expect((prompt.match(/```/g) ?? []).length, kind).toBe(2); // no other fenced block
+      expect(() => JSON.parse(fences[0]![1]!), kind).not.toThrow();
+      expect(prompt.trimEnd().endsWith('```'), kind).toBe(true);
+    }
+    const example = JSON.parse([...promptOf('review').matchAll(/```json\n([\s\S]*?)\n```/g)][0]![1]!) as { verdict: string };
+    expect(example.verdict).toBe('approve');
+    expect(promptOf('review')).toContain('request_changes');
+  });
+
+  it('the review prompt forbids diff drivers and --output', () => {
+    const prompt = promptOf('review');
+    expect(prompt).toContain('--no-ext-diff --no-textconv');
+    for (const cmd of ['git diff', 'git show', 'git log -p']) expect(prompt).toContain(cmd);
+    expect(prompt).toMatch(/never use `--output`/i);
+  });
 });

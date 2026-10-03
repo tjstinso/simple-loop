@@ -27,11 +27,12 @@ config:
     - If a "Feedback" section follows the work item, it is the reviewer's feedback on your
       previous attempt. Address every point in it.
 
-    END your final message with exactly one fenced json block, and nothing after it:
+    "summary" says what was done and why, in 1-3 sentences. "followups" lists worthwhile pieces
+    of work you noticed but deliberately did NOT do, each with a "title" and a "body". Use an
+    empty array when there are none.
+
+    END your final message with exactly one fenced json block, and nothing after it, for example:
 
     ```json
-    {"summary": "<what was done and why, 1-3 sentences>", "followups": [{"title": "...", "body": "..."}]}
+    {"summary": "Added shout() to greet.js and a test for it.", "followups": [{"title": "Validate greet() input", "body": "greet() accepts non-strings."}]}
     ```
-
-    "followups" lists worthwhile pieces of work you noticed but deliberately did NOT do. Use an
-    empty array when there are none.
