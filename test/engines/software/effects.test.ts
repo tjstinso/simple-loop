@@ -181,15 +181,31 @@ describe('runSoftwareEffect', () => {
       expect(git(ws.path, ['rev-parse', 'HEAD'])).toBe(head);
     });
 
-    it('commit_push throws StaleDeliveryError when the remote branch moved', async () => {
+    it('commit_push throws StaleDeliveryError when the remote branch moved and this delivery is stale', async () => {
       remote.commit(BRANCH, 'first.txt', '1\n');
       const ws = await provider.prepare(chain(), job({ delivery: 2 }));
       const moved = remote.commit(BRANCH, 'zombie.txt', 'z\n');
       writeFileSync(join(ws.path, 'mine.txt'), 'm\n');
-      await expect(runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports }), fence())).rejects.toBeInstanceOf(
+      // A newer delivery owns the job by the time the lease rejection is examined (a zombie).
+      let checks = 0;
+      const turnsStale: EffectFence = { jobId: 42, delivery: 1, assertCurrent: () => { if (++checks > 2) throw new StaleDeliveryError(); } };
+      await expect(runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports }), turnsStale)).rejects.toBeInstanceOf(
         StaleDeliveryError,
       );
+      expect(checks).toBe(3);
       expect(remoteHead()).toBe(moved);
+    });
+
+    it('commit_push: a lease rejection while this delivery is still current is a runner_error (someone else moved the branch)', async () => {
+      remote.commit(BRANCH, 'first.txt', '1\n');
+      const ws = await provider.prepare(chain(), job({ delivery: 2 }));
+      const human = remote.commit(BRANCH, 'human.txt', 'h\n'); // e.g. a person pushed to factory/issue-7
+      writeFileSync(join(ws.path, 'mine.txt'), 'm\n');
+      const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports }), fence()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EffectError);
+      expect((err as EffectError).reason).toBe('runner_error');
+      expect((err as Error).message).toBe('remote branch moved by someone else');
+      expect(remoteHead()).toBe(human);
     });
 
     it('a stale fence stops commit_push before it pushes', async () => {

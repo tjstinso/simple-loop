@@ -143,7 +143,17 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
     throw new EffectError('no changes produced', 'runner_error');
   }
   fence.assertCurrent();
-  await ctx.git.push(ws, { remoteBranch: branch, expectSha: ws.remoteHeadSha });
+  try {
+    await ctx.git.push(ws, { remoteBranch: branch, expectSha: ws.remoteHeadSha });
+  } catch (e) {
+    if (!(e instanceof StaleDeliveryError)) throw e;
+    // The lease was rejected: the branch moved since this delivery was seeded. If a newer delivery
+    // owns the job (a zombie), assertCurrent throws StaleDeliveryError and nothing is written. If this
+    // delivery is still current, someone else moved the branch (a human push, another chain): fail
+    // the job now instead of leaving it running until its lease expires.
+    fence.assertCurrent();
+    throw new EffectError('remote branch moved by someone else', 'runner_error');
+  }
 }
 
 async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {

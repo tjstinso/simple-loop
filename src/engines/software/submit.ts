@@ -39,7 +39,8 @@ export function parseIssueUrl(url: string): { repo: string; number: number } {
   if (!/^\d+$/.test(num) || Number(num) < 1 || !Number.isSafeInteger(Number(num))) {
     throw new Error(`invalid issue number in issue URL: ${JSON.stringify(url)}`);
   }
-  return { repo: `${owner}/${name}`, number: Number(num) };
+  // GitHub owner and repository names are case-insensitive: one spelling, so one subject key per issue.
+  return { repo: `${owner}/${name}`.toLowerCase(), number: Number(num) };
 }
 
 function missingSections(body: string, required: string[]): string[] {

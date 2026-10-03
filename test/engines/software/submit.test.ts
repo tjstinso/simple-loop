@@ -44,6 +44,17 @@ describe('parseIssueUrl', () => {
     }
   });
 
+  it('normalizes owner and repository to lower case (one subject per repository)', async () => {
+    expect(parseIssueUrl('https://github.com/Owner/Repo.JS/issues/3')).toEqual({ repo: 'owner/repo.js', number: 3 });
+    const host = new FakeGitHost();
+    host.addIssue({ number: 3, title: 't', body: BODY, labels: [] });
+    const policies = new PolicyStore([policy('p-default', [], true), reviewDefault]);
+    const config = { defaultProfile: 'supervised' as const, requiredSections: [] };
+    const r = await softwareSubmit({ issueUrl: 'https://github.com/Owner/Repo/issues/3' }, { host, policies, config });
+    expect(r.subjectKey).toBe('owner/repo#3');
+    expect(r.state.repo).toBe('owner/repo');
+  });
+
   it('accepts www and a trailing slash', () => {
     expect(parseIssueUrl('https://github.com/o/r/issues/12')).toEqual({ repo: 'o/r', number: 12 });
     expect(parseIssueUrl('https://www.github.com/o/r.x/issues/12/')).toEqual({ repo: 'o/r.x', number: 12 });
