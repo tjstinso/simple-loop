@@ -360,7 +360,7 @@ The first engine. Policy kinds: `execute` and `review`. Subject key: `owner/repo
 
 ### Chain state (`engine_state`)
 
-`{ repo, issueNumber, profile, branch, attempt, phase }`
+`{ repo, issueNumber, labels, profile, branch, attempt, phase }`
 
 - `branch` is the remote branch `factory/issue-<n>`. Workspaces are per delivery and their paths are derived, so none is stored here.
 - `attempt` is the current execute attempt, 1 to `maxAttempts` (default 3).
@@ -415,7 +415,7 @@ GitHub is the source of truth, and the engine looks before acting. Before each e
 
 ### Workspace
 
-Each job delivery gets its own private git worktree, with a local branch named `factory/issue-<n>-d<delivery>`. This isolates a zombie worker from its replacement (section 5).
+Each job delivery gets its own private git worktree, with a local branch named `factory/issue-<n>-c<chainId>-d<delivery>`. This isolates a zombie worker from its replacement (section 5).
 
 - An execute delivery is seeded from the remote `factory/issue-<n>` head if the branch exists (a revise attempt starts from the previously published commits), otherwise from the base branch.
 - A review delivery is seeded from the PR head and is read-only by policy.
