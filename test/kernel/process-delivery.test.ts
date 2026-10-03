@@ -85,6 +85,18 @@ describe('processDelivery', () => {
     expect(typeof seen[0].fence.assertCurrent).toBe('function');
   });
 
+  it('gives runEffect the job carrying the result recorded by this delivery', async () => {
+    const seen: any[] = [];
+    const s = setup({ echo: { onEffect: (_e, _f, ctx) => { seen.push(ctx.job); } } });
+    s.addChain();
+    const job = s.claim();
+    expect(job.result).toBeNull();
+    s.fake.script('echo', [{ value: 'hi' }]);
+    expect(await processDelivery(s.deps, job, 'w1', signal())).toBe('succeeded');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ id: job.id, delivery: job.delivery, result: { value: 'hi' } });
+  });
+
   it('runs a delivery end to end and enqueues the follow-on job only after effects ran', async () => {
     const jobsAtEffect: number[] = [];
     const s = setup({

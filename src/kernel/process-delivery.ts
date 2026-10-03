@@ -235,9 +235,11 @@ async function deliver(
       if (!isCurrent(db, fence)) throw new StaleDeliveryError();
     },
   };
+  // The claimed `job` predates the run: give effects the job with its recorded result.
+  const done: Job = { ...job, result };
   for (const effect of t.effects) {
     try {
-      await engine.runEffect(effect, { chain: view, job, fence: effectFence });
+      await engine.runEffect(effect, { chain: view, job: done, fence: effectFence });
     } catch (e) {
       if (e instanceof StaleDeliveryError) return 'stale';
       const reason = e instanceof EffectError ? e.reason : 'effect_error';
