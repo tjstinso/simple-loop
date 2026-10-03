@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
 import { z } from 'zod';
@@ -67,6 +67,63 @@ export interface ClaudeCliRunnerOptions {
    * allow-list and `passEnv` but before the isolation variables (bare mode).
    */
   env?: Record<string, string>;
+  /** Process spawner (default `child_process.spawn`). Tests inject one that throws. */
+  spawn?: typeof spawn;
+  /** Remover used by `removeScratchDir` (default `fs.rmSync`). Tests inject a failing one. */
+  removeDir?: Remover;
+}
+
+export type Remover = (path: string, opts: Parameters<typeof rmSync>[1]) => void;
+
+const RM_OPTS = { recursive: true, force: true, maxRetries: 3, retryDelay: 50 } as const;
+
+/**
+ * Makes every directory under `root` (and `root`) owner-writable, so a tree holding a read-only
+ * directory with contents (Go's module cache, an agent's `chmod 000`) can be removed. Never follows
+ * symlinks: only entries `lstat` (or the `withFileTypes` dirent) reports as real directories are
+ * changed or descended into, so nothing outside `root` is touched. Errors are ignored.
+ */
+function makeDirsWritable(root: string): void {
+  const stack = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    try {
+      if (!lstatSync(dir).isDirectory()) continue;
+      chmodSync(dir, 0o700);
+    } catch {
+      continue;
+    }
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) if (e.isDirectory()) stack.push(join(dir, e.name));
+  }
+}
+
+/**
+ * Best-effort removal of a per-run scratch directory that NEVER throws (it runs inside child-process
+ * and timer callbacks, where a throw would crash the worker). `rm` retries ENOTEMPTY/EBUSY; on
+ * EACCES/EPERM the tree's directories are made writable and removal is retried once. `rm` with
+ * `recursive` removes symlinks without following them. Returns false when something was left: the
+ * directory may then remain in the temp directory (see README "Credentials").
+ */
+export function removeScratchDir(dir: string, rm: Remover = rmSync): boolean {
+  try {
+    rm(dir, RM_OPTS);
+    return true;
+  } catch (e) {
+    try {
+      const code = (e as NodeJS.ErrnoException | null)?.code;
+      if (code === 'EACCES' || code === 'EPERM') makeDirsWritable(dir);
+      rm(dir, RM_OPTS);
+      return true;
+    } catch {
+      return false; // left in the temp directory; nothing to log to
+    }
+  }
 }
 
 /** Rejection for the inactivity watchdog and the hard wall-clock limit. */
@@ -320,10 +377,14 @@ export class ClaudeCliRunner implements Runner {
   readonly configSchema = configSchema;
   private readonly bin: string;
   private readonly env: Record<string, string>;
+  private readonly spawn: typeof spawn;
+  private readonly removeDir: Remover;
 
   constructor(opts: ClaudeCliRunnerOptions = {}) {
     this.bin = opts.bin ?? 'claude';
     this.env = opts.env ?? {};
+    this.spawn = opts.spawn ?? spawn;
+    this.removeDir = opts.removeDir ?? rmSync;
   }
 
   async run(input: RunInput, signal: AbortSignal, hooks?: RunHooks): Promise<unknown> {
@@ -350,11 +411,13 @@ export class ClaudeCliRunner implements Runner {
       let inactivityTimer: NodeJS.Timeout | undefined;
       let hardTimer: NodeJS.Timeout | undefined;
 
-      // Fresh, empty per-run directories, removed once the run settles (every path below goes
-      // through settle(), or removes them itself when spawn throws). Bare mode: `<scratch>/home`
+      // Fresh, empty per-run directories, removed best-effort (never throwing) once the run settles
+      // (every path below goes through settle(), or removes them itself when spawn throws). Bare mode: `<scratch>/home`
       // (HOME and the XDG base directories) and `<scratch>/gh`; otherwise one gh config directory.
       const scratch = mkdtempSync(join(tmpdir(), cfg.bare ? 'factory-run-' : 'factory-gh-'));
-      const removeScratch = (): void => rmSync(scratch, { recursive: true, force: true });
+      const removeScratch = (): void => {
+        removeScratchDir(scratch, this.removeDir);
+      };
       let child;
       try {
         let env: Record<string, string>;
@@ -367,7 +430,7 @@ export class ClaudeCliRunner implements Runner {
         } else {
           env = childEnv(this.env, scratch);
         }
-        child = spawn(this.bin, args, {
+        child = this.spawn(this.bin, args, {
           cwd: input.workspace.path,
           env,
           detached: true,
@@ -398,8 +461,10 @@ export class ClaudeCliRunner implements Runner {
         fn();
       };
       const fail = (err: unknown): void => {
-        settle(() => reject(err));
+        // Kill first, so no process of the run is still writing into the scratch directory when
+        // settle() removes it.
         killGroup();
+        settle(() => reject(err));
       };
       const onAbort = (): void => fail(abortError());
       const armInactivity = (): void => {

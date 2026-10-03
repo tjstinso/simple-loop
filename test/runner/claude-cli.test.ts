@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn as realSpawn } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { ClaudeCliRunner, childEnv } from '../../src/runner/claude-cli.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ClaudeCliRunner, childEnv, removeScratchDir } from '../../src/runner/claude-cli.js';
 import { loadPolicies } from '../../src/policy/store.js';
 import { parseStreamLine } from '../../src/runner/stream.js';
 import type { RunHooks, RunInput } from '../../src/runner/types.js';
@@ -61,6 +62,7 @@ afterEach(() => {
     }
   }
   for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  vi.restoreAllMocks();
 });
 
 const job: Job = {
@@ -624,6 +626,126 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
     }
   });
 });
+
+describe('scratch directory removal (R49a)', () => {
+  it('removing a scratch HOME that contains a read-only directory with contents does not throw and removes it', () => {
+    const scratch = tmp('factory-run-');
+    const ro = join(scratch, 'home', 'go', 'pkg', 'mod', 'example.com@v1');
+    mkdirSync(ro, { recursive: true });
+    writeFileSync(join(ro, 'file.go'), 'package x');
+    const locked = join(scratch, 'home', 'locked');
+    mkdirSync(join(locked, 'inner'), { recursive: true });
+    writeFileSync(join(locked, 'inner', 'f'), 'x');
+    chmodSync(ro, 0o555); // like Go's module cache
+    chmodSync(join(scratch, 'home', 'go'), 0o555);
+    chmodSync(locked, 0o000); // like an agent's `chmod 000`
+    try {
+      expect(() => removeScratchDir(scratch)).not.toThrow();
+      expect(existsSync(scratch)).toBe(false);
+    } finally {
+      for (const d of [locked, join(scratch, 'home', 'go'), ro]) {
+        try {
+          chmodSync(d, 0o700);
+        } catch {
+          /* already removed */
+        }
+      }
+    }
+  });
+
+  it('a symlink in the scratch HOME is not followed', () => {
+    const scratch = tmp('factory-run-');
+    const sentinel = tmp('cli-sentinel-');
+    mkdirSync(join(sentinel, 'sub'));
+    writeFileSync(join(sentinel, 'sub', 'keep.txt'), 'keep');
+    chmodSync(join(sentinel, 'sub'), 0o555);
+    mkdirSync(join(scratch, 'home'));
+    symlinkSync(sentinel, join(scratch, 'home', 'link'));
+    symlinkSync(join(sentinel, 'sub'), join(scratch, 'home', 'link-sub'));
+    // force the permission-fixing walk as well
+    const ro = join(scratch, 'home', 'ro');
+    mkdirSync(join(ro, 'x'), { recursive: true });
+    chmodSync(ro, 0o000);
+    try {
+      removeScratchDir(scratch);
+      expect(existsSync(scratch)).toBe(false);
+      expect(readFileSync(join(sentinel, 'sub', 'keep.txt'), 'utf8')).toBe('keep');
+      expect(statMode(join(sentinel, 'sub'))).toBe(0o555); // not chmodded through the link
+    } finally {
+      chmodSync(join(sentinel, 'sub'), 0o700);
+      try {
+        chmodSync(ro, 0o700);
+      } catch {
+        /* removed */
+      }
+    }
+  });
+
+  it('removal never throws even when it cannot remove something', async () => {
+    const failing = (): never => {
+      const e = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+      e.code = 'EACCES';
+      throw e;
+    };
+    const scratch = tmp('factory-run-');
+    expect(() => removeScratchDir(scratch, failing)).not.toThrow();
+    const other = (): never => {
+      throw new Error('anything else');
+    };
+    expect(() => removeScratchDir(scratch, other)).not.toThrow();
+    // through the runner: a run whose scratch cannot be removed still resolves its result
+    const scratchRoot = tmp('cli-tmpdir-');
+    await withParentEnv({ TMPDIR: scratchRoot }, async () => {
+      const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'steps', ANTHROPIC_API_KEY: 'k' }, removeDir: failing });
+      await expect(r.run(input(), signal())).resolves.toMatchObject({ status: 'ok' });
+      const t = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'silent', ANTHROPIC_API_KEY: 'k' }, removeDir: failing });
+      const err = await t
+        .run(input({ config: config({ inactivityTimeoutMs: 200, timeoutMs: 10_000 }) }), signal(), trackingHooks())
+        .then(() => null, (e: unknown) => e);
+      expect((err as { reason?: string }).reason).toBe('timeout');
+    });
+  });
+
+  it('on timeout the process group is killed before the scratch directory is removed', async () => {
+    const order: string[] = [];
+    const kill = vi.spyOn(process, 'kill');
+    const hooks = trackingHooks();
+    const remover = (p: string, o: Parameters<typeof rmSync>[1]): void => {
+      const pid = hooks.spawned[0]?.pid;
+      const killedGroup = kill.mock.calls.some(([target, sig]) => pid !== undefined && target === -pid && sig === 'SIGKILL');
+      order.push(killedGroup ? 'remove-after-kill' : 'remove-before-kill');
+      rmSync(p, o);
+    };
+    const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'silent', ANTHROPIC_API_KEY: 'k' }, removeDir: remover });
+    const err = await r
+      .run(input({ config: config({ inactivityTimeoutMs: 200, timeoutMs: 10_000 }) }), signal(), hooks)
+      .then(() => null, (e: unknown) => e);
+    expect((err as { reason?: string }).reason).toBe('timeout');
+    expect(order[0]).toBe('remove-after-kill');
+  });
+
+  it('the synchronous spawn-throw path removes the scratch directory', async () => {
+    const scratchRoot = tmp('cli-tmpdir-');
+    await withParentEnv({ TMPDIR: scratchRoot }, async () => {
+      for (const bare of [true, false]) {
+        let seenHome: string | undefined;
+        const throwing = ((_bin: string, _args: string[], opts: { env: Record<string, string> }) => {
+          seenHome = opts.env.HOME;
+          expect(readdirSync(scratchRoot).filter((e) => e.startsWith('factory-'))).toHaveLength(1);
+          throw new Error('spawn exploded');
+        }) as unknown as typeof realSpawn;
+        const r = new ClaudeCliRunner({ bin: STUB, env: { ANTHROPIC_API_KEY: 'k' }, spawn: throwing });
+        await expect(r.run(input({ config: config({ bare }) }), signal())).rejects.toThrow('spawn exploded');
+        expect(seenHome).toBeDefined();
+        expect(readdirSync(scratchRoot).filter((e) => e.startsWith('factory-')), String(bare)).toEqual([]);
+      }
+    });
+  });
+});
+
+function statMode(p: string): number {
+  return statSync(p).mode & 0o777;
+}
 
 runnerContract(() => {
   const ws = mkdtempSync(join(tmpdir(), 'cli-contract-'));
