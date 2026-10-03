@@ -273,7 +273,7 @@ Idempotency handles an effect being *repeated*. A zombie is two actors running *
 **Layer 1: isolate each delivery.**
 
 1. **A private workspace per delivery.** Each claim gets its own workspace, seeded from the last *published* state. A zombie keeps working in its own directory and cannot corrupt the replacement's. A redelivered job starts clean; uncommitted partial work from a crashed delivery is discarded and the agent redoes it.
-2. **Publishing is only an engine effect.** A runner never publishes. The engine's effect publishes from that delivery's workspace, after the fence check. The runner's environment has no credentials for the external system. A runner with a general shell could still reach an external system through ambient credentials, so the environment is stripped of them and `allowedTools` is kept narrow.
+2. **Publishing is only an engine effect.** A runner never publishes. The engine's effect publishes from that delivery's workspace, after the fence check. The runner's environment is stripped of the GitHub credentials it could inherit (GH_*/GITHUB_* variables, git and gh configuration, SSH agent and askpass variables) but it still runs with the operator's HOME, so this is hardening and not a guarantee (see README "Credentials"). A runner with a general shell could still reach an external system through ambient credentials, so the environment is stripped of them and `allowedTools` is kept narrow.
 
 **Layer 2: reduce zombies.**
 
@@ -406,7 +406,7 @@ The engine adds `factory:dead-letter` to the issue, removes `factory:in-progress
 
 GitHub is the source of truth, and the engine looks before acting. Before each external effect it re-reads the job's `delivery` through the fence token.
 
-- **Branch:** deterministic name. Pushing is an engine effect only; the runner has no push credentials and the workspace's push URL is disabled. Pushes use `--force-with-lease` against the sha the delivery was seeded from, so a stale push fails once the branch has moved.
+- **Branch:** deterministic name. Pushing is an engine effect only; the runner is not given push credentials by the factory (see section 5 for the residual risk) and the workspace's push URL is disabled. Pushes use `--force-with-lease` against the sha the delivery was seeded from, so a stale push fails once the branch has moved.
 - **PR:** look up by head branch before creating one.
 - **Labels:** set and remove specific labels, never toggle.
 - **Merge:** check the PR state first.
