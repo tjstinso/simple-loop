@@ -1,0 +1,31 @@
+import type { ZodType } from 'zod';
+import type { Job } from '../kernel/types.js';
+
+export interface Workspace {
+  path: string;
+  [k: string]: unknown;
+}
+
+export interface RunInput {
+  job: Job;
+  config: unknown;
+  subject: unknown;
+  workspace: Workspace;
+  feedback?: string;
+}
+
+export interface RunHooks {
+  onSpawn?(child: { pid: number; pgid: number; startTime: number }): void;
+  onExit?(pid: number, code: number | null): void;
+}
+
+/**
+ * A runner works only inside `input.workspace.path` and returns a typed result.
+ * It never publishes anything. If `signal` is aborted (before or during the run)
+ * it must reject with an error whose `name` is `AbortError`.
+ */
+export interface Runner {
+  name: string;
+  configSchema: ZodType;
+  run(input: RunInput, signal: AbortSignal, hooks?: RunHooks): Promise<unknown>;
+}
