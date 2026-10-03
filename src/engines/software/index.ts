@@ -53,18 +53,27 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const historyRetentionDays = deps.config.historyRetentionDays ?? 30;
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
 
-  /** Deliveries whose workspace must survive a sweep: running jobs and recently dead-lettered (kept) ones. */
-  function liveDeliveries(now: number): Set<string> {
-    const rows = deps.db
-      .prepare(
-        `SELECT chain_id, id, delivery FROM jobs WHERE status = 'running'
-         UNION
-         SELECT j.chain_id, j.id, j.delivery FROM jobs j
-           JOIN dead_letters d ON d.job_id = j.id
-          WHERE j.status = 'failed' AND d.resolved_at IS NULL AND d.created_at > ?`,
-      )
-      .all(now - keptWorktreeMaxAgeMs) as Array<{ chain_id: number; id: number; delivery: number }>;
-    return new Set(rows.map((r) => key(r.chain_id, r.id, r.delivery)));
+  /**
+   * Deliveries whose workspace must survive a sweep: running jobs and recently dead-lettered (kept)
+   * ones. Re-queries the database on every call: the provider asks again inside its lock right
+   * before removing a directory, so a delivery claimed after the sweep started is seen.
+   */
+  function isLiveDelivery(now: number): (k: string) => boolean {
+    const stmt = deps.db.prepare(
+      `SELECT 1 FROM jobs WHERE status = 'running' AND chain_id = ? AND id = ? AND delivery = ?
+       UNION ALL
+       SELECT 1 FROM jobs j
+         JOIN dead_letters d ON d.job_id = j.id
+        WHERE j.status = 'failed' AND d.resolved_at IS NULL AND d.created_at > ?
+          AND j.chain_id = ? AND j.id = ? AND j.delivery = ?
+       LIMIT 1`,
+    );
+    return (k: string): boolean => {
+      const m = /^(\d+):(\d+):(\d+)$/.exec(k);
+      if (!m) return false;
+      const [c, j, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+      return stmt.get(c, j, d, now - keptWorktreeMaxAgeMs, c, j, d) !== undefined;
+    };
   }
 
   const workspace: WorkspaceProvider = {
@@ -182,7 +191,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       };
       await step(() => sweepUnfiledFollowups(deps.db, deps.host, now));
       await step(() => pruneFiledFollowups(deps.db, now, historyRetentionDays));
-      await step(() => deps.workspaces.sweep(liveDeliveries(now)));
+      await step(() => deps.workspaces.sweep(isLiveDelivery(now), now));
       if (errors.length > 0) throw errors[0];
     },
 

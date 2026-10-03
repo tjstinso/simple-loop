@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -11,6 +11,8 @@ import { GIT_TEST_ENV, makeRemote, type TempRemote } from '../../support/temp-re
 
 const git = (cwd: string, args: string[]) =>
   execFileSync('git', args, { cwd, env: GIT_TEST_ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+const HOUR = 3_600_000;
 
 function chain(id: number, over: Partial<SoftwareState> = {}): ChainView<SoftwareState> {
   return {
@@ -137,7 +139,7 @@ describe('GitWorkspaceProvider', () => {
     const b = await provider.prepare(chain(1), job(1, 2));
     const c = await provider.prepare(chain(2, { issueNumber: 8 }), job(2, 1));
     mkdirSync(join(root, 'junk', 'notes'), { recursive: true });
-    const removed = await provider.sweep(new Set(['1:1:2']));
+    const removed = await provider.sweep(new Set(['1:1:2']), Date.now() + HOUR); // past the sweep grace
     expect(removed.sort()).toEqual([a.path, c.path].sort());
     expect(existsSync(a.path)).toBe(false);
     expect(existsSync(c.path)).toBe(false);
@@ -346,5 +348,44 @@ describe('GitWorkspaceProvider', () => {
       if (saved === undefined) delete process.env.GIT_PROXY_COMMAND;
       else process.env.GIT_PROXY_COMMAND = saved;
     }
+  });
+
+  describe('sweep races', () => {
+    it('re-checks liveness inside the cache lock: a delivery that became live after the snapshot is kept', async () => {
+      const a = await provider.prepare(chain(1), job(1, 1));
+      const b = await provider.prepare(chain(1), job(1, 2));
+      const lock = join(root, '.cache', 'acme__widgets.git.lock');
+      const calls: Array<{ key: string; locked: boolean }> = [];
+      // 1:1:2 is not live in the first look, then a concurrent claim makes it live.
+      const isLive = (key: string): boolean => {
+        const seen = calls.filter((c) => c.key === key).length;
+        calls.push({ key, locked: existsSync(lock) });
+        return key === '1:1:2' && seen > 0;
+      };
+      const removed = await provider.sweep(isLive, Date.now() + HOUR);
+      expect(removed).toEqual([a.path]);
+      expect(existsSync(a.path)).toBe(false);
+      expect(existsSync(b.path)).toBe(true);
+      // The deciding look happens while the cache lock is held.
+      expect(calls.filter((c) => c.key === '1:1:2')).toEqual([
+        { key: '1:1:2', locked: false },
+        { key: '1:1:2', locked: true },
+      ]);
+    });
+
+    it('keeps delivery directories modified within sweepGraceMs (default 10 minutes) and removes older ones', async () => {
+      const a = await provider.prepare(chain(1), job(1, 1));
+      const mtime = statSync(a.path).mtimeMs;
+      expect(await provider.sweep(new Set(), mtime + 9 * 60_000)).toEqual([]);
+      expect(existsSync(a.path)).toBe(true);
+      expect(await provider.sweep(new Set(), mtime + 11 * 60_000)).toEqual([a.path]);
+      expect(existsSync(a.path)).toBe(false);
+
+      const short = new GitWorkspaceProvider({ cloneUrlFor: () => remote.url, root, keepOnFailure: true, sweepGraceMs: 1_000 });
+      const b = await short.prepare(chain(1), job(1, 2));
+      const bm = statSync(b.path).mtimeMs;
+      expect(await short.sweep(new Set(), bm + 500)).toEqual([]);
+      expect(await short.sweep(new Set(), bm + 2_000)).toEqual([b.path]);
+    });
   });
 });

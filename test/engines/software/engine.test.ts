@@ -64,17 +64,17 @@ function make() {
     },
   } as unknown as GitWorkspaceProvider;
   const teardowns: Array<{ jobId: number; delivery: number; outcome: string }> = [];
-  const sweeps: Array<Set<string>> = [];
+  const sweeps: Array<{ isLive: (key: string) => boolean; now: number }> = [];
   let sweepError: Error | null = null;
   const stub = workspaces as unknown as {
     teardown: (c: unknown, j: Job, outcome: string) => Promise<void>;
-    sweep: (live: Set<string>) => Promise<string[]>;
+    sweep: (isLive: (key: string) => boolean, now: number) => Promise<string[]>;
   };
   stub.teardown = async (_c, j, outcome) => {
     teardowns.push({ jobId: j.id, delivery: j.delivery, outcome });
   };
-  stub.sweep = async (live) => {
-    sweeps.push(live);
+  stub.sweep = async (isLive, now) => {
+    sweeps.push({ isLive, now });
     if (sweepError) throw sweepError;
     return [];
   };
@@ -283,7 +283,12 @@ describe('software engine', () => {
       expect(left[0]!.filed_issue_number).not.toBeNull();
       expect(host.issues.size).toBe(2);
       expect(sweeps).toHaveLength(1);
-      expect([...sweeps[0]!].sort()).toEqual(['3:1:4', '3:2:1']);
+      // The provider gets a live-check that re-queries the database (called inside its lock).
+      const candidates = ['3:1:4', '3:2:1', '3:3:5', '3:4:2', '3:5:6', '3:6:3'];
+      expect(candidates.filter((k) => sweeps[0]!.isLive(k))).toEqual(['3:1:4', '3:2:1']);
+      expect(sweeps[0]!.now).toBe(NOW);
+      seedJob(db, 7, 'running', 1); // claimed after the sweep started: the next look sees it
+      expect(sweeps[0]!.isLive('3:7:1')).toBe(true);
     });
 
     it('sweep runs every step and rethrows the first error afterwards', async () => {

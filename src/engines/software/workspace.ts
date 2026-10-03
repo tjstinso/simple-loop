@@ -35,7 +35,14 @@ export interface GitWorkspaceOptions {
   localTimeoutMs?: number;
   /** Limit for fetch and ls-remote (default GIT_NETWORK_TIMEOUT_MS, below lockStaleMs). */
   networkTimeoutMs?: number;
+  /**
+   * The sweep leaves a delivery directory alone while it was modified less than this long ago
+   * (default DEFAULT_SWEEP_GRACE_MS, 10 min); 0 disables the check.
+   */
+  sweepGraceMs?: number;
 }
+
+export const DEFAULT_SWEEP_GRACE_MS = 600_000;
 
 /** A first fetch of a large repository can take minutes; waiting for the lock must outlast it. */
 export const DEFAULT_LOCK_WAIT_MS = 600_000;
@@ -384,12 +391,40 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     );
   }
 
-  /** `liveDeliveries` holds `${chainId}:${jobId}:${delivery}` keys whose worktrees must survive. */
-  async sweep(liveDeliveries: Set<string>): Promise<string[]> {
+  /** Runs `fn` holding every cache lock (taken in a fixed order, so concurrent sweeps cannot deadlock). */
+  private withCaches<T>(caches: string[], fn: () => Promise<T>): Promise<T> {
+    const [first, ...rest] = caches;
+    if (first === undefined) return fn();
+    return this.withCache(first, () => this.withCaches(rest, fn));
+  }
+
+  /** True when the directory was modified within the sweep grace period (or in the future of `now`). */
+  private async isRecent(path: string, now: number): Promise<boolean> {
+    const grace = this.opts.sweepGraceMs ?? DEFAULT_SWEEP_GRACE_MS;
+    if (grace <= 0) return false;
+    try {
+      return now - (await stat(path)).mtimeMs < grace;
+    } catch {
+      return false; // already gone
+    }
+  }
+
+  /**
+   * Removes delivery worktrees (`<root>/<chain>/j<job>-d<delivery>`) that belong to no live delivery.
+   * `live` is a set of `${chainId}:${jobId}:${delivery}` keys, or a function answering for one key; a
+   * function is asked again INSIDE the cache locks immediately before a directory is removed, so a
+   * delivery claimed and prepared after the sweep started is never deleted under its agent. A
+   * directory modified within `sweepGraceMs` of `now` (epoch ms) is kept as well.
+   */
+  async sweep(live: Set<string> | ((key: string) => boolean), now: number): Promise<string[]> {
+    const isLive = typeof live === 'function' ? live : (key: string) => live.has(key);
     const removed: string[] = [];
     if (!existsSync(this.opts.root)) return removed;
     const caches = existsSync(join(this.opts.root, '.cache'))
-      ? (await readdir(join(this.opts.root, '.cache'))).filter((n) => n.endsWith('.git')).map((n) => join(this.opts.root, '.cache', n))
+      ? (await readdir(join(this.opts.root, '.cache')))
+          .filter((n) => n.endsWith('.git'))
+          .sort()
+          .map((n) => join(this.opts.root, '.cache', n))
       : [];
 
     for (const chainDir of await readdir(this.opts.root, { withFileTypes: true })) {
@@ -397,10 +432,13 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       for (const dDir of await readdir(join(this.opts.root, chainDir.name), { withFileTypes: true })) {
         const m = /^j(\d+)-d(\d+)$/.exec(dDir.name);
         if (!dDir.isDirectory() || !m) continue;
-        if (liveDeliveries.has(`${chainDir.name}:${m[1]}:${m[2]}`)) continue;
+        const key = `${chainDir.name}:${m[1]}:${m[2]}`;
+        if (isLive(key)) continue; // cheap first look
         const path = join(this.opts.root, chainDir.name, dDir.name);
-        for (const cache of caches) {
-          await this.withCache(cache, async () => {
+        await this.withCaches(caches, async () => {
+          // The deciding look, under the locks every prepare takes.
+          if (isLive(key) || (await this.isRecent(path, now))) return;
+          for (const cache of caches) {
             // Find the branch this worktree holds so it can be deleted too.
             let branch: string | null = null;
             try {
@@ -414,10 +452,10 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
               /* ignore */
             }
             if (branch !== null) await this.removeDelivery(cache, path, branch);
-          });
-        }
-        await rm(path, { recursive: true, force: true });
-        removed.push(path);
+          }
+          await rm(path, { recursive: true, force: true });
+          removed.push(path);
+        });
       }
     }
     for (const cache of caches) await this.withCache(cache, () => attempt(this.git(cache, ['worktree', 'prune'])));

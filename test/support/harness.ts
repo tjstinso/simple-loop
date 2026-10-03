@@ -145,7 +145,8 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     const clock = () => now;
 
     const host = new FakeGitHost();
-    const workspaces = new GitWorkspaceProvider({ cloneUrlFor: () => r.url, root: workspaceRoot, keepOnFailure: true });
+    // sweepGraceMs 0: the harness clock is fake (START_TIME), so file mtimes cannot be compared with it.
+    const workspaces = new GitWorkspaceProvider({ cloneUrlFor: () => r.url, root: workspaceRoot, keepOnFailure: true, sweepGraceMs: 0 });
     // Wired as in the production composition root (src/cli/runtime.ts).
     const git = new ExecGitPorts({ prepareForPush: (ws) => workspaces.sanitizeForPush(ws) });
 
