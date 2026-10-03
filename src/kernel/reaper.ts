@@ -43,7 +43,8 @@ export function killPidDefault(pid: number): void {
 /**
  * Kill-before-reclaim: for every running job whose lease has strictly expired,
  * first kill the live children of its current delivery and the claiming worker
- * (by pid only), mark the children exited, and only then requeue the job or
+ * (by pid only, and only while that worker's row still names this job delivery
+ * as its current one: a worker that moved on to another job is healthy), mark the children exited, and only then requeue the job or
  * dead-letter it once `delivery >= maxDeliveries`. Never signals this process.
  */
 export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
@@ -81,8 +82,10 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
     const worker =
       job.claimed_by === null
         ? undefined
-        : (db.prepare('SELECT pid, process_start_time FROM workers WHERE id = ?').get(job.claimed_by) as
-            | { pid: number; process_start_time: string | null }
+        : (db
+            .prepare('SELECT pid, process_start_time, current_job_id, current_delivery FROM workers WHERE id = ?')
+            .get(job.claimed_by) as
+            | { pid: number; process_start_time: string | null; current_job_id: number | null; current_delivery: number | null }
             | undefined);
 
     // 1. Kill before any state change.
@@ -92,8 +95,14 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
         report.killed.push(child.pgid);
       }
     }
-    // Worker: by pid only (a shell may share one group across workers), never self.
-    if (worker && worker.pid !== process.pid) {
+    // Worker: by pid only (a shell may share one group across workers), never self, and only
+    // while it is still on this delivery (after a thrown delivery or lost lease it claims other jobs).
+    if (
+      worker &&
+      worker.pid !== process.pid &&
+      worker.current_job_id === job.id &&
+      worker.current_delivery === job.delivery
+    ) {
       const startTime = worker.process_start_time === null ? 0 : Number(worker.process_start_time);
       if (isAlive(worker.pid, startTime)) {
         killPid(worker.pid);

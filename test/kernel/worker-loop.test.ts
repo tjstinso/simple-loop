@@ -403,6 +403,65 @@ describe('worker loop', () => {
     expect(surfaced).toEqual([{ chainId: second.chain.id, state: { count: 0 }, jobId: second.job.id, reason: 'max_deliveries' }]);
   });
 
+  const currentOf = (db: Kernel['deps']['db'], workerId: string) =>
+    db.prepare('SELECT current_job_id AS job, current_delivery AS delivery FROM workers WHERE id = ?').get(workerId);
+
+  it('records the current job delivery on the worker row and clears it when the delivery finishes', async () => {
+    let release!: (v: unknown) => void;
+    const s = track(setup({ runner: customRunner((_i, signal) => Promise.race([new Promise((r) => (release = r)), untilAborted(signal)])) }));
+    const { job } = await s.kernel.enqueue('echo', { key: 'a' });
+    const w = s.start();
+    expect(currentOf(s.db, w.id)).toEqual({ job: null, delivery: null });
+    await tick();
+    expect(currentOf(s.db, w.id)).toEqual({ job: job.id, delivery: 1 });
+    release({ value: 'x' });
+    await tick();
+    expect(getJob(s.db, job.id).status).toBe('succeeded');
+    // The echo chain's follow-on job was claimed next: the row moved on to it.
+    const next = listJobsForChain(s.db, job.chainId)[1]!;
+    expect(next.status).toBe('running');
+    expect(currentOf(s.db, w.id)).toEqual({ job: next.id, delivery: 1 });
+    release({ value: 'y' });
+    await tick();
+    expect(getJob(s.db, next.id).status).toBe('succeeded');
+    expect(currentOf(s.db, w.id)).toEqual({ job: null, delivery: null });
+    await w.stop();
+  });
+
+  it('clears the current job when the delivery throws, loses its lease, or the worker stops', async () => {
+    // Thrown.
+    const t = track(setup());
+    t.fake.script('echo', () => ({ value: 'v' }));
+    const thrown = await t.kernel.enqueue('echo', { key: 'bad' });
+    t.db.exec(`CREATE TRIGGER fail_commit BEFORE UPDATE ON chains WHEN NEW.id = ${thrown.chain.id}
+               BEGIN SELECT RAISE(ABORT, 'disk on fire'); END`);
+    const wt = t.start();
+    await tick();
+    expect(getJob(t.db, thrown.job.id).status).toBe('running');
+    expect(currentOf(t.db, wt.id)).toEqual({ job: null, delivery: null });
+    await wt.stop();
+
+    // Lease lost.
+    const l = track(setup({ runner: customRunner((_i, signal) => untilAborted(signal)) }));
+    const lost = await l.kernel.enqueue('echo', { key: 'a' });
+    const wl = l.start();
+    await tick();
+    expect(currentOf(l.db, wl.id)).toEqual({ job: lost.job.id, delivery: 1 });
+    l.db.prepare("UPDATE jobs SET delivery = delivery + 1, claimed_by = 'other' WHERE id = ?").run(lost.job.id);
+    await tick(HEARTBEAT);
+    expect(currentOf(l.db, wl.id)).toEqual({ job: null, delivery: null });
+    await wl.stop();
+
+    // Stopped mid-run.
+    const st = track(setup({ runner: customRunner((_i, signal) => untilAborted(signal)) }));
+    const stopped = await st.kernel.enqueue('echo', { key: 'a' });
+    const ws = st.start();
+    await tick();
+    expect(currentOf(st.db, ws.id)).toEqual({ job: stopped.job.id, delivery: 1 });
+    await ws.stop();
+    expect(currentOf(st.db, ws.id)).toEqual({ job: null, delivery: null });
+  });
+
   it('a failed surfacing is retried by the next maintenance and then marked', async () => {
     const s = track(setup());
     const { job } = await s.kernel.enqueue('echo', { key: 'a' });

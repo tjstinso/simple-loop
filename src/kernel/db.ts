@@ -47,7 +47,11 @@ CREATE TABLE IF NOT EXISTS workers (
   process_start_time TEXT,
   host TEXT NOT NULL,
   started_at INTEGER NOT NULL,
-  last_seen_at INTEGER NOT NULL
+  last_seen_at INTEGER NOT NULL,
+  -- The job delivery the worker is processing right now (NULL when idle); the reaper kills a
+  -- worker only while it is still on the expired delivery.
+  current_job_id INTEGER,
+  current_delivery INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS child_processes (

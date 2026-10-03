@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { openDb, migrate } from '../../src/kernel/db.js';
 import { claimNext, createChain, getChain, getJob, recordResult } from '../../src/kernel/queue.js';
-import { recordChild, registerWorker, liveChildrenFor } from '../../src/kernel/workers.js';
+import { recordChild, registerWorker, liveChildrenFor, setWorkerJob } from '../../src/kernel/workers.js';
 import { listDeadLetters } from '../../src/kernel/dlq.js';
 import { reapExpired } from '../../src/kernel/reaper.js';
 
@@ -15,7 +15,9 @@ const first = { type: 'build', attempt: 1, policyId: 'p', payload: {} };
 function claimed(db: ReturnType<typeof mk>, key = 'k1', now = 100, leaseMs = 1000) {
   createChain(db, { engine: 'e', subjectKey: key, engineState: {}, firstJob: first }, now);
   registerWorker(db, { id: 'w1', pid: 4001, pgid: 4001, startTime: 5, host: 'h' }, now);
-  return claimNext(db, 'w1', now, leaseMs)!;
+  const job = claimNext(db, 'w1', now, leaseMs)!;
+  setWorkerJob(db, 'w1', job.id, job.delivery); // as the worker loop does at claim
+  return job;
 }
 const status = (db: ReturnType<typeof mk>, id: number) => getJob(db, id).status;
 const alive = () => true;
@@ -141,6 +143,7 @@ describe('reaper', () => {
     createChain(db, { engine: 'e', subjectKey: 'k2', engineState: {}, firstJob: first }, 100);
     registerWorker(db, { id: 'w2', pid: 4002, pgid: 4002, startTime: 6, host: 'h' }, 100);
     const j2 = claimNext(db, 'w2', 100, 1000)!;
+    setWorkerJob(db, 'w2', j2.id, j2.delivery);
     return { j1, j2 };
   }
   function run(db: ReturnType<typeof mk>, j1Id: number, mutate: () => void, killed: number[]) {
@@ -214,5 +217,40 @@ describe('reaper', () => {
     expect(r.errors).toEqual([{ jobId: j1.id, error: 'EPERM' }]);
     expect(status(db, j1.id)).toBe('running');
     expect(r.requeued).toEqual([j2.id]);
+  });
+
+  it('does not kill a worker that moved on to another job, but still reclaims the expired one', () => {
+    const db = mk();
+    const job = claimed(db);
+    // The worker abandoned this delivery (thrown / lease lost) and now works on job 999.
+    setWorkerJob(db, 'w1', 999, 1);
+    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: alive, killGroup: boom, killPid: boom });
+    expect(r.killed).toEqual([]);
+    expect(r.requeued).toEqual([job.id]);
+  });
+
+  it('does not kill a worker that is idle or on another delivery of the same job', () => {
+    for (const set of [
+      (db: ReturnType<typeof mk>) => setWorkerJob(db, 'w1', null, null),
+      (db: ReturnType<typeof mk>, id: number, d: number) => setWorkerJob(db, 'w1', id, d + 1),
+    ]) {
+      const db = mk();
+      const job = claimed(db);
+      set(db, job.id, job.delivery);
+      const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: alive, killGroup: boom, killPid: boom });
+      expect(r.killed).toEqual([]);
+      expect(r.requeued).toEqual([job.id]);
+    }
+  });
+
+  it('kills a worker still on the expired delivery', () => {
+    const db = mk();
+    const job = claimed(db);
+    const row = db.prepare('SELECT current_job_id, current_delivery FROM workers WHERE id = ?').get('w1');
+    expect(row).toEqual({ current_job_id: job.id, current_delivery: job.delivery });
+    const pids: number[] = [];
+    const r = reapExpired(db, { now: 2000, maxDeliveries: 3, groupProbe: () => false, isAlive: alive, killGroup: boom, killPid: (p) => void pids.push(p) });
+    expect(pids).toEqual([4001]);
+    expect(r.killed).toEqual([4001]);
   });
 });

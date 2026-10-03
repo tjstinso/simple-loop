@@ -14,6 +14,7 @@ import {
   ownPgid,
   reapOwnOrphans,
   registerWorker,
+  setWorkerJob,
   touchWorker,
 } from './workers.js';
 
@@ -223,6 +224,14 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       };
     });
 
+  const clearCurrent = (): void => {
+    try {
+      setWorkerJob(db, id, null, null);
+    } catch (e) {
+      report(e);
+    }
+  };
+
   const stopHeartbeat = (d: Delivery): void => {
     if (d.heartbeat !== undefined) clearInterval(d.heartbeat);
     d.heartbeat = undefined;
@@ -250,6 +259,8 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
     if (d.finalized) return;
     d.finalized = true;
     stopHeartbeat(d);
+    // Finished or abandoned: the reaper must no longer treat this worker as the delivery's owner.
+    clearCurrent();
     if (d.leaseLost || d.stopRequested) killChildren(d);
     // Hand an interrupted delivery straight back, unless the lease is no
     // longer ours (then it belongs to its new owner or the reaper). A thrown
@@ -279,6 +290,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
     const loseLease = (): void => {
       d.leaseLost = true;
       stopHeartbeat(d);
+      clearCurrent();
       d.ac.abort(new Error(`lease lost for job ${job.id} delivery ${job.delivery}`));
     };
 
@@ -309,8 +321,10 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       try {
         return await processDelivery(deps, job, id, d.ac.signal);
       } catch (e) {
-        // Stop heartbeating at once so the lease expires and the reaper redelivers.
+        // Stop heartbeating at once so the lease expires and the reaper redelivers; this worker
+        // will claim other jobs, so it is no longer this delivery's owner.
         stopHeartbeat(d);
+        clearCurrent();
         report(e, job);
         return 'threw';
       }
@@ -332,6 +346,11 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
         report(e);
       }
       if (job) {
+        try {
+          setWorkerJob(db, id, job.id, job.delivery);
+        } catch (e) {
+          report(e, job);
+        }
         await runJob(job);
         continue;
       }
@@ -351,6 +370,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       finalize(d, await withTimeout(d.settled, stopTimeoutMs));
     }
     if (maintenanceRun) await withTimeout(maintenanceRun, stopTimeoutMs);
+    clearCurrent();
     resolveDone();
   };
 

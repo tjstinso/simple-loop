@@ -55,7 +55,8 @@ export function registerWorker(
      ON CONFLICT(id) DO UPDATE SET
        pid = excluded.pid, pgid = excluded.pgid,
        process_start_time = excluded.process_start_time, host = excluded.host,
-       started_at = excluded.started_at, last_seen_at = excluded.last_seen_at`,
+       started_at = excluded.started_at, last_seen_at = excluded.last_seen_at,
+       current_job_id = NULL, current_delivery = NULL`,
   ).run({
     id: args.id,
     pid: args.pid,
@@ -64,6 +65,19 @@ export function registerWorker(
     host: args.host,
     now,
   });
+}
+
+/**
+ * Records the job delivery this worker is processing (both null: idle). Set at claim and cleared
+ * when the delivery finishes or is abandoned, so the reaper never kills a worker that moved on.
+ */
+export function setWorkerJob(
+  db: Database.Database,
+  workerId: string,
+  jobId: number | null,
+  delivery: number | null,
+): void {
+  db.prepare('UPDATE workers SET current_job_id = ?, current_delivery = ? WHERE id = ?').run(jobId, delivery, workerId);
 }
 
 export function touchWorker(db: Database.Database, id: string, now: number): void {
