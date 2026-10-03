@@ -137,6 +137,12 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       await deps.host.comment(s.repo, s.issueNumber, body);
     },
 
+    async afterRetry(chain: ChainView<SoftwareState>) {
+      // The retried chain is back in progress: undo surfaceDeadLetter's labels on the issue.
+      const s = chain.state;
+      await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_IN_PROGRESS], [LABEL_DEAD_LETTER]);
+    },
+
     async cleanup(chain, job) {
       // The CURRENT status decides: only a dead-lettered job keeps its workspace (debugging).
       // A succeeded, aborted (still running, delivery lost) or stale delivery is removed.

@@ -1,7 +1,8 @@
 import type Database from 'better-sqlite3';
 import { migrate, openDb } from './db.js';
-import { createChain } from './queue.js';
-import type { Chain, Job, KernelDeps } from './types.js';
+import { retryDeadLetter } from './dlq.js';
+import { createChain, getChain } from './queue.js';
+import type { Chain, ChainView, Job, KernelDeps } from './types.js';
 import { startWorker, type Worker, type WorkerOptions } from './worker-loop.js';
 
 export interface Kernel {
@@ -12,6 +13,12 @@ export interface Kernel {
    * with the policy store's error when no policy matches the first job.
    */
   enqueue(engineId: string, input: unknown): Promise<{ chain: Chain; job: Job }>;
+  /**
+   * Re-queue a dead-lettered job (`retryDeadLetter` in dlq.ts), then call the chain engine's
+   * optional `afterRetry` hook with the chain view and the re-queued job. A hook error is
+   * swallowed; the retry stands. Rejects (nothing changed) when the retry itself is refused.
+   */
+  retryDeadLetter(jobId: number): Promise<Job>;
   startWorker(opts?: WorkerOptions): Worker;
   close(): void;
 }
@@ -59,6 +66,27 @@ export function createKernel(
         },
         deps.clock(),
       );
+    },
+    async retryDeadLetter(jobId) {
+      const job = retryDeadLetter(db, jobId, deps.clock());
+      try {
+        const chain = getChain(db, job.chainId);
+        const engine = deps.engines.get(chain.engine);
+        if (engine.afterRetry) {
+          const parsed = engine.stateSchema.safeParse(chain.engineState);
+          const view: ChainView<unknown> = {
+            id: chain.id,
+            engine: chain.engine,
+            subjectKey: chain.subjectKey,
+            status: chain.status,
+            state: parsed.success ? parsed.data : chain.engineState,
+          };
+          await engine.afterRetry(view, job);
+        }
+      } catch {
+        // Best effort: the retry already committed and the kernel has no logger.
+      }
+      return job;
     },
     startWorker: (o) => startWorker(deps, o),
     close() {

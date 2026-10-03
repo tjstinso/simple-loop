@@ -144,6 +144,12 @@ export interface Engine<S = unknown> {
   runEffect(effect: Effect, ctx: RunEffectContext<S>): Promise<void>;
   describe(chain: ChainView<S>): string;
   surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
+  /**
+   * Optional: called by `Kernel.retryDeadLetter` after a dead-lettered job was re-queued, with the
+   * chain view and the re-queued job (for example to clear a dead-letter marker on the subject).
+   * Errors are swallowed: the retry stands.
+   */
+  afterRetry?(chain: ChainView<S>, job: Job): Promise<void>;
   /** Called after every delivery, whatever its outcome. */
   cleanup(chain: ChainView<S>, job: Job): Promise<void>;
   /** Optional periodic maintenance, called on the kernel's maintenance interval. */

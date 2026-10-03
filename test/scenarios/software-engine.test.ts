@@ -256,12 +256,24 @@ describe('software engine scenarios', () => {
     expect(deliveryDirs(h, chain.id)).toEqual([]);
 
     // Fix the agent, retry the dead letter, run to completion.
-    writesPerAttempt(h);
-    const retried = retryDeadLetter(h.db, failed!.id, h.clock());
+    expect(h.issueLabels(N)).toEqual([LABEL_DEAD_LETTER]);
+    const labelsDuringRun: string[][] = [];
+    h.scriptExecute((input) => {
+      labelsDuringRun.push(h.issueLabels(N));
+      h.write(input, `attempt-${input.job.attempt}.txt`, `attempt ${input.job.attempt}\n`);
+      return ok(`attempt ${input.job.attempt}`);
+    });
+    const retried = await h.kernel.retryDeadLetter(failed!.id);
     expect(retried).toMatchObject({ id: failed!.id, status: 'queued', delivery: 1, result: null, error: null });
     expect(h.chain(chain.id).status).toBe('active');
+    // The engine's afterRetry hook took the issue out of the dead-letter state.
+    expect(h.issueLabels(N)).toEqual([IN_PROGRESS]);
 
     const outcomes = await h.runUntilIdle();
+
+    expect(labelsDuringRun).toEqual([[IN_PROGRESS]]);
+    expect(h.issueLabels(N)).not.toContain(LABEL_DEAD_LETTER);
+    expect(h.issueLabels(N)).toEqual([]);
 
     expect(outcomes.map((o) => [o.type, o.attempt, o.delivery, o.outcome])).toEqual([
       ['execute', 1, 2, 'succeeded'],

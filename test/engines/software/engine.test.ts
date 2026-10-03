@@ -111,6 +111,15 @@ describe('software engine', () => {
     expect(comments[0]).toContain('<!-- factory:chain=3 job=42 event=dead-letter -->');
   });
 
+  it('afterRetry clears the dead-letter label and sets in-progress', async () => {
+    const { host, engine } = make();
+    await engine.surfaceDeadLetter(chain(), dl());
+    expect(host.getLabels(7)).toEqual(['factory:dead-letter']);
+    await engine.afterRetry!(chain(), { ...job(), status: 'queued' });
+    expect(host.getLabels(7)).toEqual([LABEL_IN_PROGRESS]);
+    expect(host.calls.at(-1)).toEqual({ method: 'setLabels', args: [REPO, 7, [LABEL_IN_PROGRESS], ['factory:dead-letter']] });
+  });
+
   it('describe renders repo, phase, attempt and profile', () => {
     expect(make().engine.describe(chain())).toBe('acme/widgets#7 phase=reviewing attempt=2 profile=supervised');
   });
