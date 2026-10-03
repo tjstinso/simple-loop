@@ -63,18 +63,29 @@ describe('FakeGitHost', () => {
     expect(await gh.findIssueByMarker(R, '<!-- k -->')).toBe(1);
     expect(await gh.findIssueByMarker(R, '<!-- nope -->')).toBeNull();
   });
+
+  it('findIssueByMarker honors the label filter', async () => {
+    const gh = new FakeGitHost();
+    gh.addIssue({ title: 'a', body: '<!-- k -->', labels: [] });
+    gh.addIssue({ title: 'b', body: '<!-- k -->', labels: ['factory:followup'] });
+    expect(await gh.findIssueByMarker(R, '<!-- k -->')).toBe(1);
+    expect(await gh.findIssueByMarker(R, '<!-- k -->', 'factory:followup')).toBe(2);
+    expect(await gh.findIssueByMarker(R, '<!-- k -->', 'other')).toBeNull();
+  });
 });
 
 type Call = [string, string[]];
 function stub(responses: Array<{ stdout?: string; stderr?: string; exitCode?: number }>) {
   const calls: Call[] = [];
+  const inputs: Array<string | undefined> = [];
   let i = 0;
-  const exec: ExecFn = async (file, args) => {
+  const exec: ExecFn = async (file, args, opts) => {
     calls.push([file, args]);
+    inputs.push(opts?.input);
     const r = responses[Math.min(i++, responses.length - 1)]!;
     return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', exitCode: r.exitCode ?? 0 };
   };
-  return { exec, calls };
+  return { exec, calls, inputs };
 }
 
 describe('GhCliHost', () => {
@@ -151,6 +162,71 @@ describe('GhCliHost', () => {
   it('findIssueByMarker returns the lowest matching number', async () => {
     const { exec, calls } = stub([{ stdout: JSON.stringify({ items: [{ number: 9 }, { number: 4 }, { number: 6, pull_request: {} }] }) }]);
     expect(await new GhCliHost({ exec }).findIssueByMarker(R, '<!-- k -->')).toBe(4);
-    expect(calls[0]![1]).toEqual(['api', '-X', 'GET', 'search/issues', '-f', 'q=repo:o/r in:body "<!-- k -->"', '-f', 'per_page=100']);
+    expect(calls[0]![1]).toEqual(['api', '-X', 'GET', 'search/issues', '-f', 'q=repo:o/r is:issue in:body "<!-- k -->"', '-f', 'per_page=100']);
+  });
+
+  it('findIssueByMarker with a label lists issues, skips PRs, pages and returns the lowest match', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ number: 100 + i, body: 'nope' }));
+    const page2 = [
+      { number: 50, body: 'has <!-- k -->', pull_request: {} },
+      { number: 30, body: 'has <!-- k -->' },
+      { number: 20, body: null },
+      { number: 40, body: 'also <!-- k -->' },
+    ];
+    const { exec, calls } = stub([{ stdout: JSON.stringify(page1) }, { stdout: JSON.stringify(page2) }]);
+    expect(await new GhCliHost({ exec }).findIssueByMarker(R, '<!-- k -->', 'factory:followup')).toBe(30);
+    expect(calls.map((c) => c[1])).toEqual([
+      ['api', '-X', 'GET', 'repos/o/r/issues', '-f', 'state=all', '-f', 'labels=factory:followup', '-f', 'per_page=100', '-f', 'page=1'],
+      ['api', '-X', 'GET', 'repos/o/r/issues', '-f', 'state=all', '-f', 'labels=factory:followup', '-f', 'per_page=100', '-f', 'page=2'],
+    ]);
+    const none = stub([{ stdout: '[]' }]);
+    expect(await new GhCliHost({ exec: none.exec }).findIssueByMarker(R, '<!-- k -->', 'l')).toBeNull();
+  });
+
+  it('findIssueByMarker without a label falls back to search with is:issue', async () => {
+    const { exec, calls } = stub([{ stdout: JSON.stringify({ items: [] }) }]);
+    expect(await new GhCliHost({ exec }).findIssueByMarker(R, '<!-- k -->')).toBeNull();
+    expect(calls[0]![1]).toContain('q=repo:o/r is:issue in:body "<!-- k -->"');
+  });
+
+  it('openPr sends head, base, title and body on stdin', async () => {
+    const { exec, calls, inputs } = stub([
+      { stdout: JSON.stringify({ number: 12, state: 'open', merged: false, head: { sha: 'h1' }, base: { ref: 'main' } }) },
+    ]);
+    const pr = await new GhCliHost({ exec }).openPr(R, { head: 'feat', base: 'main', title: 'T', body: 'B "q"\n' });
+    expect(pr).toEqual({ number: 12, state: 'open', headSha: 'h1', baseBranch: 'main' });
+    expect(calls).toEqual([['gh', ['api', '-X', 'POST', 'repos/o/r/pulls', '--input', '-']]]);
+    expect(JSON.parse(inputs[0]!)).toEqual({ head: 'feat', base: 'main', title: 'T', body: 'B "q"\n' });
+  });
+
+  it('getPr maps open, closed and merged states', async () => {
+    const mk = (extra: object) => JSON.stringify({ number: 3, head: { sha: 's' }, base: { ref: 'dev' }, ...extra });
+    const open = stub([{ stdout: mk({ state: 'open', merged_at: null }) }]);
+    const closed = stub([{ stdout: mk({ state: 'closed', merged_at: null }) }]);
+    const merged = stub([{ stdout: mk({ state: 'closed', merged_at: '2026-01-01T00:00:00Z' }) }]);
+    expect((await new GhCliHost({ exec: open.exec }).getPr(R, 3)).state).toBe('open');
+    expect((await new GhCliHost({ exec: closed.exec }).getPr(R, 3)).state).toBe('closed');
+    expect(await new GhCliHost({ exec: merged.exec }).getPr(R, 3)).toEqual({ number: 3, state: 'merged', headSha: 's', baseBranch: 'dev' });
+    expect(merged.calls).toEqual([['gh', ['api', '-X', 'GET', 'repos/o/r/pulls/3']]]);
+  });
+
+  it('comment posts the body on stdin', async () => {
+    const { exec, calls, inputs } = stub([{ stdout: '{}' }]);
+    await new GhCliHost({ exec }).comment(R, 8, 'hi <!-- m -->');
+    expect(calls).toEqual([['gh', ['api', '-X', 'POST', 'repos/o/r/issues/8/comments', '--input', '-']]]);
+    expect(JSON.parse(inputs[0]!)).toEqual({ body: 'hi <!-- m -->' });
+  });
+
+  it('createIssue sends title, body and labels and returns the number', async () => {
+    const { exec, calls, inputs } = stub([{ stdout: JSON.stringify({ number: 21 }) }]);
+    expect(await new GhCliHost({ exec }).createIssue(R, { title: 'T', body: 'B', labels: ['a', 'b'] })).toBe(21);
+    expect(calls).toEqual([['gh', ['api', '-X', 'POST', 'repos/o/r/issues', '--input', '-']]]);
+    expect(JSON.parse(inputs[0]!)).toEqual({ title: 'T', body: 'B', labels: ['a', 'b'] });
+  });
+
+  it('setLabels sends a deduplicated labels array on stdin when adding', async () => {
+    const { exec, inputs } = stub([{ stdout: '[]' }]);
+    await new GhCliHost({ exec }).setLabels(R, 5, ['a', 'b', 'a'], []);
+    expect(JSON.parse(inputs[0]!)).toEqual({ labels: ['a', 'b'] });
   });
 });

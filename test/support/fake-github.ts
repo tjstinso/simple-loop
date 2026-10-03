@@ -130,9 +130,11 @@ export class FakeGitHost implements GitHost {
     this.comments.set(n, [...(this.comments.get(n) ?? []), body]);
   }
 
-  async findIssueByMarker(repo: string, marker: string): Promise<number | null> {
-    this.enter('findIssueByMarker', [repo, marker]);
-    const nums = [...this.issues.values()].filter((i) => i.body.includes(marker)).map((i) => i.number);
+  async findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null> {
+    this.enter('findIssueByMarker', [repo, marker, label]);
+    const nums = [...this.issues.values()]
+      .filter((i) => i.body.includes(marker) && (label === undefined || this.labels.get(i.number)?.has(label)))
+      .map((i) => i.number);
     return nums.length ? Math.min(...nums) : null;
   }
 

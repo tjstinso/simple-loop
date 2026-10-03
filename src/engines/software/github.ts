@@ -23,7 +23,7 @@ export interface GitHost {
   setLabels(repo: string, n: number, add: string[], remove: string[]): Promise<void>;
   findComment(repo: string, n: number, marker: string): Promise<boolean>;
   comment(repo: string, n: number, body: string): Promise<void>;
-  findIssueByMarker(repo: string, marker: string): Promise<number | null>;
+  findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null>;
   createIssue(repo: string, args: { title: string; body: string; labels: string[] }): Promise<number>;
   mergePr(repo: string, n: number): Promise<void>;
 }
@@ -102,8 +102,15 @@ export const buildCommentArgs = (repo: string, n: number): string[] => [
 
 export const buildSearchIssuesArgs = (repo: string, marker: string): string[] => [
   'api', '-X', 'GET', 'search/issues',
-  '-f', `q=repo:${repo} in:body "${marker.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
+  '-f', `q=repo:${repo} is:issue in:body "${marker.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
   '-f', 'per_page=100',
+];
+
+// Read-after-write consistent lookup (the search index is eventually consistent).
+// With `-X GET`, gh sends `-f` fields as URL-encoded query parameters, so the label is encoded by gh.
+export const buildListIssuesByLabelArgs = (repo: string, label: string, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/issues`,
+  '-f', 'state=all', '-f', `labels=${label}`, '-f', 'per_page=100', '-f', `page=${page}`,
 ];
 
 export const buildCreateIssueArgs = (repo: string): string[] => [
@@ -219,7 +226,20 @@ export class GhCliHost implements GitHost {
     await this.run(buildCommentArgs(repo, n), { body });
   }
 
-  async findIssueByMarker(repo: string, marker: string): Promise<number | null> {
+  async findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null> {
+    if (label !== undefined) {
+      let best: number | null = null;
+      for (let page = 1; ; page++) {
+        const items = await this.json<Array<{ number: number; body?: string | null; pull_request?: unknown }>>(
+          buildListIssuesByLabelArgs(repo, label, page),
+        );
+        for (const i of items) {
+          if (i.pull_request || !(i.body ?? '').includes(marker)) continue;
+          if (best === null || i.number < best) best = i.number;
+        }
+        if (items.length < 100) return best;
+      }
+    }
     const r = await this.json<{ items?: Array<{ number: number; pull_request?: unknown }> }>(
       buildSearchIssuesArgs(repo, marker),
     );
