@@ -80,6 +80,23 @@ A real boundary needs deployment, not code: run the worker under a dedicated low
 
 `bare: false` is the weaker opt-out: the agent gets your whole environment minus the `GH_*` and `GITHUB_*` variables and `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`, `GIT_SSH_COMMAND` and `GIT_SSH`, with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and an empty per-run `GH_CONFIG_DIR`, and no `--bare`. It keeps your `HOME` (the `claude` CLI uses its own login there), `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` (so `gh auth token` or `git credential fill` can reach the OS keyring) and any cloud credentials in the environment, so the credential files under your `HOME` and the OS keyring stay reachable with ordinary commands (for example `GH_CONFIG_DIR=~/.config/gh gh auth token`). A keyring login is not safer than a plaintext one there.
 
+#### Secret guard
+
+The model API key is in the agent's environment, and a shell-capable agent could write it (or another secret it can reach) into a file in its worktree, by mistake or because an issue told it to. Since the engine commits with `git add -A` and pushes, `commit_push` checks the change before pushing. This is defense in depth, not a guarantee.
+
+- What is scanned: what the push would publish beyond the commit the delivery was seeded from, that is every commit in `seed..HEAD` (including commits the agent made itself, and a file added in one commit and deleted in a later one), each compared with its first parent. For each commit: the paths it adds or modifies, its added lines, and its author, committer and message. Binary files are checked by path only. The change's own `.gitattributes` cannot mark a text file as binary to hide it (git 2.42 or newer), but an `info/attributes` file in the shared cache repository still can. At most 5 MiB of text is scanned; a larger change is refused as `scan-truncated`.
+- What is matched: the named patterns `anthropic-key` (`sk-ant-...`), `github-token` (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`), `github-fine-grained-token` (`github_pat_...`), `aws-access-key-id` (`AKIA...`), `private-key` (a `-----BEGIN ... PRIVATE KEY-----` line), `slack-token` (`xoxb-` and similar) and `google-api-key` (`AIza...`); `known-secret-value`, the exact value of `ANTHROPIC_API_KEY`, of every variable in the worker's environment whose name contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or `CREDENTIAL` (any case), and of the variables the claude-cli policies list in `passEnv` (values shorter than 12 characters, or one repeated character, are ignored); and `secret-file`, an added file named `.env`, `.env.*` (except `.env.example`, `.env.sample` and `.env.template`), `*.env`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.npmrc`, `.netrc`, `credentials` or `credentials.json`.
+- What happens on a match: nothing is pushed and no PR is opened. The execute job is dead-lettered as `runner_error` with `effect 'commit_push' failed: refusing to push: the change contains a secret (<kinds>); the matched text is not shown`, and that message is what the issue comment shows. The matched text is never shown in the error, the dead letter, the issue comment or the logs. With `keepWorktreeOnFailure` the worktree, secret included, is kept for inspection; delete it once you have looked (the sweep removes it after `keptWorktreeMaxAgeMs`). `factory dlq retry` reruns the agent in a fresh worktree; `factory dlq discard` gives up.
+- Redaction: the commit message (built from the issue title), the PR title and the agent's summary in the PR body have every pattern match and known value replaced with `[redacted]`.
+
+Limits:
+
+- It matches patterns and exact values only. An encoded, obfuscated or split secret, or a secret that is neither in the worker's environment nor shaped like one of the patterns, is not recognized.
+- Beyond the redaction above it does not inspect the PR title or body, and it does not cover what the agent prints to its own output, which the factory stores (the job result in the database, the step log).
+- It does not stop the agent from using a secret in other ways (sending it over the network, for example); the key is in its environment by design.
+- It does not replace rotating a key: if the guard fired, the secret was written to a worktree on the worker's disk, and a pushed or otherwise leaked key must be rotated.
+- It can refuse legitimate changes: a test fixture that looks like a token, a `*.key` or `*.pem` file, or a value of a secret-named variable that also appears in the code. Such a change has to be pushed by hand, or the variable removed from the worker's environment.
+
 ## Install and build
 
 ```

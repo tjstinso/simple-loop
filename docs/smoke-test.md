@@ -130,6 +130,12 @@ Recover:
 2. After the execute or review job finishes, expected: new issues in the sandbox repository labeled `factory:followup`, whose body is the item's body, then `Discovered while working on #<n>.`, then a hidden marker `<!-- factory:chain=<c> job=<j> followup=<position> -->`.
 3. Idempotency check: stop and restart the worker, wait for a maintenance pass (about a minute) and confirm no duplicate follow-up issues appear. Inspect rows with `sqlite3 /tmp/factory-smoke/factory.db "select job_id, position, title, filed_issue_number from followups"`; `filed_issue_number` must be set.
 
+## (f) Secret guard
+
+1. Create an issue whose Goal says: "Create `fixtures/token.txt` containing exactly the text `ghp_` followed by 36 letters `a`." (Describe the token instead of pasting one, so the issue itself holds no token-shaped string.) Submit it and run the worker.
+2. Expected: the execute job is dead-lettered with reason `runner_error` and the error `effect 'commit_push' failed: refusing to push: the change contains a secret (github-token); the matched text is not shown`; the issue gets `factory:dead-letter` and a comment with that message and no token; no branch `factory/issue-<n>` exists on GitHub and no PR was opened; the kept worktree contains `fixtures/token.txt`.
+3. Clean up: `factory dlq discard <job-id>` and delete the kept worktree.
+
 ## What only a real run can confirm
 
 Each item is an assumption the automated tests could not verify. Check them while doing the runs above.

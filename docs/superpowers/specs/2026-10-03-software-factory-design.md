@@ -406,7 +406,7 @@ The engine adds `factory:dead-letter` to the issue, removes `factory:in-progress
 
 GitHub is the source of truth, and the engine looks before acting. Before each external effect it re-reads the job's `delivery` through the fence token.
 
-- **Branch:** deterministic name. Pushing is an engine effect only; the runner is not given push credentials by the factory (see section 5 for the residual risk) and the workspace's push URL is disabled. Pushes use `--force-with-lease` against the sha the delivery was seeded from, so a stale push fails once the branch has moved.
+- **Branch:** deterministic name. Pushing is an engine effect only; the runner is not given push credentials by the factory (see section 5 for the residual risk) and the workspace's push URL is disabled. Pushes use `--force-with-lease` against the sha the delivery was seeded from, so a stale push fails once the branch has moved. Before pushing, `commit_push` scans what the push would publish (every commit in `seed..HEAD`: added paths, added lines, commit metadata) for secret-looking file names, known token patterns and the exact values of the worker's secret-looking environment variables, and refuses with `runner_error`, naming only the kinds found, on any match (R50; pattern and value based, defense in depth only).
 - **PR:** look up by head branch before creating one.
 - **Labels:** set and remove specific labels, never toggle.
 - **Merge:** check the PR state first.
