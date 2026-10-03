@@ -69,6 +69,8 @@ export function softwareTransition(
         newJobs: [],
         effects: [
           { kind: 'set_labels', target: 'pr', add: [LABEL_READY_FOR_MERGE], remove: [LABEL_IN_PROGRESS] },
+          // in-progress lives on the issue (set by the execute transition).
+          { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
           ...followups,
         ],
       };
@@ -89,6 +91,7 @@ export function softwareTransition(
       newJobs: [],
       effects: [
         { kind: 'set_labels', target: 'pr', add: [LABEL_NEEDS_HUMAN], remove: [LABEL_IN_PROGRESS] },
+        { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
         ...followups,
       ],
     };

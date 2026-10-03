@@ -66,7 +66,10 @@ describe('softwareTransition', () => {
     expect(t).toEqual({
       engineState: baseState({ phase: 'awaiting_merge' }),
       chainStatus: 'waiting',
-      effects: [{ kind: 'set_labels', target: 'pr', add: [LABEL_READY_FOR_MERGE], remove: [LABEL_IN_PROGRESS] }],
+      effects: [
+        { kind: 'set_labels', target: 'pr', add: [LABEL_READY_FOR_MERGE], remove: [LABEL_IN_PROGRESS] },
+        { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
+      ],
       newJobs: [],
     });
   });
@@ -107,7 +110,10 @@ describe('softwareTransition', () => {
     expect(t).toEqual({
       engineState: baseState({ attempt: max, phase: 'needs_human' }),
       chainStatus: 'waiting',
-      effects: [{ kind: 'set_labels', target: 'pr', add: [LABEL_NEEDS_HUMAN], remove: [LABEL_IN_PROGRESS] }],
+      effects: [
+        { kind: 'set_labels', target: 'pr', add: [LABEL_NEEDS_HUMAN], remove: [LABEL_IN_PROGRESS] },
+        { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
+      ],
       newJobs: [],
     });
   });
@@ -128,6 +134,7 @@ describe('softwareTransition', () => {
     });
     expect(sup.effects).toEqual([
       { kind: 'set_labels', target: 'pr', add: [LABEL_READY_FOR_MERGE], remove: [LABEL_IN_PROGRESS] },
+      { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
       fx,
     ]);
     const auto = softwareTransition(chainOf(baseState({ profile: 'automatic' })), jobOf('review'), {
