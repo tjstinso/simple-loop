@@ -244,6 +244,50 @@ describe('ExecGitPorts', () => {
       await expect(ports.push(ws, { sha: '--all', remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toThrow(/invalid/);
     });
 
+    describe("with a hostile global git config in the worker's environment", () => {
+      // The PARENT process environment points at a scratch HOME and config the test controls (never
+      // the real ones); ExecGitPorts reads process.env when it runs git.
+      const saved: Record<string, string | undefined> = {};
+      const NAMES = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'];
+      beforeEach(() => {
+        for (const n of NAMES) saved[n] = process.env[n];
+        const home = join(root, 'home');
+        mkdirSync(join(home, '.config', 'git'), { recursive: true });
+        writeFileSync(join(home, '.config', 'git', 'attributes'), '* -diff binary\n');
+        const cfg = join(home, '.gitconfig');
+        writeFileSync(cfg, '[log]\n\tshowRoot = false\n[core]\n\tbigFileThreshold = 1\n[push]\n\tfollowTags = true\n');
+        process.env.HOME = home;
+        process.env.XDG_CONFIG_HOME = join(home, '.config');
+        process.env.GIT_CONFIG_GLOBAL = cfg;
+        delete process.env.GIT_CONFIG_NOSYSTEM;
+      });
+      afterEach(() => {
+        for (const n of NAMES) {
+          if (saved[n] === undefined) delete process.env[n];
+          else process.env[n] = saved[n];
+        }
+      });
+
+      it('still scans an orphan root commit and file contents', async () => {
+        git(ws.path, ['checkout', '-q', '--orphan', 'elsewhere']);
+        git(ws.path, ['rm', '-q', '-r', '--cached', '.']);
+        writeFileSync(join(ws.path, 'planted.txt'), 'planted in an orphan root\n');
+        git(ws.path, ['add', 'planted.txt']);
+        git(ws.path, ['commit', '-q', '-m', 'orphan']);
+        const c = await ports.addedChanges(ws, await ports.headSha(ws));
+        expect(c.paths).toContain('planted.txt');
+        expect(c.text.split('\n')).toContain('planted in an orphan root');
+      });
+
+      it('push does not follow tags', async () => {
+        writeFileSync(join(ws.path, 't.txt'), 't\n');
+        await ports.commitAll(ws, 't');
+        git(ws.path, ['tag', '-a', '-m', 'tag message', 'v-follow', 'HEAD']);
+        await ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null });
+        expect(git(remote.path, ['tag', '--list'])).toBe('');
+      });
+    });
+
     it('is empty when HEAD is the seed', async () => {
       expect(await ports.addedChanges(ws, await ports.headSha(ws))).toEqual({ paths: [], text: '', truncated: false });
     });

@@ -408,6 +408,26 @@ describe('runSoftwareEffect', () => {
     expect(delays).toEqual([100, 200]);
   });
 
+  it('a failing secret scan is a runner_error and nothing is pushed', async () => {
+    const pushed: string[] = [];
+    const scanFails: GitPorts = {
+      commitAll: async () => true,
+      headSha: async () => 'new',
+      addedChanges: async () => {
+        throw new Error('git log timed out after 60000 ms');
+      },
+      push: async () => void pushed.push('push'),
+    };
+    // Also for a job type outside the execute-only runner_error mapping: the scan itself classifies.
+    for (const j of [job(), job({ type: 'review' })]) {
+      const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx({ git: scanFails, job: j }), fence()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EffectError);
+      expect((err as EffectError).reason).toBe('runner_error');
+      expect((err as Error).message).toBe('refusing to push: the secret scan failed: git log timed out after 60000 ms');
+    }
+    expect(pushed).toEqual([]);
+  });
+
   it("an execute job's open_pr host failure is a runner_error", async () => {
     host.failNext('openPr', new GitHostError('Validation Failed', 422));
     const err = await runSoftwareEffect({ kind: 'open_pr' }, ctx(), fence()).catch((e: unknown) => e);

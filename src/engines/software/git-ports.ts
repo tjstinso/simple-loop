@@ -54,6 +54,25 @@ const BRANCH_RE = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/;
 // Neutralize hooks and signing the agent (or a user's global config) might have set up.
 const SAFE_CONFIG = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false'];
 
+/**
+ * The secret scan (and the HEAD it pins) must not depend on the worker's own git configuration: a
+ * global or system `log.showRoot=false` hides an orphan root commit, `core.bigFileThreshold` or a
+ * global attributes file can turn files binary. Scan commands therefore ignore the global and system
+ * config and any config passed through the environment, and pin the settings that matter. (The push
+ * itself keeps the operator's configuration: it needs the credential helper or ssh setup.)
+ */
+const SCAN_CONFIG = ['-c', 'core.attributesFile=/dev/null', '-c', 'log.showRoot=true', '-c', 'core.bigFileThreshold=1g'];
+
+function scanEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  for (const k of Object.keys(out)) {
+    if (k === 'GIT_CONFIG_PARAMETERS' || k === 'GIT_CONFIG_COUNT' || k === 'GIT_CONFIG' || k.startsWith('GIT_CONFIG_KEY_') || k.startsWith('GIT_CONFIG_VALUE_')) {
+      delete out[k];
+    }
+  }
+  return out;
+}
+
 interface GitResult {
   stdout: string;
   stderr: string;
@@ -74,17 +93,25 @@ function gitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function run(cwd: string, args: string[], timeoutMs: number, input?: string): Promise<GitResult> {
+/** The git subcommand of an argument list (after any leading `-c key=value` pairs), for messages. */
+function subcommand(args: string[]): string {
+  let i = 0;
+  while (args[i] === '-c') i += 2;
+  return args[i] ?? 'command';
+}
+
+/** Runs git; `scan` isolates it from the worker's git configuration (see SCAN_CONFIG). */
+function run(cwd: string, args: string[], timeoutMs: number, input?: string, scan = false): Promise<GitResult> {
   return new Promise((resolve) => {
     const child = execFile(
       'git',
-      [...SAFE_CONFIG, ...args],
-      { cwd, env: gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+      [...SAFE_CONFIG, ...(scan ? SCAN_CONFIG : []), ...args],
+      { cwd, env: scan ? scanEnv(gitEnv()) : gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
         if (!err) return resolve({ stdout, stderr, code: 0 });
         const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string | null };
         if (e.killed === true && e.signal === 'SIGKILL') {
-          return resolve({ stdout: stdout ?? '', stderr: `git ${args[0]} timed out after ${timeoutMs} ms`, code: -1 });
+          return resolve({ stdout: stdout ?? '', stderr: `git ${subcommand(args)} timed out after ${timeoutMs} ms`, code: -1 });
         }
         const code = e.code;
         resolve({ stdout: stdout ?? '', stderr: String(stderr || err.message), code: typeof code === 'number' ? code : 1 });
@@ -98,7 +125,8 @@ function run(cwd: string, args: string[], timeoutMs: number, input?: string): Pr
 }
 
 /**
- * Runs git like `run`, but hands stdout to `onData` chunk by chunk instead of buffering it. When
+ * Runs a scan git command (isolated like `run` with `scan`), but hands stdout to `onData` chunk by
+ * chunk instead of buffering it. When
  * `onData` returns false, git is killed and the result has `stopped: true` (its exit code is then
  * meaningless). A command still running at `timeoutMs` is killed and reported as code -1.
  */
@@ -106,12 +134,11 @@ function stream(
   cwd: string,
   args: string[],
   timeoutMs: number,
-  extraEnv: NodeJS.ProcessEnv,
   onData: (chunk: string) => boolean,
   input?: string,
 ): Promise<{ code: number; stderr: string; stopped: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn('git', [...SAFE_CONFIG, ...args], { cwd, env: { ...gitEnv(), ...extraEnv }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('git', [...SAFE_CONFIG, ...SCAN_CONFIG, ...args], { cwd, env: scanEnv(gitEnv()), stdio: ['pipe', 'pipe', 'pipe'] });
     // git may exit without reading stdin (EPIPE); its exit code decides the outcome.
     child.stdin.on('error', () => undefined);
     child.stdin.end(input ?? '');
@@ -196,8 +223,8 @@ function lineSplitter(onLine: (line: string) => boolean, overflows: (pending: st
   };
 }
 
-async function must(cwd: string, args: string[], timeoutMs: number, input?: string): Promise<string> {
-  const r = await run(cwd, args, timeoutMs, input);
+async function must(cwd: string, args: string[], timeoutMs: number, input?: string, scan = false): Promise<string> {
+  const r = await run(cwd, args, timeoutMs, input, scan);
   if (r.code !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
   return r.stdout.trim();
 }
@@ -239,7 +266,8 @@ export class ExecGitPorts implements GitPorts {
   }
 
   async headSha(ws: SoftwareWorkspace): Promise<string> {
-    return must(ws.path, ['rev-parse', '--verify', 'HEAD^{commit}'], this.local);
+    // The sha commit_push scans and pushes: resolved with the scan's isolation.
+    return must(ws.path, ['rev-parse', '--verify', 'HEAD^{commit}'], this.local, undefined, true);
   }
 
   async push(ws: SoftwareWorkspace, a: { sha: string; remoteBranch: string; expectSha: string | null }): Promise<void> {
@@ -251,7 +279,10 @@ export class ExecGitPorts implements GitPorts {
       throw new Error(`invalid expected sha: ${JSON.stringify(a.expectSha)}`);
     }
     const ref = `refs/heads/${a.remoteBranch}`;
+    // The operator's config stays (credentials), but tags are never pushed along with the commit.
     const r = await run(ws.path, [
+      '-c',
+      'push.followTags=false',
       'push',
       '--no-verify',
       '--porcelain',
@@ -278,15 +309,15 @@ export class ExecGitPorts implements GitPorts {
 
     // Paths added, modified or type-changed by any commit (renames as delete + add, so a file renamed
     // to `.env` is listed). NUL-separated: odd names survive.
-    const names = await run(ws.path, ['log', '--format=', '--name-only', '--no-renames', '--diff-filter=AMT', '-z', ...perCommit], this.local);
+    const names = await run(ws.path, ['log', '--format=', '--name-only', '--no-renames', '--diff-filter=AMT', '-z', ...perCommit], this.local, undefined, true);
     if (names.code !== 0) throw new Error(`git log failed: ${names.stderr.trim() || `exit ${names.code}`}`);
     const paths = [...new Set(names.stdout.split('\0').filter((p) => p !== ''))];
 
     const out = new CappedText(this.scanCap);
-    const collect = async (args: string[], extraEnv: NodeJS.ProcessEnv, onLine: (line: string) => boolean, input?: string) => {
+    const collect = async (args: string[], onLine: (line: string) => boolean, input?: string) => {
       if (out.truncated) return;
       const lines = lineSplitter(onLine, (pending) => out.overflows(pending));
-      const r = await stream(ws.path, args, this.local, extraEnv, (chunk) => lines.push(chunk), input);
+      const r = await stream(ws.path, args, this.local, (chunk) => lines.push(chunk), input);
       if (r.stopped) return;
       if (r.code !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
       lines.end();
@@ -295,11 +326,11 @@ export class ExecGitPorts implements GitPorts {
     // The commit objects are pushed too. Read each exactly as stored (`cat-file --batch`): every
     // header, including an extra header a hand-built commit carries and the `encoding` header, which
     // `--pretty=raw` does not print. Then each message as git displays it (re-encoded to UTF-8).
-    const commits = await run(ws.path, ['rev-list', range], this.local);
+    const commits = await run(ws.path, ['rev-list', range], this.local, undefined, true);
     if (commits.code !== 0) throw new Error(`git rev-list failed: ${commits.stderr.trim() || `exit ${commits.code}`}`);
     const shas = commits.stdout.split('\n').filter((l) => SHA_RE.test(l));
-    if (shas.length > 0) await collect(['cat-file', '--batch'], {}, (line) => out.add(line), `${shas.join('\n')}\n`);
-    await collect(['log', '--format=%B', ...perCommit], {}, (line) => out.add(line));
+    if (shas.length > 0) await collect(['cat-file', '--batch'], (line) => out.add(line), `${shas.join('\n')}\n`);
+    await collect(['log', '--format=%B', ...perCommit], (line) => out.add(line));
 
     // Added lines only (`+` lines inside hunks; the `+++` file header is outside them, so an added
     // line that itself starts with `++` is kept). `--text` diffs every file as text, so neither real
@@ -308,7 +339,6 @@ export class ExecGitPorts implements GitPorts {
     let inHunk = false;
     await collect(
       ['log', '--format=', '-p', '--text', '--unified=0', '--no-ext-diff', '--no-textconv', '-M', ...perCommit],
-      {},
       (line) => {
         if (line.startsWith('diff --git ')) inHunk = false;
         else if (line.startsWith('@@')) inHunk = true;

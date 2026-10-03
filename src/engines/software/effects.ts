@@ -167,7 +167,14 @@ const secretValuesOf = (ctx: EffectContext): readonly string[] => ctx.secretValu
  * secret value, or was too large to scan whole. The message names only the kinds, never the text.
  */
 async function assertNoSecrets(ctx: EffectContext, ws: SoftwareWorkspace, sha: string): Promise<void> {
-  const changes = await ctx.git.addedChanges(ws, sha);
+  let changes: Awaited<ReturnType<GitPorts['addedChanges']>>;
+  try {
+    changes = await ctx.git.addedChanges(ws, sha);
+  } catch (e) {
+    // Fail closed, as an agent-caused failure (a huge or odd change): a retry reruns the agent.
+    if (e instanceof StaleDeliveryError) throw e;
+    throw new EffectError(`refusing to push: the secret scan failed: ${e instanceof Error ? e.message : String(e)}`, 'runner_error');
+  }
   const values = secretValuesOf(ctx);
   const kinds = [
     ...scanPaths(changes.paths),
