@@ -35,14 +35,15 @@ export interface SoftwareEngineDeps {
 export const LABEL_DEAD_LETTER = 'factory:dead-letter';
 
 export type SoftwareEngine = Engine<SoftwareState> & {
-  /** Evicts the cached workspace of one delivery (used by cleanup). */
-  forgetWorkspace(chainId: number, delivery: number): void;
+  /** Evicts the cached workspace of one delivery of one job (used by cleanup). */
+  forgetWorkspace(chainId: number, jobId: number, delivery: number): void;
 };
 
 export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const cache = new Map<string, SoftwareWorkspace>();
-  const key = (chainId: number, delivery: number) => `${chainId}:${delivery}`;
-  const forget = (chainId: number, delivery: number) => void cache.delete(key(chainId, delivery));
+  // `delivery` restarts at 1 for every job, so a delivery is identified by (chain, job, delivery).
+  const key = (chainId: number, jobId: number, delivery: number) => `${chainId}:${jobId}:${delivery}`;
+  const forget = (chainId: number, jobId: number, delivery: number) => void cache.delete(key(chainId, jobId, delivery));
   const historyRetentionDays = deps.config.historyRetentionDays ?? 30;
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
 
@@ -50,20 +51,20 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   function liveDeliveries(now: number): Set<string> {
     const rows = deps.db
       .prepare(
-        `SELECT chain_id, delivery FROM jobs WHERE status = 'running'
+        `SELECT chain_id, id, delivery FROM jobs WHERE status = 'running'
          UNION
-         SELECT j.chain_id, j.delivery FROM jobs j
+         SELECT j.chain_id, j.id, j.delivery FROM jobs j
            JOIN dead_letters d ON d.job_id = j.id
           WHERE j.status = 'failed' AND d.resolved_at IS NULL AND d.created_at > ?`,
       )
-      .all(now - keptWorktreeMaxAgeMs) as Array<{ chain_id: number; delivery: number }>;
-    return new Set(rows.map((r) => key(r.chain_id, r.delivery)));
+      .all(now - keptWorktreeMaxAgeMs) as Array<{ chain_id: number; id: number; delivery: number }>;
+    return new Set(rows.map((r) => key(r.chain_id, r.id, r.delivery)));
   }
 
   const workspace: WorkspaceProvider = {
     async prepare(chain: ChainView<any>, job: Job): Promise<Workspace> {
       const ws = await deps.workspaces.prepare(chain, job);
-      cache.set(key(chain.id, job.delivery), ws as SoftwareWorkspace);
+      cache.set(key(chain.id, job.id, job.delivery), ws as SoftwareWorkspace);
       return ws;
     },
   };
@@ -103,7 +104,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         {
           chain: ctx.chain,
           job: ctx.job,
-          workspace: cache.get(key(ctx.chain.id, ctx.job.delivery)) ?? null,
+          workspace: cache.get(key(ctx.chain.id, ctx.job.id, ctx.job.delivery)) ?? null,
           host: deps.host,
           git: deps.git,
           sleep: deps.sleep,
@@ -141,7 +142,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       // A succeeded, aborted (still running, delivery lost) or stale delivery is removed.
       const row = deps.db.prepare('SELECT status FROM jobs WHERE id = ?').get(job.id) as { status: string } | undefined;
       const outcome = row?.status === 'failed' ? 'failed' : 'ok';
-      forget(chain.id, job.delivery);
+      forget(chain.id, job.id, job.delivery);
       await deps.workspaces.teardown(chain, job, outcome);
     },
 

@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { SoftwareWorkspace } from '../../src/engines/software/workspace.js';
@@ -78,6 +78,16 @@ describe('zombie deliveries', () => {
     const callsBefore = x.host.calls.length;
     const logBefore = x.workspaceLog.length;
 
+    // While the zombie is still in flight, the review job's delivery-1 prepare neither removed nor
+    // reused the zombie's delivery-1 worktree: same delivery number, different job.
+    const zombieDir = join(x.workspaceRoot, String(chain.id), `j${job.id}-d1`);
+    const reviewPrep = x.workspaceLog.find((e) => e.op === 'prepare' && e.type === 'review')!;
+    expect(reviewPrep).toMatchObject({ jobId: job.id + 1, delivery: 1 });
+    expect(reviewPrep.path).toBe(join(x.workspaceRoot, String(chain.id), `j${job.id + 1}-d1`));
+    expect(reviewPrep.path).not.toBe(zombieDir);
+    expect(existsSync(zombieDir)).toBe(true);
+    expect(readFileSync(join(zombieDir, 'zombie.txt'), 'utf8')).toBe('written by delivery 1\n');
+
     // Now the zombie's runner returns its result.
     zombieGate.resolve();
     expect(await zombie).toBe('stale');
@@ -97,10 +107,10 @@ describe('zombie deliveries', () => {
 
     // The two deliveries used different workspaces and local branches.
     const [w1, w2] = x.callsOf('execute').map((c) => c.workspace as SoftwareWorkspace);
-    expect(w1!.path).toBe(join(x.workspaceRoot, String(chain.id), 'd1'));
-    expect(w2!.path).toBe(join(x.workspaceRoot, String(chain.id), 'd2'));
-    expect(w1!.localBranch).toBe(`${BRANCH}-c${chain.id}-d1`);
-    expect(w2!.localBranch).toBe(`${BRANCH}-c${chain.id}-d2`);
+    expect(w1!.path).toBe(join(x.workspaceRoot, String(chain.id), `j${job.id}-d1`));
+    expect(w2!.path).toBe(join(x.workspaceRoot, String(chain.id), `j${job.id}-d2`));
+    expect(w1!.localBranch).toBe(`${BRANCH}-c${chain.id}-j${job.id}-d1`);
+    expect(w2!.localBranch).toBe(`${BRANCH}-c${chain.id}-j${job.id}-d2`);
     expect(w2!.seedSha).toBe(w1!.seedSha); // both seeded from main: the zombie never published
     expect(w2!.remoteHeadSha).toBeNull();
 
@@ -178,6 +188,6 @@ describe('zombie deliveries', () => {
     expect(await crashed).toBe('stale');
     expect(published(x)).toEqual(before);
     expect(x.callsOf('review')).toHaveLength(1);
-    expect(existsSync(join(x.workspaceRoot, String(chain.id), 'd1'))).toBe(false);
+    expect(existsSync(join(x.workspaceRoot, String(chain.id), `j${recorded.id}-d1`))).toBe(false);
   });
 });

@@ -234,7 +234,7 @@ describe('software engine scenarios', () => {
     expect(h.host.prs.size).toBe(0);
     expect(h.remoteBranches()).toEqual(['main']);
     // The failed delivery's worktree is kept on disk for debugging.
-    const kept = join(h.workspaceRoot, String(chain.id), 'd1');
+    const kept = join(h.workspaceRoot, String(chain.id), `j${h.jobs(chain.id)[0]!.id}-d1`);
     expect(h.workspaceLog.at(-1)).toEqual({ op: 'teardown', jobId: job!.id, type: 'execute', delivery: 1, outcome: 'failed', path: kept });
     expect(existsSync(join(kept, 'README.md'))).toBe(true);
   });
@@ -243,7 +243,7 @@ describe('software engine scenarios', () => {
     const h = harness();
     const { chain } = await driveToRunnerError(h);
     const [failed] = h.jobs(chain.id);
-    const kept = join(h.workspaceRoot, String(chain.id), 'd1');
+    const kept = join(h.workspaceRoot, String(chain.id), `j${h.jobs(chain.id)[0]!.id}-d1`);
     expect(existsSync(kept)).toBe(true);
 
     // A sweep keeps a recent dead letter's worktree ...

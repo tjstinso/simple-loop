@@ -128,7 +128,7 @@ describe('software engine', () => {
     ).rejects.toBeInstanceOf(EffectError);
     expect(git.calls).toEqual([]);
     // forgetting evicts
-    engine.forgetWorkspace(3, 1);
+    engine.forgetWorkspace(3, 42, 1);
     await expect(
       engine.runEffect({ kind: 'commit_push' }, { chain: chain(), job: job(1), fence: fence() }),
     ).rejects.toBeInstanceOf(EffectError);
@@ -253,7 +253,7 @@ describe('software engine', () => {
       expect(left[0]!.filed_issue_number).not.toBeNull();
       expect(host.issues.size).toBe(2);
       expect(sweeps).toHaveLength(1);
-      expect([...sweeps[0]!].sort()).toEqual(['3:1', '3:4']);
+      expect([...sweeps[0]!].sort()).toEqual(['3:1:4', '3:2:1']);
     });
 
     it('sweep runs every step and rethrows the first error afterwards', async () => {

@@ -17,8 +17,8 @@ function chain(id: number, over: Partial<SoftwareState> = {}): ChainView<Softwar
     state: { repo: 'acme/widgets', issueNumber: 7, labels: [], profile: 'supervised', branch: 'factory/issue-7', attempt: 1, phase: 'executing', ...over },
   };
 }
-function job(chainId: number, delivery: number, type = 'execute'): Job {
-  return { id: 1, chainId, type, attempt: 1, status: 'running', policyId: 'p', payload: {}, result: null, claimedBy: 'w', leaseExpiresAt: null, delivery, error: null };
+function job(chainId: number, delivery: number, type = 'execute', id = 1): Job {
+  return { id, chainId, type, attempt: 1, status: 'running', policyId: 'p', payload: {}, result: null, claimedBy: 'w', leaseExpiresAt: null, delivery, error: null };
 }
 
 describe('GitWorkspaceProvider', () => {
@@ -44,7 +44,7 @@ describe('GitWorkspaceProvider', () => {
     expect(ws.remoteHeadSha).toBeNull();
     expect(ws.seedSha).toBe(mainHead);
     expect(ws.baseBranch).toBe('main');
-    expect(ws.path).toBe(join(root, '1', 'd1'));
+    expect(ws.path).toBe(join(root, '1', 'j1-d1'));
     expect(ws.remoteBranch).toBe('factory/issue-7');
     expect(ws.remoteUrl).toBe(remote.url);
     expect(readFileSync(join(ws.path, 'README.md'), 'utf8')).toBe('hello\n');
@@ -71,11 +71,29 @@ describe('GitWorkspaceProvider', () => {
     const a = await provider.prepare(chain(1), job(1, 1));
     const b = await provider.prepare(chain(1), job(1, 2));
     expect(a.path).not.toBe(b.path);
-    expect(a.localBranch).toBe('factory/issue-7-c1-d1');
-    expect(b.localBranch).toBe('factory/issue-7-c1-d2');
-    expect(git(a.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('factory/issue-7-c1-d1');
+    expect(a.localBranch).toBe('factory/issue-7-c1-j1-d1');
+    expect(b.localBranch).toBe('factory/issue-7-c1-j1-d2');
+    expect(git(a.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('factory/issue-7-c1-j1-d1');
     writeFileSync(join(a.path, 'only-a.txt'), 'x');
     expect(existsSync(join(b.path, 'only-a.txt'))).toBe(false);
+  });
+
+  it('two jobs of one chain use distinct workspace paths and branches even at the same delivery number', async () => {
+    const exec = await provider.prepare(chain(1), job(1, 1, 'execute', 1));
+    writeFileSync(join(exec.path, 'in-flight.txt'), 'x');
+    const review = await provider.prepare(chain(1), job(1, 1, 'review', 2));
+    expect(exec.path).toBe(join(root, '1', 'j1-d1'));
+    expect(review.path).toBe(join(root, '1', 'j2-d1'));
+    expect(exec.localBranch).toBe('factory/issue-7-c1-j1-d1');
+    expect(review.localBranch).toBe('factory/issue-7-c1-j2-d1');
+    // The second prepare neither removed nor reused the first job's worktree.
+    expect(existsSync(join(exec.path, 'in-flight.txt'))).toBe(true);
+    expect(git(exec.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('factory/issue-7-c1-j1-d1');
+    expect(existsSync(join(review.path, 'in-flight.txt'))).toBe(false);
+    // Tearing one down leaves the other.
+    await provider.teardown(chain(1), job(1, 1, 'review', 2), 'ok');
+    expect(existsSync(review.path)).toBe(false);
+    expect(existsSync(join(exec.path, 'in-flight.txt'))).toBe(true);
   });
 
   it('disables the push URL on the workspace remote', async () => {
@@ -118,7 +136,7 @@ describe('GitWorkspaceProvider', () => {
     const b = await provider.prepare(chain(1), job(1, 2));
     const c = await provider.prepare(chain(2, { issueNumber: 8 }), job(2, 1));
     mkdirSync(join(root, 'junk', 'notes'), { recursive: true });
-    const removed = await provider.sweep(new Set(['1:2']));
+    const removed = await provider.sweep(new Set(['1:1:2']));
     expect(removed.sort()).toEqual([a.path, c.path].sort());
     expect(existsSync(a.path)).toBe(false);
     expect(existsSync(c.path)).toBe(false);
@@ -126,7 +144,7 @@ describe('GitWorkspaceProvider', () => {
     expect(existsSync(join(root, '.cache'))).toBe(true);
     expect(existsSync(join(root, 'junk', 'notes'))).toBe(true);
     const cache = join(root, '.cache', 'acme__widgets.git');
-    expect(git(cache, ['branch', '--list', 'factory/issue-7-c1-d1'])).toBe('');
+    expect(git(cache, ['branch', '--list', 'factory/issue-7-c1-j1-d1'])).toBe('');
   });
 
   it('prepare is idempotent for the same delivery', async () => {
@@ -147,6 +165,8 @@ describe('GitWorkspaceProvider', () => {
     await expect(provider.prepare(chain(1, { issueNumber: 1.5 }), job(1, 1))).rejects.toThrow(/issue/);
     await expect(provider.prepare(chain(1), job(1, -2))).rejects.toThrow(/delivery/);
     await expect(provider.prepare(chain(1.5), job(1, 1))).rejects.toThrow(/chain/);
+    await expect(provider.prepare(chain(1), job(1, 1, 'execute', 0))).rejects.toThrow(/job id/);
+    await expect(provider.prepare(chain(1), job(1, 1, 'execute', 2.5))).rejects.toThrow(/job id/);
     await expect(provider.teardown(chain(1, { repo: '../x/y' }), job(1, 1), 'ok')).rejects.toThrow(/repo/);
   });
 
@@ -157,7 +177,7 @@ describe('GitWorkspaceProvider', () => {
     const b = await provider.prepare(chain(2), job(2, 1));
     expect(b.path).not.toBe(a.path);
     expect(b.localBranch).not.toBe(a.localBranch);
-    expect(b.localBranch).toBe('factory/issue-7-c2-d1');
+    expect(b.localBranch).toBe('factory/issue-7-c2-j1-d1');
     expect(existsSync(a.path)).toBe(true);
     expect(existsSync(b.path)).toBe(true);
   });

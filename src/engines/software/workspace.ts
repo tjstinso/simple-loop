@@ -36,6 +36,7 @@ const DISABLED_PUSH_URL = 'no_push://disabled';
 interface Ids {
   repo: string;
   chainId: number;
+  jobId: number;
   delivery: number;
   issue: number;
 }
@@ -46,9 +47,10 @@ function ids(chain: ChainView<SoftwareState>, job: Job): Ids {
     throw new Error(`invalid repo: ${JSON.stringify(repo)}`);
   }
   if (!Number.isSafeInteger(chain.id) || chain.id < 0) throw new Error(`invalid chain id: ${chain.id}`);
+  if (!Number.isSafeInteger(job.id) || job.id <= 0) throw new Error(`invalid job id: ${job.id}`);
   if (!Number.isSafeInteger(job.delivery) || job.delivery < 0) throw new Error(`invalid delivery: ${job.delivery}`);
   if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) throw new Error(`invalid issue number: ${issueNumber}`);
-  return { repo, chainId: chain.id, delivery: job.delivery, issue: issueNumber };
+  return { repo, chainId: chain.id, jobId: job.id, delivery: job.delivery, issue: issueNumber };
 }
 
 function gitEnv(): NodeJS.ProcessEnv {
@@ -83,8 +85,13 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     return join(this.opts.root, '.cache', `${repo.replace('/', '__')}.git`);
   }
 
-  private deliveryPath(chainId: number, delivery: number): string {
-    return join(this.opts.root, String(chainId), `d${delivery}`);
+  /** `delivery` restarts at 1 for every job, so the job id is part of a delivery's identity. */
+  private deliveryPath(chainId: number, jobId: number, delivery: number): string {
+    return join(this.opts.root, String(chainId), `j${jobId}-d${delivery}`);
+  }
+
+  private localBranch(issue: number, chainId: number, jobId: number, delivery: number): string {
+    return `factory/issue-${issue}-c${chainId}-j${jobId}-d${delivery}`;
   }
 
   private async isStale(lock: string): Promise<boolean> {
@@ -209,9 +216,9 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   }
 
   async prepare(chain: ChainView<SoftwareState>, job: Job): Promise<SoftwareWorkspace> {
-    const { repo, chainId, delivery, issue } = ids(chain, job);
-    const path = this.deliveryPath(chainId, delivery);
-    const localBranch = `factory/issue-${issue}-c${chainId}-d${delivery}`;
+    const { repo, chainId, jobId, delivery, issue } = ids(chain, job);
+    const path = this.deliveryPath(chainId, jobId, delivery);
+    const localBranch = this.localBranch(issue, chainId, jobId, delivery);
     const remoteBranch = `factory/issue-${issue}`;
     const remoteUrl = this.opts.cloneUrlFor(repo);
     const cache = this.cachePath(repo);
@@ -240,14 +247,15 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   }
 
   async teardown(chain: ChainView<SoftwareState>, job: Job, outcome: 'ok' | 'failed'): Promise<void> {
-    const { repo, chainId, delivery, issue } = ids(chain, job);
+    const { repo, chainId, jobId, delivery, issue } = ids(chain, job);
     if (outcome === 'failed' && this.opts.keepOnFailure) return;
     const cache = this.cachePath(repo);
     await this.withCache(cache, () =>
-      this.removeDelivery(cache, this.deliveryPath(chainId, delivery), `factory/issue-${issue}-c${chainId}-d${delivery}`),
+      this.removeDelivery(cache, this.deliveryPath(chainId, jobId, delivery), this.localBranch(issue, chainId, jobId, delivery)),
     );
   }
 
+  /** `liveDeliveries` holds `${chainId}:${jobId}:${delivery}` keys whose worktrees must survive. */
   async sweep(liveDeliveries: Set<string>): Promise<string[]> {
     const removed: string[] = [];
     if (!existsSync(this.opts.root)) return removed;
@@ -258,9 +266,9 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     for (const chainDir of await readdir(this.opts.root, { withFileTypes: true })) {
       if (!chainDir.isDirectory() || !/^\d+$/.test(chainDir.name)) continue;
       for (const dDir of await readdir(join(this.opts.root, chainDir.name), { withFileTypes: true })) {
-        const m = /^d(\d+)$/.exec(dDir.name);
+        const m = /^j(\d+)-d(\d+)$/.exec(dDir.name);
         if (!dDir.isDirectory() || !m) continue;
-        if (liveDeliveries.has(`${chainDir.name}:${m[1]}`)) continue;
+        if (liveDeliveries.has(`${chainDir.name}:${m[1]}:${m[2]}`)) continue;
         const path = join(this.opts.root, chainDir.name, dDir.name);
         for (const cache of caches) {
           await this.withCache(cache, async () => {

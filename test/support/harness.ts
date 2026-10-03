@@ -157,7 +157,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     workspaces.teardown = async (c: ChainView<SoftwareState>, j: Job, outcome: 'ok' | 'failed') => {
       workspaceLog.push({
         op: 'teardown', jobId: j.id, type: j.type, delivery: j.delivery, outcome,
-        path: join(workspaceRoot, String(c.id), `d${j.delivery}`),
+        path: join(workspaceRoot, String(c.id), `j${j.id}-d${j.delivery}`),
       });
       return teardown(c, j, outcome);
     };
