@@ -18,7 +18,7 @@
 // When STUB_PID_FILE is set, the stub writes {"pid":..,"grandchild":..} to it
 // (after spawning the grandchild, if any) so tests can verify process death.
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readdirSync, writeFileSync } from 'node:fs';
 
 const mode = process.env.STUB_MODE ?? 'echo';
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
@@ -54,6 +54,13 @@ switch (mode) {
     writePids(null);
     out({ type: 'system', subtype: 'init' });
     const payload = { argv: process.argv.slice(2), env: process.env, cwd: process.cwd() };
+    if (process.env.STUB_LIST_GH_CONFIG) {
+      try {
+        payload.ghConfigEntries = readdirSync(process.env.GH_CONFIG_DIR ?? '');
+      } catch {
+        payload.ghConfigEntries = null;
+      }
+    }
     // Escape backticks so the prompt's own ``` fences cannot end the block early.
     const json = JSON.stringify(payload).replace(/`/g, '\\u0060');
     const text = 'echo done\n```json\n' + json + '\n```';

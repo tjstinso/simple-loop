@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ClaudeCliRunner } from '../../src/runner/claude-cli.js';
+import { ClaudeCliRunner, childEnv } from '../../src/runner/claude-cli.js';
 import { parseStreamLine } from '../../src/runner/stream.js';
 import type { RunHooks, RunInput } from '../../src/runner/types.js';
 import type { Job } from '../../src/kernel/types.js';
@@ -263,6 +263,7 @@ describe('ClaudeCliRunner', () => {
     process.env.GH_ENTERPRISE_TOKEN = 'secret-ent';
     process.env.GITHUB_PAT_EXTRA = 'secret-pat';
     process.env.FACTORY_KEEP_ME = 'kept';
+    process.env.GH_CONFIG_DIR = '/home/operator/.config/gh';
     try {
       const inp = input({ config: config({ resultFormat: 'json' }) });
       const { env } = (await runner('echo', { EXTRA_OVERRIDE: 'yes' }).run(inp, signal())) as { env: Record<string, string> };
@@ -270,13 +271,70 @@ describe('ClaudeCliRunner', () => {
       expect(env.GITHUB_TOKEN).toBeUndefined();
       expect(env.GH_ENTERPRISE_TOKEN).toBeUndefined();
       expect(env.GITHUB_PAT_EXTRA).toBeUndefined();
-      expect(Object.keys(env).filter((k) => k.startsWith('GH_') || k.startsWith('GITHUB_'))).toEqual([]);
+      // The only GH_ variable is the runner's own empty per-run GH_CONFIG_DIR (C1/R32), never the operator's.
+      expect(Object.keys(env).filter((k) => (k.startsWith('GH_') && k !== 'GH_CONFIG_DIR') || k.startsWith('GITHUB_'))).toEqual([]);
+      expect(env.GH_CONFIG_DIR).toMatch(/factory-gh-/);
       expect(env.FACTORY_KEEP_ME).toBe('kept');
       expect(env.EXTRA_OVERRIDE).toBe('yes');
     } finally {
       for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
     }
+  });
+
+  it('isolates git and gh config and drops SSH and askpass variables in the child environment', async () => {
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      SSH_AUTH_SOCK: '/tmp/agent.sock',
+      SSH_ASKPASS: '/bin/askpass',
+      GIT_ASKPASS: '/bin/git-askpass',
+      GIT_SSH_COMMAND: 'ssh -i key',
+      GIT_SSH: '/bin/ssh',
+      GIT_CONFIG_GLOBAL: '/home/me/.gitconfig',
+      HOME: process.env.HOME ?? '/home/me',
+    });
+    try {
+      const inp = input({ config: config({ resultFormat: 'json' }) });
+      const { env } = (await runner('echo').run(inp, signal())) as { env: Record<string, string> };
+      for (const k of ['SSH_AUTH_SOCK', 'SSH_ASKPASS', 'GIT_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH']) {
+        expect(env[k], k).toBeUndefined();
+      }
+      expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+      expect(env.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(env.HOME).toBe(process.env.HOME); // claude needs its own login
+      // A fresh, empty gh config directory per run, removed once the run settles.
+      expect(env.GH_CONFIG_DIR).toMatch(/factory-gh-/);
+      expect(existsSync(env.GH_CONFIG_DIR!)).toBe(false);
+      const second = (await runner('echo').run(inp, signal())) as { env: Record<string, string> };
+      expect(second.env.GH_CONFIG_DIR).not.toBe(env.GH_CONFIG_DIR);
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  it('childEnv sets the isolation variables even when the parent has none of the dropped ones', () => {
+    const env = childEnv({ EXTRA: '1' }, '/tmp/gh-x');
+    expect(env).toMatchObject({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GH_CONFIG_DIR: '/tmp/gh-x', EXTRA: '1' });
+    expect(Object.keys(env).filter((k) => k.startsWith('GH_') && k !== 'GH_CONFIG_DIR')).toEqual([]);
+  });
+
+  it('the gh config directory is empty while the agent runs', async () => {
+    const inp = input({ config: config({ resultFormat: 'json' }) });
+    const res = (await runner('echo', { STUB_LIST_GH_CONFIG: '1' }).run(inp, signal())) as { ghConfigEntries: string[] | null };
+    expect(res.ghConfigEntries).toEqual([]);
+  });
+
+  it('passes --setting-sources only when the config sets it', async () => {
+    const without = (await runner('echo').run(input({ config: config({ resultFormat: 'json' }) }), signal())) as { argv: string[] };
+    expect(without.argv).not.toContain('--setting-sources');
+    const withIt = (await runner('echo').run(input({ config: config({ resultFormat: 'json', settingSources: 'user' }) }), signal())) as {
+      argv: string[];
+    };
+    const i = withIt.argv.indexOf('--setting-sources');
+    expect(i).toBeGreaterThan(-1);
+    expect(withIt.argv[i + 1]).toBe('user');
+    expect(withIt.argv.indexOf('--')).toBeGreaterThan(i);
   });
 
   it('resolves status error for a truncated final line, non-JSON noise, or no result event', async () => {

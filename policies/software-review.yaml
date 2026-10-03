@@ -11,6 +11,9 @@ config:
   timeoutMs: 900000
   inactivityTimeoutMs: 600000
   resultFormat: json
+  # Load only the operator's user settings: the branch under review was written by the execute
+  # agent and must not supply hooks or permission rules through its own .claude/settings.json.
+  settingSources: user
   prompt: |
     You are reviewing a pull request branch that is checked out read-only in the current
     directory. Inspect the change with `git diff origin/<baseBranch>...HEAD` (the base branch

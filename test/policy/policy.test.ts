@@ -87,3 +87,10 @@ describe('loadPolicies', () => {
     expect(() => loadPolicies(d)).toThrow(/duplicate.*one\.yaml.*two\.yaml/i);
   });
 });
+
+describe('shipped policies', () => {
+  it('the review policy loads only user settings (never the project .claude/settings.json under review)', () => {
+    const review = loadPolicies(join(import.meta.dirname, '../../policies')).find((x) => x.kind === 'review')!;
+    expect((review.config as { settingSources?: string }).settingSources).toBe('user');
+  });
+});

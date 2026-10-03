@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { readProcessStartTime } from '../util/proc.js';
 import { LineSplitter, StreamCollector, lastJsonBlock, parseStreamLine, truncate } from './stream.js';
@@ -14,6 +17,12 @@ const configSchema = z.object({
   inactivityTimeoutMs: z.number().int().positive().max(MAX_TIMER_MS),
   resultFormat: z.enum(['execution', 'json']),
   permissionMode: z.string().min(1).optional(),
+  /**
+   * Passed as `--setting-sources` (comma-separated: user, project, local). The review policy sets
+   * `user` so the branch under review cannot supply hooks or permission rules through its own
+   * `.claude/settings.json`.
+   */
+  settingSources: z.string().min(1).optional(),
 });
 
 export type ClaudeCliConfig = z.infer<typeof configSchema>;
@@ -56,15 +65,29 @@ function abortError(): Error {
   return e;
 }
 
-/** The parent environment minus GitHub credentials, plus `overrides`. */
-export function childEnv(overrides: Record<string, string> = {}): Record<string, string> {
+/** Variables that hand the agent a way to authenticate as the operator (SSH agent, askpass helpers, ssh commands). */
+const DROPPED_VARS = new Set(['SSH_AUTH_SOCK', 'SSH_ASKPASS', 'GIT_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH']);
+
+/**
+ * The agent's environment: the parent environment minus GitHub tokens (`GH_*`, `GITHUB_*`) and the
+ * SSH/askpass variables, with git's global and system config switched off (so a credential helper
+ * such as `gh auth setup-git` in ~/.gitconfig is not used) and `gh` pointed at `ghConfigDir` (an
+ * empty directory, so the operator's `gh` login is not found), plus `overrides`. HOME is kept: the
+ * claude CLI needs its own login. This is not a sandbox: an agent with a general shell can still read
+ * credentials stored in plaintext under HOME (see README "Credentials").
+ */
+export function childEnv(overrides: Record<string, string> = {}, ghConfigDir?: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
     const upper = k.toUpperCase();
     if (upper.startsWith('GH_') || upper.startsWith('GITHUB_')) continue; // covers GH_TOKEN, GITHUB_TOKEN
+    if (DROPPED_VARS.has(upper)) continue;
     env[k] = v;
   }
+  env.GIT_CONFIG_GLOBAL = '/dev/null';
+  env.GIT_CONFIG_NOSYSTEM = '1';
+  if (ghConfigDir !== undefined) env.GH_CONFIG_DIR = ghConfigDir;
   return { ...env, ...overrides };
 }
 
@@ -95,6 +118,7 @@ export function buildArgs(cfg: ClaudeCliConfig, prompt: string): string[] {
   // positional prompt. Entries may contain spaces (e.g. `Bash(git *)`).
   if (cfg.allowedTools.length > 0) args.push(`--allowedTools=${cfg.allowedTools.join(',')}`);
   if (cfg.permissionMode !== undefined) args.push('--permission-mode', cfg.permissionMode);
+  if (cfg.settingSources !== undefined) args.push('--setting-sources', cfg.settingSources);
   // `--` keeps a prompt that starts with `-` from being read as an option.
   args.push('--', prompt);
   return args;
@@ -179,12 +203,22 @@ export class ClaudeCliRunner implements Runner {
       let inactivityTimer: NodeJS.Timeout | undefined;
       let hardTimer: NodeJS.Timeout | undefined;
 
-      const child = spawn(this.bin, args, {
-        cwd: input.workspace.path,
-        env: childEnv(this.env),
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // A fresh, empty gh config directory for this run only, removed once the run settles.
+      const ghConfigDir = mkdtempSync(join(tmpdir(), 'factory-gh-'));
+      const removeGhConfigDir = (): void => rmSync(ghConfigDir, { recursive: true, force: true });
+      let child;
+      try {
+        child = spawn(this.bin, args, {
+          cwd: input.workspace.path,
+          env: childEnv(this.env, ghConfigDir),
+          detached: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        removeGhConfigDir();
+        reject(err);
+        return;
+      }
       const pid = child.pid;
 
       const killGroup = (): void => {
@@ -201,6 +235,7 @@ export class ClaudeCliRunner implements Runner {
         clearTimeout(inactivityTimer);
         clearTimeout(hardTimer);
         signal.removeEventListener('abort', onAbort);
+        removeGhConfigDir();
         fn();
       };
       const fail = (err: unknown): void => {
