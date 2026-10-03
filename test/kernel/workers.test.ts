@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import type Database from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { migrate, openDb } from '../../src/kernel/db.js';
 import { readProcessStartTime } from '../../src/util/proc.js';
 import {
@@ -174,5 +175,42 @@ describe('workers', () => {
       .prepare('SELECT exited_at, exit_code FROM child_processes WHERE id=?')
       .get(live) as { exited_at: number; exit_code: number | null };
     expect(row).toEqual({ exited_at: NOW + 100, exit_code: null });
+  });
+
+  it("killProcessGroup refuses pgid 0, 1, negative and NaN, and the caller's own group, and the test process survives", () => {
+    const spy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const stat = readFileSync('/proc/self/stat', 'utf8');
+      const own = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[2]);
+      for (const bad of [0, 1, -5, Number.NaN, own]) killProcessGroup(bad, 10);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(alive(process.pid)).toBe(true);
+  });
+
+  it('reapOwnOrphans kills surviving group members after the leader has exited', async () => {
+    worker();
+    const script =
+      "const {spawn}=require('child_process');" +
+      "const g=spawn('sleep',['60'],{stdio:'ignore'});" +
+      "process.stdout.write(String(g.pid)+'\\n',()=>process.exit(0));";
+    const child = spawn(process.execPath, ['-e', script], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const pid = child.pid as number;
+    leftovers.push(pid);
+    const grandchild = await new Promise<number>((resolve) => {
+      child.stdout.once('data', (d: Buffer) => resolve(Number(d.toString().trim())));
+    });
+    leftovers.push(grandchild);
+    expect(await waitUntil(() => !alive(pid))).toBe(true);
+    expect(alive(grandchild)).toBe(true);
+    const id = recordChild(db, { workerId: 'w1', jobId, delivery: 1, pid, pgid: pid, startTime: 1 }, NOW);
+    expect(reapOwnOrphans(db, 'w1', NOW + 1)).toEqual([id]);
+    expect(await waitUntil(() => !alive(grandchild))).toBe(true);
+    expect(liveChildrenFor(db, jobId, 1)).toEqual([]);
   });
 });

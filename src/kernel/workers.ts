@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import type Database from 'better-sqlite3';
 import { readProcessStartTime } from '../util/proc.js';
 
@@ -120,8 +121,28 @@ export function isProcessAlive(pid: number, startTime: number): boolean {
   }
 }
 
-/** SIGTERM the whole process group, then SIGKILL after `graceMs`. */
+/** This process's own process group id (field 5 of /proc/self/stat), or null. */
+function ownPgid(): number | null {
+  try {
+    const stat = readFileSync('/proc/self/stat', 'utf8');
+    const n = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[2]);
+    return Number.isInteger(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A pgid is safe to signal only if it is a real group id: not 0 (own group),
+ * 1 (kill(-1) hits everything), negative, non-integer, or the caller's own group.
+ */
+function isSignalablePgid(pgid: number): boolean {
+  return Number.isInteger(pgid) && pgid > 1 && pgid !== ownPgid();
+}
+
+/** SIGTERM the whole process group, then SIGKILL after `graceMs`. Refuses unsafe pgids. */
 export function killProcessGroup(pgid: number, graceMs = 2000): void {
+  if (!isSignalablePgid(pgid)) return;
   const signal = (sig: NodeJS.Signals): void => {
     try {
       process.kill(-pgid, sig);
@@ -131,6 +152,16 @@ export function killProcessGroup(pgid: number, graceMs = 2000): void {
   };
   signal('SIGTERM');
   setTimeout(() => signal('SIGKILL'), graceMs).unref();
+}
+
+function groupHasMembers(pgid: number): boolean {
+  if (!isSignalablePgid(pgid)) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false; // ESRCH: empty; EPERM: cannot signal it anyway
+  }
 }
 
 /**
@@ -143,7 +174,10 @@ export function reapOwnOrphans(db: Database.Database, workerId: string, now: num
     .all(workerId) as ChildDbRow[];
   const reaped: number[] = [];
   for (const r of rows.map(toChildRow)) {
-    if (isProcessAlive(r.pid, r.startTime)) killProcessGroup(r.pgid);
+    // Kill when the leader is alive, or when the leader is gone but group
+    // members survive. Residual risk (accepted): an emptied, recycled pgid
+    // number could be probed/signalled.
+    if (isProcessAlive(r.pid, r.startTime) || groupHasMembers(r.pgid)) killProcessGroup(r.pgid);
     markChildExited(db, r.id, null, now);
     reaped.push(r.id);
   }
