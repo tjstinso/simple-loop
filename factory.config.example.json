@@ -1,0 +1,12 @@
+{
+  "dbPath": "./factory.db",
+  "policiesDir": "./policies",
+  "workspaceRoot": "./.factory/workspaces",
+  "defaultEngine": "software",
+  "defaultProfile": "supervised",
+  "requiredSections": ["## Goal", "## Acceptance criteria"],
+  "historyRetentionDays": 30,
+  "keepWorktreeOnFailure": true,
+  "keptWorktreeMaxAgeMs": 604800000,
+  "cloneUrlTemplate": "https://github.com/{repo}.git"
+}
