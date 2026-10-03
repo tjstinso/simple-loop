@@ -9,6 +9,7 @@ import type {
   EffectFence,
   Engine,
   Job,
+  RunEffectContext,
   Transition,
 } from '../../src/kernel/types.js';
 import type { Workspace } from '../../src/runner/types.js';
@@ -19,7 +20,7 @@ export interface EchoState {
 
 export interface EchoOptions {
   /** Called for every effect before it is recorded; may throw or inspect the database. */
-  onEffect?: (effect: Effect, fence: EffectFence) => void | Promise<void>;
+  onEffect?: (effect: Effect, fence: EffectFence, ctx: RunEffectContext<EchoState>) => void | Promise<void>;
   /** Called at the start of `transition`; may throw. */
   onTransition?: (chain: ChainView<EchoState>, job: Job, result: unknown) => void;
 }
@@ -97,9 +98,9 @@ export function makeEchoEngine(id = 'echo', opts: EchoOptions = {}): EchoEngine 
       };
     },
 
-    async runEffect(effect, fence) {
+    async runEffect(effect, ctx) {
       calls.effects.push(effect);
-      await opts.onEffect?.(effect, fence);
+      await opts.onEffect?.(effect, ctx.fence, ctx);
       if (effect.kind !== 'note') throw new Error(`echo: unknown effect kind ${effect.kind}`);
       notes.push(String(effect.text));
     },

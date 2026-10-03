@@ -113,6 +113,12 @@ export interface EffectFence extends Fence {
  * Prepares the private workspace for one job delivery. Engines are constructed
  * with their own ports; teardown belongs to `Engine.cleanup`, never the kernel.
  */
+export interface RunEffectContext<S> {
+  chain: ChainView<S>;
+  job: Job;
+  fence: EffectFence;
+}
+
 export interface WorkspaceProvider {
   prepare(chain: ChainView<any>, job: Job): Promise<Workspace>;
 }
@@ -131,7 +137,7 @@ export interface Engine<S = unknown> {
   /** Pure: no I/O. */
   transition(chain: ChainView<S>, job: Job, result: unknown): Transition<S>;
   /** Idempotent, check-before-act. Runs before the transition commits. */
-  runEffect(effect: Effect, fence: EffectFence): Promise<void>;
+  runEffect(effect: Effect, ctx: RunEffectContext<S>): Promise<void>;
   describe(chain: ChainView<S>): string;
   surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
   /** Called after every delivery, whatever its outcome. */

@@ -71,6 +71,20 @@ function setup(o: { echo?: EchoOptions; runner?: Runner; extraEngines?: EchoEngi
 const signal = () => new AbortController().signal;
 
 describe('processDelivery', () => {
+  it('passes the chain view, the job and the fence to runEffect', async () => {
+    const seen: any[] = [];
+    const s = setup({ echo: { onEffect: (_e, _f, ctx) => { seen.push(ctx); } } });
+    const chain = s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', [{ value: 'hi' }]);
+    expect(await processDelivery(s.deps, job, 'w1', signal())).toBe('succeeded');
+    expect(seen).toHaveLength(1);
+    expect(seen[0].chain).toMatchObject({ id: chain.id, engine: 'echo', state: { count: 0 } });
+    expect(seen[0].job).toMatchObject({ id: job.id, delivery: job.delivery });
+    expect(seen[0].fence).toMatchObject({ jobId: job.id, delivery: job.delivery });
+    expect(typeof seen[0].fence.assertCurrent).toBe('function');
+  });
+
   it('runs a delivery end to end and enqueues the follow-on job only after effects ran', async () => {
     const jobsAtEffect: number[] = [];
     const s = setup({
