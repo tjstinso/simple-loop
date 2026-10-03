@@ -1,3 +1,4 @@
+import type Database from 'better-sqlite3';
 import { migrate, openDb } from './db.js';
 import { createChain } from './queue.js';
 import type { Chain, Job, KernelDeps } from './types.js';
@@ -16,11 +17,25 @@ export interface Kernel {
 }
 
 export function createKernel(
-  opts: Omit<KernelDeps, 'db'> & { dbPath: string; migrations?: string[] },
+  opts: Omit<KernelDeps, 'db'> &
+    ({ dbPath: string; migrations?: string[] } | { db: Database.Database }),
 ): Kernel {
-  const { dbPath, migrations, ...rest } = opts;
-  const db = openDb(dbPath);
-  migrate(db, migrations ?? []);
+  let db: Database.Database;
+  let owned: boolean;
+  let rest: Omit<KernelDeps, 'db'>;
+  if ('db' in opts) {
+    // An already-open, already-migrated handle: used as is and never closed here.
+    const { db: given, ...others } = opts;
+    db = given;
+    owned = false;
+    rest = others;
+  } else {
+    const { dbPath, migrations, ...others } = opts;
+    db = openDb(dbPath);
+    migrate(db, migrations ?? []);
+    owned = true;
+    rest = others;
+  }
   const deps: KernelDeps = { ...rest, db };
 
   return {
@@ -46,6 +61,8 @@ export function createKernel(
       );
     },
     startWorker: (o) => startWorker(deps, o),
-    close: () => db.close(),
+    close() {
+      if (owned) db.close();
+    },
   };
 }

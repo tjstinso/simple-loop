@@ -415,11 +415,8 @@ describe('runSoftwareEffect', () => {
     expect(host.getComments(pr.number)).toEqual(['on pr\n\n<!-- m2 -->']);
   });
 
-  it('rejects an unknown effect kind and file_followups as unsupported', async () => {
+  it('rejects an unknown effect kind as unsupported', async () => {
     await expect(runSoftwareEffect({ kind: 'bogus' }, ctx(), fence())).rejects.toThrow('unsupported effect: bogus');
-    await expect(runSoftwareEffect({ kind: 'file_followups', followups: [] }, ctx(), fence())).rejects.toThrow(
-      'unsupported effect: file_followups',
-    );
     await expect(runSoftwareEffect({ kind: 'set_labels', target: 'nope' }, ctx(), fence())).rejects.toThrow(/invalid set_labels effect/);
     expect(host.calls).toEqual([]);
   });

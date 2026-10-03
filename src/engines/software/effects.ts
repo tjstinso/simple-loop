@@ -1,4 +1,6 @@
+import type Database from 'better-sqlite3';
 import { z } from 'zod';
+import { fileFollowups, storeFollowups } from './followups.js';
 import { EffectError, type ChainView, type Effect, type EffectFence, type Job } from '../../kernel/types.js';
 import { GitHostError, type GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
@@ -15,6 +17,8 @@ export interface EffectContext {
   git: GitPorts;
   /** Injectable backoff delay (default setTimeout). */
   sleep?: (ms: number) => Promise<void>;
+  /** Required by the file_followups effect only. */
+  followups?: { db: Database.Database; now: () => number };
 }
 
 const MAX_ATTEMPTS = 3;
@@ -155,12 +159,34 @@ async function comment(ctx: EffectContext, fence: EffectFence, e: Extract<Suppor
   await ctx.host.comment(repo, n, `${e.body}\n\n${e.marker}`);
 }
 
+const FollowupsEffect = z.object({
+  kind: z.literal('file_followups'),
+  followups: z.array(z.object({ title: z.string(), body: z.string() })),
+});
+
+/**
+ * Stores, then files. Deliberately outside `classified`: GitHostErrors are absorbed per item
+ * (rows stay unfiled for the sweep), so this effect never fails the job; StaleDeliveryError and
+ * bugs propagate. Replaying after a crash at any point never duplicates rows or issues.
+ */
+async function fileFollowupsEffect(effect: Effect, ctx: EffectContext, fence: EffectFence): Promise<void> {
+  const r = FollowupsEffect.safeParse(effect);
+  if (!r.success) throw new Error(`invalid file_followups effect: ${r.error.message}`);
+  if (!ctx.followups) throw new Error('file_followups needs a database');
+  fence.assertCurrent();
+  const { db, now } = ctx.followups;
+  const { repo, issueNumber } = ctx.chain.state;
+  storeFollowups(db, { jobId: ctx.job.id, chainId: ctx.chain.id, repo, issueNumber }, r.data.followups, now());
+  await fileFollowups(db, ctx.host, ctx.job.id, now(), () => fence.assertCurrent());
+}
+
 /**
  * Runs one software effect: idempotent (looks before acting), fenced (the fence is checked
  * at the start and again immediately before each externally visible mutation), with host
  * failures classified into EffectError reasons. StaleDeliveryError always propagates.
  */
 export async function runSoftwareEffect(effect: Effect, ctx: EffectContext, fence: EffectFence): Promise<void> {
+  if (effect?.kind === 'file_followups') return fileFollowupsEffect(effect, ctx, fence);
   const e = parse(effect);
   fence.assertCurrent();
   await classified(ctx, () => {
