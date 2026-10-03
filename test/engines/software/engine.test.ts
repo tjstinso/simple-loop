@@ -151,9 +151,26 @@ describe('software engine', () => {
     expect(engine.stateSchema).toBe(SoftwareStateSchema);
   });
 
-  it('the placeholder for buildRunInput behaves as documented', async () => {
+  it('buildRunInput fetches the issue and builds an execute subject', async () => {
     const { engine } = make();
-    await expect(engine.buildRunInput(chain(), job(), ws)).rejects.toThrow('buildRunInput is implemented in Task 20');
+    const out = await engine.buildRunInput(chain(), job(), ws);
+    expect(out.subject).toEqual({
+      kind: 'execute', repo: REPO, issueNumber: 7, title: 't', body: 'b', labels: [LABEL_IN_PROGRESS], attempt: 2,
+    });
+  });
+
+  it('buildRunInput for a review job also looks up the PR', async () => {
+    const { engine, host } = make();
+    const pr = await host.openPr(REPO, { head: 'factory/issue-7', base: 'main', title: 't', body: 'b' });
+    const out = await engine.buildRunInput(chain(), { ...job(), type: 'review' }, ws);
+    expect(out.subject).toMatchObject({ kind: 'review', prNumber: pr.number, baseBranch: 'main' });
+  });
+
+  it('buildRunInput rejects when a review job has no PR', async () => {
+    const { engine } = make();
+    await expect(engine.buildRunInput(chain(), { ...job(), type: 'review' }, ws)).rejects.toThrow(
+      'no PR found for review of factory/issue-7',
+    );
   });
 
   describe('cleanup and sweep', () => {

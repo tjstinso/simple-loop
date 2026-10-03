@@ -6,6 +6,7 @@ import type { Workspace } from '../../runner/types.js';
 import { runSoftwareEffect } from './effects.js';
 import type { GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
+import { buildSoftwareRunInput } from './run-input.js';
 import { ExecutionResultSchema, LABEL_IN_PROGRESS, ReviewVerdictSchema } from './schemas.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 import { softwareSubmit } from './submit.js';
@@ -82,9 +83,16 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     workspace,
 
-    // Placeholder: implemented by Task 20.
-    async buildRunInput() {
-      throw new Error('buildRunInput is implemented in Task 20');
+    async buildRunInput(chain, job, ws) {
+      const s = chain.state;
+      const issue = await deps.host.getIssue(s.repo, s.issueNumber);
+      let pr: { number: number; baseBranch: string } | null = null;
+      if (job.type === 'review') {
+        const found = await deps.host.findPrByHead(s.repo, s.branch);
+        if (!found) throw new Error(`no PR found for review of ${s.branch}`);
+        pr = { number: found.number, baseBranch: (ws as SoftwareWorkspace).baseBranch };
+      }
+      return buildSoftwareRunInput(chain, job, ws as SoftwareWorkspace, issue, pr);
     },
 
     transition: softwareTransition,
