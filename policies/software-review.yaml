@@ -12,8 +12,9 @@ config:
   inactivityTimeoutMs: 600000
   resultFormat: json
   # Bare mode: `claude --bare`, an allow-listed environment and an empty per-run HOME, so the agent
-  # starts with no ambient credentials. Needs ANTHROPIC_API_KEY in the worker's environment (or a
-  # provider's variables in passEnv). Not a sandbox: see README "Credentials".
+  # starts with no credentials in its environment or HOME (ssh still finds ~/.ssh). Needs
+  # ANTHROPIC_API_KEY in the worker's environment (or a provider's variables in passEnv).
+  # Not a sandbox: see README "Credentials".
   bare: true
   # Load only user settings: the branch under review was written by the execute agent and must not
   # supply hooks or permission rules through its own .claude/settings.json. In bare mode HOME is an

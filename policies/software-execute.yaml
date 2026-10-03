@@ -11,8 +11,9 @@ config:
   inactivityTimeoutMs: 600000
   resultFormat: execution
   # Bare mode: `claude --bare`, an allow-listed environment and an empty per-run HOME, so the agent
-  # starts with no ambient credentials. Needs ANTHROPIC_API_KEY in the worker's environment (or a
-  # provider's variables in passEnv). Not a sandbox: see README "Credentials".
+  # starts with no credentials in its environment or HOME (ssh still finds ~/.ssh). Needs
+  # ANTHROPIC_API_KEY in the worker's environment (or a provider's variables in passEnv).
+  # Not a sandbox: see README "Credentials".
   bare: true
   prompt: |
     You are working inside a private git checkout of a repository. Your job is to implement the

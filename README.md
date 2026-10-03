@@ -45,7 +45,7 @@ The profile is `supervised` unless the issue carries the label `factory:profile:
 
 ### Credentials
 
-The factory process itself needs GitHub credentials: `gh` calls use your `gh` login (or `GH_TOKEN`), and the engine pushes with the machine's git credential configuration (credential helper, `gh auth setup-git`, and so on) to the explicit URL built from `cloneUrlTemplate`. The agent (the `claude` child process) is NOT meant to have them. The goal is that the agent keeps its tools (Bash, Edit, the project's tests) but starts with no ambient credentials, so the default routes (`git push`, `gh`, the keyring, a credential helper, the SSH agent) find nothing to authenticate with.
+The factory process itself needs GitHub credentials: `gh` calls use your `gh` login (or `GH_TOKEN`), and the engine pushes with the machine's git credential configuration (credential helper, `gh auth setup-git`, and so on) to the explicit URL built from `cloneUrlTemplate`. The agent (the `claude` child process) is NOT meant to have them. The goal is that the agent keeps its tools (Bash, Edit, the project's tests) but starts with no ambient credentials, so the default routes (`git push` over HTTPS, `gh`, the keyring, a credential helper, the SSH agent) find nothing to authenticate with. SSH keys on disk are the exception, see below.
 
 Bare mode (policy config `bare: true`, the default and what both shipped policies set):
 

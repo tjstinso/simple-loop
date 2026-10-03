@@ -208,7 +208,9 @@ export interface BareEnvOptions {
  * the agent: no GH_* or GITHUB_* tokens, SSH_* (agent socket), GIT_* (askpass, ssh command), DBUS_*,
  * XDG_RUNTIME_DIR or GNOME_KEYRING_* (keyring discovery), KRB5*, AWS_*, GOOGLE_* or AZURE_*
  * unless a name is listed in `passEnv` (which refuses GH_*, GITHUB_*, SSH_*, GIT_*, DBUS_* and
- * XDG_RUNTIME_DIR). So the default lookups of git, gh, ssh and keyring clients find nothing. It
+ * XDG_RUNTIME_DIR). So the default lookups of git over HTTPS, gh and keyring clients find nothing.
+ * Not ssh: OpenSSH finds `~/.ssh` through the user database, not HOME, so passphrase-less keys
+ * there remain usable (git over SSH included). It
  * is not a sandbox: the agent still runs as the worker's OS user and can read or write any file
  * that user can by its absolute path, and ANTHROPIC_API_KEY is in its environment.
  */
