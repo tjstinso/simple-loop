@@ -1,3 +1,10 @@
+import type Database from 'better-sqlite3';
+import type { ZodType } from 'zod';
+import type { PolicyStore } from '../policy/store.js';
+import type { RunnerRegistry } from '../runner/registry.js';
+import type { RunInput, Workspace } from '../runner/types.js';
+import type { EngineRegistry } from './engine-registry.js';
+
 export type Clock = () => number;
 
 export type ChainStatus = 'active' | 'waiting' | 'dead_lettered' | 'completed' | 'cancelled';
@@ -91,4 +98,53 @@ export interface Transition<S> {
   chainStatus: ChainStatus;
   newJobs: NewJob[];
   effects: Effect[];
+}
+
+/**
+ * The fence handed to `Engine.runEffect`. `assertCurrent` re-reads the job
+ * from the database and throws StaleDeliveryError unless the job is still
+ * `running` at this fence's delivery; effects call it before acting.
+ */
+export interface EffectFence extends Fence {
+  assertCurrent(): void;
+}
+
+/**
+ * Prepares the private workspace for one job delivery. Engines are constructed
+ * with their own ports; teardown belongs to `Engine.cleanup`, never the kernel.
+ */
+export interface WorkspaceProvider {
+  prepare(chain: ChainView<any>, job: Job): Promise<Workspace>;
+}
+
+export interface Engine<S = unknown> {
+  id: string;
+  policyKinds: string[];
+  /** Validates `chain.engineState`. */
+  stateSchema: ZodType<S>;
+  /** Job type -> schema for the runner's result. */
+  resultSchemas: Record<string, ZodType>;
+  submit(input: unknown): Promise<{ subjectKey: string; state: S; firstJob: NewJob }>;
+  workspace: WorkspaceProvider;
+  /** Everything the runner needs except `config`, which the kernel fills from the job's policy. */
+  buildRunInput(chain: ChainView<S>, job: Job, workspace: Workspace): Promise<Omit<RunInput, 'config'>>;
+  /** Pure: no I/O. */
+  transition(chain: ChainView<S>, job: Job, result: unknown): Transition<S>;
+  /** Idempotent, check-before-act. Runs before the transition commits. */
+  runEffect(effect: Effect, fence: EffectFence): Promise<void>;
+  describe(chain: ChainView<S>): string;
+  surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
+  /** Called after every delivery, whatever its outcome. */
+  cleanup(chain: ChainView<S>, job: Job): Promise<void>;
+  /** Optional periodic maintenance, called on the kernel's maintenance interval. */
+  sweep?(now: number): Promise<void>;
+}
+
+export interface KernelDeps {
+  db: Database.Database;
+  engines: EngineRegistry;
+  runners: RunnerRegistry;
+  policies: PolicyStore;
+  clock: Clock;
+  config: { leaseMs: number; heartbeatMs: number; maxDeliveries: number };
 }
