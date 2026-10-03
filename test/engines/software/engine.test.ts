@@ -182,6 +182,13 @@ describe('software engine', () => {
     });
   });
 
+  it('buildRunInput rejects when the issue was closed after submit', async () => {
+    const { engine, host } = make();
+    host.issues.get(7)!.state = 'closed';
+    await expect(engine.buildRunInput(chain(), job(), ws)).rejects.toThrow('issue #7 is closed');
+    await expect(engine.buildRunInput(chain(), { ...job(), type: 'review' }, ws)).rejects.toThrow('issue #7 is closed');
+  });
+
   it('buildRunInput for a review job also looks up the PR', async () => {
     const { engine, host } = make();
     const pr = await host.openPr(REPO, { head: 'factory/issue-7', base: 'main', title: 't', body: 'b' });

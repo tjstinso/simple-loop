@@ -279,6 +279,34 @@ describe('runSoftwareEffect', () => {
     expect(host.prs.size).toBe(0);
   });
 
+  it('open_pr on a closed issue is an effect_error and opens no PR', async () => {
+    host.issues.get(ISSUE)!.state = 'closed';
+    const err = await runSoftwareEffect({ kind: 'open_pr' }, ctx(), fence()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as EffectError).reason).toBe('effect_error');
+    expect((err as Error).message).toBe(`issue #${ISSUE} is closed`);
+    expect(host.prs.size).toBe(0);
+  });
+
+  it('merge_pr on a closed issue is an effect_error and merges nothing', async () => {
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.issues.get(ISSUE)!.state = 'closed';
+    const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: job({ type: 'review' }) }), fence()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as EffectError).reason).toBe('effect_error');
+    expect((err as Error).message).toBe(`issue #${ISSUE} is closed`);
+    expect(host.prs.get(pr.number)?.state).toBe('open');
+    expect(host.calls.map((c) => c.method)).not.toContain('mergePr');
+  });
+
+  it('the closed-issue check re-reads the issue through the transient retry', async () => {
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.failNext('getIssue', new GitHostError('bad gateway', 502));
+    await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: job({ type: 'review' }) }), fence());
+    expect(host.prs.get(pr.number)?.state).toBe('merged');
+    expect(delays).toEqual([100]);
+  });
+
   it('open_pr reuses an existing open PR for the branch', async () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     host.calls.length = 0;

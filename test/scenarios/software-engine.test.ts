@@ -403,6 +403,21 @@ describe('software engine scenarios', () => {
     expect(h.chain(again.chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
   });
 
+  it('closing the issue stops the chain: the next job dead-letters before the agent runs', async () => {
+    const h = harness();
+    const { chain } = await h.submit(N);
+    writesPerAttempt(h);
+    h.scriptReview([{ verdict: 'request_changes', feedback: 'more' }]);
+    await h.runOne(); // execute attempt 1
+    await h.runOne(); // review requests changes: execute attempt 2 is queued
+    h.host.issues.get(N)!.state = 'closed';
+    const rec = await h.runOne();
+    expect(rec).toMatchObject({ type: 'execute', attempt: 2, outcome: 'dead_lettered' });
+    expect(h.callsOf('execute')).toHaveLength(1);
+    expect(h.deadLetters()).toEqual([expect.objectContaining({ reason: 'runner_error', error: `issue #${N} is closed` })]);
+    expect(h.chain(chain.id).status).toBe('dead_lettered');
+  });
+
   it('a second submit for an open chain is rejected', async () => {
     const h = harness();
     const { chain } = await h.submit(N);

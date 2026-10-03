@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { fileFollowups, storeFollowups } from './followups.js';
 import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type Job } from '../../kernel/types.js';
-import { GitHostError, type GitHost } from './github.js';
+import { GitHostError, type GitHost, type Issue } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import type { SoftwareEffect } from './schemas.js';
 import type { SoftwareState } from './state.js';
@@ -67,6 +67,22 @@ async function classified(ctx: EffectContext, body: () => Promise<void>): Promis
   }
 }
 
+/** The issue was closed while the chain ran: nothing more is published for it. Always `effect_error`. */
+export class IssueClosedError extends EffectError {
+  constructor(issueNumber: number) {
+    super(`issue #${issueNumber} is closed`, 'effect_error');
+    this.name = 'IssueClosedError';
+  }
+}
+
+/** Re-reads the issue (inside the effect's retry wrapper) and refuses to continue when it is closed. */
+async function openIssue(ctx: EffectContext): Promise<Issue> {
+  const { repo, issueNumber } = ctx.chain.state;
+  const issue = await ctx.host.getIssue(repo, issueNumber);
+  if (issue.state !== 'open') throw new IssueClosedError(issueNumber);
+  return issue;
+}
+
 function requireWorkspace(ctx: EffectContext): SoftwareWorkspace {
   if (!ctx.workspace) throw new EffectError('workspace for this delivery is gone; retry will rerun the agent', 'runner_error');
   return ctx.workspace;
@@ -120,9 +136,9 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
 async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
+  const issue = await openIssue(ctx);
   const existing = await ctx.host.findPrByHead(repo, branch);
   if (existing?.state === 'open') return;
-  const issue = await ctx.host.getIssue(repo, issueNumber);
   const summary = summaryOf(ctx.job);
   const marker = `<!-- factory:chain=${ctx.chain.id} job=${ctx.job.id} event=open-pr -->`;
   const body = [`Closes #${issueNumber}`, ...(summary ? [summary] : []), marker].join('\n\n');
@@ -142,6 +158,8 @@ async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   if (!pr) throw new EffectError('no PR found to merge', 'effect_error');
   if (pr.state === 'merged') return;
   if (pr.state === 'closed') throw new EffectError('PR is closed and cannot be merged', 'effect_error');
+  // `automatic` must not merge code for an issue someone closed meanwhile.
+  await openIssue(ctx);
   fence.assertCurrent();
   try {
     await ctx.host.mergePr(repo, pr.number);
@@ -198,7 +216,8 @@ async function asRunnerError(body: () => Promise<void>): Promise<void> {
   try {
     await body();
   } catch (e) {
-    if (e instanceof StaleDeliveryError) throw e;
+    // A closed issue is not something a rerun of the agent can fix (R38): it stays effect_error.
+    if (e instanceof StaleDeliveryError || e instanceof IssueClosedError) throw e;
     if (e instanceof EffectError) {
       if (e.reason === 'runner_error') throw e;
       throw new EffectError(e.message, 'runner_error');

@@ -93,6 +93,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     async buildRunInput(chain, job, ws) {
       const s = chain.state;
       const issue = await deps.host.getIssue(s.repo, s.issueNumber);
+      // Closing the issue stops the chain: dead-lettered (runner_error) before the agent spends budget.
+      if (issue.state !== 'open') throw new Error(`issue #${s.issueNumber} is closed`);
       let pr: { number: number; baseBranch: string } | null = null;
       if (job.type === 'review') {
         const found = await deps.host.findPrByHead(s.repo, s.branch);
