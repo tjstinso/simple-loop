@@ -84,7 +84,7 @@ Add a function `shout(name)` to greet.js that returns the name in upper case fol
    `factory status` now shows `phase=reviewing attempt=1`.
 6. When the review finishes with an approval, expected: the PR has `factory:ready-for-merge`; the issue no longer has `factory:in-progress`; `factory status` shows `phase=awaiting_merge` with chain status `waiting`. The worker stays idle and keeps polling.
 7. Check the review verdict: the verdict itself is not posted to GitHub; look at the worker's terminal for errors and, if you want the verdict, query the database: `sqlite3 /tmp/factory-smoke/factory.db "select type, attempt, status, result from jobs"` (the review row's `result` holds `verdict`, `feedback`, `costUsd`).
-8. Finish by merging by hand: `gh pr merge <pr> --repo <owner>/<repo> --squash`. The issue closes through `Closes #<n>`. Nothing in the factory observes the merge (there is no poller), so `factory status` keeps listing the chain as `waiting`; that is expected for this prototype. To clear it, stop the worker and delete the database in Cleanup, or leave it.
+8. Finish by merging by hand: `gh pr merge <pr> --repo <owner>/<repo> --squash`. The issue closes through `Closes #<n>`. Nothing in the factory observes the merge (there is no poller), so `factory status` keeps listing the chain as `waiting`; that is expected for this prototype. End it with `factory cancel <chain-id>`: expected `cancelled chain <chain-id>`, the chain leaves `factory status`, and the issue loses any `factory:*` status label (the PR keeps `factory:ready-for-merge`).
 9. Any follow-ups the agent or reviewer reported appear as new issues labeled `factory:followup`; see (e).
 
 ## (b) Automatic profile
@@ -92,7 +92,8 @@ Add a function `shout(name)` to greet.js that returns the name in upper case fol
 1. Create a second issue (a different small goal, for example `shout` with a trailing "?" variant, so the code does not collide with (a)). Add the label before submitting: `gh issue create ... --label factory:profile:automatic`.
 2. `factory submit <url>`; `factory status` shows `profile=automatic`.
 3. Worker as before. Stages are the same as (a) up to the review.
-4. On approval expected: the factory runs `gh pr merge <pr> --repo <owner>/<repo> --squash`; the PR is merged, the issue loses `factory:in-progress` and is closed by `Closes #<n>`, and the chain leaves `factory status` (`completed`). The PR never receives `factory:ready-for-merge`. The remote branch `factory/issue-<n>` is not deleted by the factory.
+4. On approval expected: the factory runs `gh pr merge <pr> --repo <owner>/<repo> --squash --delete-branch --match-head-commit <sha>` (the sha is the PR head the reviewer saw); the PR is merged, the remote branch `factory/issue-<n>` is deleted, the issue loses `factory:in-progress` and is closed by `Closes #<n>`, and the chain leaves `factory status` (`completed`). The PR never receives `factory:ready-for-merge`.
+5. Optional, merge pin: on another automatic issue, push a commit to `factory/issue-<n>` by hand while the review job runs. Expected: the merge is refused, the review job is dead-lettered (`effect_error`, `merge refused: ...` if `gh` reports a 405 or 409, otherwise after three transient retries) and the PR stays open.
 
 ## (c) Forced failure and the dead-letter queue
 
@@ -105,14 +106,16 @@ Killed worker. Submit an issue, start the worker, and when the execute run is un
 Expected after the dead letter:
 
 - `factory dlq list` prints `job <id> chain <id> runner_error <first line of the error>` (or `max_deliveries ...`).
-- The issue has `factory:dead-letter` (and not `factory:in-progress`) and a comment "The factory dead-lettered job <id> (reason: ...)" with the error in a code block and a hidden marker. A dead letter created by the reaper is surfaced only once by the maintenance pass; if the label is missing, that is the known limitation.
+- The issue has `factory:dead-letter` (and not `factory:in-progress`) and a comment "The factory dead-lettered job <id> (reason: ...)" with the error in a code block and a hidden marker. A dead letter whose surfacing failed (or that the reaper created) is surfaced by the next maintenance pass (once a minute); `sqlite3 /tmp/factory-smoke/factory.db "select job_id, reason, surfaced_at from dead_letters"` shows `surfaced_at` set once it succeeded.
 - `factory status` shows the chain with status `dead_lettered`.
 - With `keepWorktreeOnFailure` (default true) the worktree `workspaces/<chain>/j<job>-d<delivery>` is still on disk.
 
 Recover:
 
 - Fix the cause (restore the budget, restart the worker), then `factory dlq retry <job-id>`. Expected: `requeued job <id>`; the issue label goes back from `factory:dead-letter` to `factory:in-progress`; the chain is `active` again; the next worker claim runs delivery + 1 in a new worktree `j<job>-d<delivery+1>`.
-- Or give up: `factory dlq discard <job-id>`, expected `discarded job <id>`. The chain is cancelled, so you can submit the same issue again. The `factory:dead-letter` label stays on the issue until you remove it (`gh issue edit <n> --repo <owner>/<repo> --remove-label factory:dead-letter`).
+- Or give up: `factory dlq discard <job-id>`, expected `discarded job <id>`. The chain is cancelled, so you can submit the same issue again, and the factory removes `factory:dead-letter` (and any other `factory:*` status label) from the issue.
+- Also try `factory cancel <chain-id>` on a chain whose job is running: expected exit 1 with `error: cannot cancel chain <id>: job <job-id> is running; ...`.
+- Closing the issue: close an issue whose chain is between jobs (for example during a revise loop) and expect the next job to be dead-lettered with `issue #<n> is closed` before any agent runs.
 
 ## (d) Revise loop
 
@@ -142,31 +145,31 @@ Where to fix: `src/engines/software/github.ts` (`run` parses stderr; the `build*
 
 Assumption: `claude -p --output-format stream-json` requires `--verbose` (the runner always passes it), and `--permission-prompts none` is accepted by the installed `claude` and denies, rather than waits for, any tool use outside `--allowedTools`. Also that `--allowedTools=<comma list>` with entries containing spaces or parentheses is parsed as intended and `--max-budget-usd` is enforced.
 
-How to check: run `claude --help` and confirm `--permission-prompts`, `--max-budget-usd`, `--allowedTools` and `--verbose` exist. Run one execute job and confirm it finishes without hanging on a permission prompt (the inactivity timeout of 10 minutes would otherwise kill it with `no output from claude`). Make the impossible-budget run in (c) and confirm the budget is enforced.
+How to check: run `claude --help` and confirm `--permission-prompts`, `--max-budget-usd`, `--allowedTools`, `--setting-sources` and `--verbose` exist (the review policy passes `--setting-sources user`; confirm a review run does not load the sandbox repository's `.claude/settings.json`, for example by committing one with a hook to the PR branch and checking the hook never runs). Run one execute job and confirm it finishes without hanging on a permission prompt (the inactivity timeout of 10 minutes would otherwise kill it with `no output from claude`). Make the impossible-budget run in (c) and confirm the budget is enforced.
 
 Where to fix: `buildArgs` in `src/runner/claude-cli.ts`.
 
 ### 3. Allow-rule syntax and the residual risk in the review policy (`policies/software-review.yaml`)
 
-Assumption: rules like `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)` and `Bash(git status:*)` match exactly those git subcommands and nothing else, so the reviewer cannot write. Residual risk: even these read-only subcommands can run an external diff or textconv driver configured in the repository's git config (or attributes) unless invoked with `--no-ext-diff --no-textconv`; the policy does not force those flags and cannot, since the agent composes the command.
+Assumption: rules like `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)` and `Bash(git status:*)` match exactly those git subcommands and nothing else, so the reviewer cannot write. Residual risk: even these read-only subcommands can run an external diff or textconv driver configured in git config (or attributes) unless invoked with `--no-ext-diff --no-textconv`. The review prompt now instructs those flags (and forbids `--output`), but the allow-list cannot enforce them, since the agent composes the command. The factory removes `diff.*` and every other non-allow-listed key from the shared cache config before each workspace preparation, so a driver planted there by an execute agent is gone; a driver in the worktree's `.gitattributes` still needs a matching config entry to do anything.
 
 How to check: during a review run, confirm `git diff origin/<base>...HEAD` works and that a write attempt (for example a `Bash(touch x)` request) is denied; the review job's `result` holds only the verdict, so the worker terminal and the unchanged tree are the evidence. For the residual risk, confirm that no `diff.*.command` or `diff.*.textconv` is set in the bare cache config (`git -C /tmp/factory-smoke/workspaces/.cache/<owner>__<repo>.git config -l`) or in your global git config, since a worktree shares the cache's config.
 
-Where to fix: the `allowedTools` list in `policies/software-review.yaml` and the review prompt (instruct `--no-ext-diff --no-textconv`).
+Where to fix: the `allowedTools` list and the prompt in `policies/software-review.yaml`; the cache-config allow-list (`ALLOWED_KEYS` in `src/engines/software/workspace.ts`).
 
 ### 4. Final JSON block parsing (`src/runner/stream.ts`, `lastJsonBlock`)
 
-Assumption: the result is taken from the LAST fenced ```` ```json ```` block of the final assistant message, so a model that quotes the prompt's example block after its real one would break parsing: the example block `{"verdict": "approve" | "request_changes", ...}` is not valid JSON. A review would then produce an error result that fails the verdict schema, so the job is dead-lettered as `runner_error` with a schema failure on `verdict`; an execute job would lose its summary and followups (it falls back to the message text).
+Assumption: the result is taken from the LAST fenced ```` ```json ```` block of the final assistant message. Both prompts end with a single, valid example block (the review example says `"verdict": "approve"`), so a model that quotes the example after its real block would turn the example into the result: a review would then approve with the example feedback, and an execute job would carry the example summary.
 
-How to check: over several runs of each kind, confirm the review verdicts parse (no review dead letter with `runner_error` and a schema failure on `verdict`) and the PR body carries the agent's summary rather than raw message text.
+How to check: over several runs of each kind, confirm the review verdicts parse (no review dead letter with `runner_error` and a schema failure on `verdict`), that no review result carries the example feedback text, and that the PR body carries the agent's summary rather than raw message text or the example summary.
 
 Where to fix: `lastJsonBlock` in `src/runner/stream.ts` and the closing instructions in both policy prompts.
 
 ### 5. Workspace, base branch and push mechanics (`src/engines/software/workspace.ts`, `git-ports.ts`)
 
-Assumption: the default branch is detected with `git ls-remote --symref origin HEAD` (it falls back to `main` if that fails); the bare cache under `<workspaceRoot>/.cache/<owner>__<repo>.git` fetches with `+refs/heads/*:refs/remotes/origin/*`; `remote.origin.pushurl` is set to `no_push://disabled` so nothing in a worktree can push through `origin`, while the engine pushes to the explicit URL from `cloneUrlTemplate` with `--force-with-lease=refs/heads/factory/issue-<n>:<sha>`.
+Assumption: the default branch is detected with `git ls-remote --symref origin HEAD` (it falls back to `main` if that fails); fetches and pushes finish well within their 5-minute timeout (a first fetch of a large repository is the risky case); the bare cache under `<workspaceRoot>/.cache/<owner>__<repo>.git` fetches with `+refs/heads/*:refs/remotes/origin/*`; `remote.origin.pushurl` is set to `no_push://disabled` so nothing in a worktree can push through `origin`, while the engine pushes to the explicit URL from `cloneUrlTemplate` with `--force-with-lease=refs/heads/factory/issue-<n>:<sha>`.
 
-How to check: use a sandbox whose default branch is not `main` (for example `trunk`) and confirm the PR base is that branch. After a run, `git -C .../.cache/<owner>__<repo>.git config -l` shows the `pushurl`. Confirm the push works with your credential setup, and that a revise attempt (d) pushes a fast-forward commit with the lease succeeding. In a kept worktree, `git push origin HEAD` must fail with `no_push`.
+How to check: use a sandbox whose default branch is not `main` (for example `trunk`) and confirm the PR base is that branch. After a run, `git -C .../.cache/<owner>__<repo>.git config -l` shows the `pushurl` and only the allow-listed keys. Confirm the push works with your credential setup, and that a revise attempt (d) pushes a fast-forward commit with the lease succeeding. In a kept worktree, `git push origin HEAD` must fail with `no_push`.
 
 Where to fix: `detectBase`, `ensureCache` in `src/engines/software/workspace.ts`; `push` in `src/engines/software/git-ports.ts`.
 
@@ -190,7 +193,7 @@ Where to fix: `leaseMs` and `heartbeatMs` in `src/cli/runtime.ts`.
 
 1. Stop the worker (Ctrl-C in terminal 2) and confirm no `claude` process remains (`pgrep -fa claude`).
 2. Remove the local state: `rm -rf /tmp/factory-smoke` (database, config and all worktrees and the bare cache).
-3. In the sandbox repository: close the pull requests you did not merge (`gh pr close <n> --repo <owner>/<repo> --delete-branch`), delete leftover branches (`git push https://github.com/<owner>/<repo>.git --delete factory/issue-<n>`), close the test issues and the `factory:followup` issues, or delete the whole sandbox repository (`gh repo delete <owner>/<repo>`).
+3. In the sandbox repository: close the pull requests you did not merge (`gh pr close <n> --repo <owner>/<repo> --delete-branch`), delete leftover branches (an automatic merge already deleted its own) (`git push https://github.com/<owner>/<repo>.git --delete factory/issue-<n>`), close the test issues and the `factory:followup` issues, or delete the whole sandbox repository (`gh repo delete <owner>/<repo>`).
 
 ## Recorded deviations
 

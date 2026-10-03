@@ -93,12 +93,13 @@ factory [--config <path>] status
 factory [--config <path>] dlq list
 factory [--config <path>] dlq retry <job-id>
 factory [--config <path>] dlq discard <job-id>
+factory [--config <path>] cancel <chain-id>
 factory --help
 ```
 
-`--config` and `-h`/`--help` may appear anywhere on the line. Exit codes: 0 success, 1 runtime error (message `error: ...` on stderr), 2 usage error (message and the usage text on stderr).
+`--config` and `-h`/`--help` may appear anywhere on the line. Exit codes: 0 success, 1 runtime error (message `error: ...` on stderr), 2 usage error (message and the usage text on stderr). Every command first loads and validates the policies (see Policies) and fails with exit 1, naming the policy, when one is invalid.
 
-**submit.** The URL must be `https://github.com/<owner>/<repo>/issues/<n>`. The issue must be open, have a non-empty body, and contain the required sections; a policy of kind `execute` must match its labels. A subject (`owner/repo#n`) can have only one open chain. `--label` values and `--engine <id>` (shorthand for `--label factory:engine:<id>`) feed the router only; they are not written to the issue. `submit` makes no GitHub writes.
+**submit.** The URL must be `https://github.com/<owner>/<repo>/issues/<n>`; owner and repository are lower-cased, so `Owner/Repo` and `owner/repo` name the same subject. The issue must be open, have a non-empty body, and contain the required sections; exactly one policy of kind `execute` and one of kind `review` must match its labels (or the defaults apply), so an ambiguous review policy fails here rather than after the agent ran. A subject (`owner/repo#n`) can have only one open chain. `--label` values and `--engine <id>` (shorthand for `--label factory:engine:<id>`) feed the router only; they are not written to the issue. `submit` makes no GitHub writes.
 
 ```
 $ factory submit https://github.com/acme/sandbox/issues/12
@@ -134,16 +135,25 @@ $ factory dlq discard 1
 discarded job 1
 ```
 
-`retry` re-queues the same job (its delivery counter is kept, so the next claim is delivery + 1), puts the chain back to active, and keeps the recorded result only for `effect_error` (then the agent is not rerun, only the post-processing). Only a review job's effects (labels, merge, comments) dead-letter as `effect_error`. When an execute job's push or pull-request creation fails, the job is dead-lettered as `runner_error`, so one `retry` reruns the agent in a fresh worktree (its earlier, unpublished work is redone); resuming would be impossible because the earlier delivery's worktree is not reused. It also moves the issue label from `factory:dead-letter` back to `factory:in-progress`. `discard` cancels the chain, which frees the subject for a new `submit`; it does not touch labels on GitHub, so remove `factory:dead-letter` from the issue yourself.
+`retry` re-queues the same job (its delivery counter is kept, so the next claim is delivery + 1), puts the chain back to active, and keeps the recorded result only for `effect_error` (then the agent is not rerun, only the post-processing). Only a review job's effects (labels, merge, comments) dead-letter as `effect_error`. When an execute job's push or pull-request creation fails, the job is dead-lettered as `runner_error`, so one `retry` reruns the agent in a fresh worktree (its earlier, unpublished work is redone); resuming would be impossible because the earlier delivery's worktree is not reused. `retry` also moves the issue label from `factory:dead-letter` back to `factory:in-progress`. `discard` cancels the chain, which frees the subject for a new `submit`, and removes `factory:in-progress`, `factory:needs-human`, `factory:dead-letter` and `factory:ready-for-merge` from the issue (best effort; a labelling failure is printed as an error, the discard stands).
+
+If labelling the issue fails when a job is dead-lettered (for example GitHub answers 502), the dead letter is recorded as not yet surfaced, and every maintenance pass (once a minute, in any running worker) retries the label and comment until they succeed.
+
+**cancel.** Ends a chain by hand, typically a `waiting` one: a supervised PR you merged or closed yourself, a `needs-human` PR you dealt with, or an issue you want to resubmit. It cancels the chain and its queued jobs, resolves its dead letters, frees the subject for a new `submit`, and removes `factory:in-progress`, `factory:needs-human`, `factory:dead-letter` and `factory:ready-for-merge` from the issue (labels on the PR are left alone). It refuses (exit 1) a chain whose job is running (stop that worker, or wait for the delivery to finish) and a chain that is already completed or cancelled; a missing or non-numeric id is a usage error (exit 2).
+
+```
+$ factory cancel 1
+cancelled chain 1
+```
 
 ## Labels
 
 | Label | On | Meaning |
 |---|---|---|
-| `factory:in-progress` | issue | Set once the first execute job produced a pull request; removed on approval, on the final changes request, and on dead-lettering. |
+| `factory:in-progress` | issue | Set once the first execute job produced a pull request (the same step removes a leftover `factory:dead-letter`); removed on approval, on the final changes request, on dead-lettering, and by `cancel` and `dlq discard`. |
 | `factory:ready-for-merge` | PR | `supervised` profile: the reviewer approved; a human merges. |
 | `factory:needs-human` | PR | The reviewer still requested changes after the last attempt. |
-| `factory:dead-letter` | issue | A job failed beyond what the kernel can recover; the factory also comments with the reason, error and job id. |
+| `factory:dead-letter` | issue | A job failed beyond what the kernel can recover; the factory also comments with the reason, error and job id. Removed by `dlq retry`, `dlq discard`, `cancel`, and the next execute job of a resubmitted issue. |
 | `factory:followup` | new issues | Issues the factory filed from `followups` in agent or reviewer output. Nothing queues them automatically. |
 | `factory:profile:automatic` | issue (set by you, before submit) | Selects the `automatic` profile. |
 | `factory:engine:<id>` | `--label` value | Router label naming the engine. More than one distinct engine label is an error; an unknown id is an error. |
@@ -152,7 +162,9 @@ Labels are set and removed explicitly, never toggled. GitHub creates a label on 
 
 ### needs-human versus dead-letter
 
-`needs-human` means the machinery worked: the agent produced a pull request three times and the reviewer kept requesting changes. A PR exists and a person decides what to do with it. `dead-letter` means the machinery failed (the runner errored or timed out, a GitHub or git effect kept failing, the workspace could not be prepared, or the lease expired on every delivery) and no usable result exists. Look at the issue comment and `factory dlq list`, fix the cause, then `factory dlq retry <job-id>`, or `factory dlq discard <job-id>` to give up.
+`needs-human` means the machinery worked: the agent produced a pull request three times and the reviewer kept requesting changes. A PR exists and a person decides what to do with it. `dead-letter` means the machinery failed (the runner errored or timed out, a GitHub or git effect kept failing, the workspace could not be prepared, or the lease expired on every delivery) and no usable result exists. Look at the issue comment and `factory dlq list`, fix the cause, then `factory dlq retry <job-id>`, or `factory dlq discard <job-id>` to give up. Nothing in the factory watches the PR after `needs-human` or `ready-for-merge`: once you have merged, closed or otherwise handled it, end the chain with `factory cancel <chain-id>`.
+
+Closing the issue stops the chain: the next job is dead-lettered (`runner_error`, `issue #<n> is closed`) before the agent runs, and opening a pull request or merging for a closed issue fails as `effect_error`. Discard it or cancel the chain.
 
 ## Policies
 
@@ -165,14 +177,14 @@ A policy is one YAML file in `policiesDir`:
 | `match.labels` | Labels that must all be present on the job's labels (the issue's labels at submit time). |
 | `default` | `true` marks the fallback for its kind. A default must have empty `match.labels`; a non-default must have a non-empty list. At most one default per kind. |
 | `runner` | Runner name; `claude-cli` is the only one registered. |
-| `config` | Runner-specific settings, validated by the runner when it runs. |
+| `config` | Runner-specific settings, validated against the runner's schema at startup. |
 
-Matching: among the non-default policies of the kind, those whose `match.labels` are all present are candidates. Exactly one wins; more than one is an `ambiguous policy match` error; none falls back to the default of that kind; no default is an error. Files are loaded at startup, so restart the worker after editing them.
+Matching: among the non-default policies of the kind, those whose `match.labels` are all present are candidates. Exactly one wins; more than one is an `ambiguous policy match` error; none falls back to the default of that kind; no default is an error. Files are loaded and validated at startup: each policy's `kind` must be declared by a registered engine, its `runner` must be registered, and its `config` must pass that runner's schema; otherwise every command fails with an error naming the policy. Restart the worker after editing them.
 
 Two default policies ship:
 
 - `policies/software-execute.yaml` (`software-execute`): tools `Read, Edit, Write, Bash, Glob, Grep`, budget `maxBudgetUsd: 5`, `timeoutMs: 1800000`, `inactivityTimeoutMs: 600000`, `resultFormat: execution`.
-- `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`.
+- `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `settingSources: user`.
 
 `claude-cli` config fields (`src/runner/claude-cli.ts`):
 
@@ -185,16 +197,17 @@ Two default policies ship:
 | `inactivityTimeoutMs` | Kill the run after this long without a stream event (same bounds). |
 | `resultFormat` | `execution` (summary and optional followups from the final JSON block; steps and cost from the stream) or `json` (the final JSON block is the result, used for review verdicts). |
 | `permissionMode` | Optional; passed as `--permission-mode`. |
+| `settingSources` | Optional; passed as `--setting-sources` (comma-separated `user`, `project`, `local`). The review policy uses `user`, so the branch under review cannot bring its own `.claude/settings.json`. |
 
-The review policy is read-only by tool restriction: no `Edit`, `Write` or general `Bash`, only the four read-only git subcommands. The agent must end its final message with one fenced `json` block; the last such block is parsed.
+The review policy is read-only by tool restriction: no `Edit`, `Write` or general `Bash`, only the four read-only git subcommands. Its prompt tells the reviewer to pass `--no-ext-diff --no-textconv` to `git diff`, `git show` and `git log -p` and never to use `--output` (a prompt rule, not enforced: the `Bash(git diff:*)` rules cannot express it). The agent must end its final message with one fenced `json` block; the last such block is parsed.
 
 ## Concurrency and safety
 
-Each claim of a job increments its `delivery` counter and takes a lease (5 minutes, renewed every 30 seconds by a heartbeat). Every kernel write is fenced by `(job id, delivery)`, so a stale worker's result is rejected, and every external effect re-checks the fence immediately before acting. Each delivery gets its own git worktree, so a zombie cannot corrupt its replacement, and the push uses `--force-with-lease` against the sha the delivery was seeded from. Before a job is reclaimed the reaper kills the claiming worker's agent process groups and the worker pid, then requeues or dead-letters. Effects look before they act (find the PR by branch, find a marker comment, check PR state). The reasoning and the accepted residual risks are in section 5 of [the spec](docs/superpowers/specs/2026-10-03-software-factory-design.md).
+Each claim of a job increments its `delivery` counter and takes a lease (5 minutes, renewed every 30 seconds by a heartbeat). Every kernel write is fenced by `(job id, delivery)`, so a stale worker's result is rejected, and every external effect re-checks the fence immediately before acting. Each delivery gets its own git worktree, so a zombie cannot corrupt its replacement, and the push uses `--force-with-lease` against the sha the delivery was seeded from. Before a job is reclaimed the reaper kills the delivery's agent process groups and, only if that worker's row still names this job delivery as its current one, the worker pid (a worker that moved on to another job is never killed), then requeues or dead-letters. A worker that loses its lease waits at most 10 seconds for the run to stop before it moves on. Effects look before they act (find the PR by branch, find a marker comment, check PR state). When the push's lease is rejected while the delivery is still current, someone else moved `factory/issue-<n>` (a person pushed to it, for example) and the job is dead-lettered (`runner_error`, `remote branch moved by someone else`). In the `automatic` profile the merge is pinned with `gh pr merge --match-head-commit` to the commit the reviewer saw, and `--delete-branch` removes the branch afterwards. The agent's summary is capped at 2000 characters and neutralized before it goes into the PR body (no `@` mentions, no `Fixes #n` closing references). Every `gh` call is killed after 60 seconds (a transient failure, retried), every git network command (fetch, push, ls-remote) after 5 minutes and every local git command after 60 seconds; git's ssh runs with `BatchMode=yes`, so it fails instead of prompting. The reasoning and the accepted residual risks are in section 5 of [the spec](docs/superpowers/specs/2026-10-03-software-factory-design.md). The reasoning and the accepted residual risks are in section 5 of [the spec](docs/superpowers/specs/2026-10-03-software-factory-design.md).
 
 ## Writing a new engine
 
-1. Implement `Engine<S>` from `src/kernel/types.ts`: `id`, `policyKinds`, `stateSchema`, `resultSchemas` (job type to zod schema), `submit`, `workspace`, `buildRunInput`, a pure `transition`, idempotent `runEffect`, `describe`, `surfaceDeadLetter`, `cleanup`, and optionally `afterRetry` and `sweep`.
+1. Implement `Engine<S>` from `src/kernel/types.ts`: `id`, `policyKinds`, `stateSchema`, `resultSchemas` (job type to zod schema), `submit`, `workspace`, `buildRunInput`, a pure `transition`, idempotent `runEffect`, `describe`, `surfaceDeadLetter`, `cleanup`, and optionally `afterRetry`, `afterCancel` and `sweep`.
 2. The smallest working example is the echo engine in `test/support/echo-engine.ts`; `src/engines/software/` is the full-size one.
 3. Register it in `buildRuntime` (`src/cli/runtime.ts`) next to the software engine, and add policies for its kinds.
 4. Route to it with `factory submit <input> --engine <id>` (the label `factory:engine:<id>`). `factory submit` currently passes `{ issueUrl }` as the engine's submit input, so a new engine reading something else needs a CLI change.
@@ -213,9 +226,12 @@ Tests use fakes for GitHub (`test/support/fake-github.ts`) and the model (a stub
 - Single machine only: the queue is a SQLite file and the kernel kills worker and agent PIDs locally. Workers on separate hosts are not supported.
 - No poller: work enters only through `factory submit`. Routing uses the explicit `--label` and `--engine` values, not the issue's own labels. (The profile label `factory:profile:automatic` and policy matching do read the issue's labels.)
 - One engine ships (software). The experiment and intake engines are future work.
-- An execute job whose result was recorded but whose workspace was lost in a crash goes to the dead-letter queue; a human `factory dlq retry` reruns the agent. Review jobs resume cleanly.
-- A dead letter created by the reaper is surfaced on the issue only once; if that surfacing fails it is not retried.
-- The worktree sweep only recognizes directories named `j<jobId>-d<delivery>`; older naming is left alone.
-- History tables are pruned by `historyRetentionDays`.
-- The `claimed_until` column of the `followups` table exists only in the DDL (`CREATE TABLE IF NOT EXISTS`) and there is no migration tooling: delete the database file when upgrading a prototype database.
-- The `gh`-based GitHub calls were never run against the real CLI during development, only against fakes.
+- Linux only (see Prerequisites).
+- Not a sandbox: the agent runs as your OS user with your `HOME`, and the shipped execute policy allows unrestricted `Bash`. See "Credentials" for what is isolated and what is not.
+- An execute job whose result was recorded but whose workspace was lost in a crash goes to the dead-letter queue; a human `factory dlq retry` reruns the agent. Review jobs resume cleanly. The same holds when the execute job's third effect (adding `factory:in-progress` to the issue) keeps failing: that dead letter is an `effect_error`, its first retry resumes into the missing workspace and dead-letters again as `runner_error`, and the second retry reruns the agent.
+- Nothing observes the PR after the factory is done with it (no poller, no webhook): a `waiting` chain stays open until `factory cancel <chain-id>`.
+- The worktree sweep only recognizes directories named `j<jobId>-d<delivery>`; older naming is left alone. It never removes a delivery that is running or recently dead-lettered (checked again under the cache lock right before removal), nor a delivery directory modified in the last 10 minutes.
+- History tables are pruned by `historyRetentionDays`. The `workers` table is never pruned.
+- There is no migration tooling: tables are created with `CREATE TABLE IF NOT EXISTS`, so columns added since a database was created (`followups.claimed_until`, `dead_letters.surfaced_at`, `workers.current_job_id` and `workers.current_delivery`) are missing from it. Delete the database file when upgrading a prototype database.
+- Timeouts are fixed in code: 60 seconds per `gh` call and per local git command, 5 minutes per git fetch or push. A first fetch of a very large repository that needs longer fails the delivery (`workspace prepare failed: ... timed out`).
+- The `gh`-based GitHub calls were never run against the real CLI during development, only against fakes. In particular, whether `gh pr merge --match-head-commit` reports an HTTP status when it refuses is unverified (if not, the refusal is retried as transient, then dead-lettered as `effect_error`).
