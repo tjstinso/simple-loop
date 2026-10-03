@@ -42,7 +42,18 @@ The profile is `supervised` unless the issue carries the label `factory:profile:
 - `claude`, the Claude Code CLI, logged in.
 - Issues in the formalized template: the body must contain a line `## Goal` and a line `## Acceptance criteria` (compared case-insensitively on trimmed lines; configurable with `requiredSections`).
 
-Credentials: the `claude` child process runs with every environment variable starting with `GH_` or `GITHUB_` removed, so the agent cannot use `GH_TOKEN` or `GITHUB_TOKEN`. The engine itself pushes with the machine's own git credential configuration (credential helper, `gh auth setup-git`, and so on), to the explicit URL built from `cloneUrlTemplate`.
+### Credentials
+
+The factory process itself needs GitHub credentials: `gh` calls use your `gh` login (or `GH_TOKEN`), and the engine pushes with the machine's git credential configuration (credential helper, `gh auth setup-git`, and so on) to the explicit URL built from `cloneUrlTemplate`. The agent (the `claude` child process) is NOT meant to have them, and the factory takes these measures:
+
+- The agent's environment has every variable starting with `GH_` or `GITHUB_` removed (so no `GH_TOKEN` or `GITHUB_TOKEN`), and `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`, `GIT_SSH_COMMAND` and `GIT_SSH` removed (no SSH agent, no askpass helper).
+- `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` are set for the agent, so git inside the agent does not see a credential helper configured in `~/.gitconfig` or the system config.
+- `GH_CONFIG_DIR` points at a fresh, empty directory created for each run and removed afterwards, so `gh` inside the agent does not find your `gh` login.
+- The worktree's `origin` has its push URL disabled, and only the engine pushes, after the run.
+- The worktrees share one bare cache repository per GitHub repository, whose config the agent can write. Before the engine commits and pushes, and at the start of every workspace preparation, the factory removes every key of that config that is not on a short allow-list (so a planted `url.*.insteadOf`, `credential.helper`, `core.sshCommand`, `core.fsmonitor` or `include.path` cannot redirect or hijack the engine's own git), checks that the worktree's `.git` file still points into the cache, and runs its git commands with hooks disabled.
+- The review run is started with `--setting-sources user`, so the `.claude/settings.json` on the branch under review (written by the execute agent) cannot add hooks or permission rules.
+
+Residual risk: this is not a sandbox. The agent runs as your OS user with your `HOME` (the `claude` CLI needs its own login there), and the shipped execute policy allows unrestricted `Bash`. An agent that goes looking can still read any credential stored in plaintext under `HOME` (for example `~/.config/gh/hosts.yml` when `gh` stores its token in a file rather than the system keyring, `~/.git-credentials`, SSH private keys without a passphrase, cloud CLI credentials), and it could leave a background process that rewrites the cache config after the factory sanitized it. Run the factory under a dedicated low-privilege OS user, or in a container or VM, whose only GitHub credential is a fine-grained token (or machine user) limited to the repositories you submit, ideally a sandbox repository.
 
 ## Install and build
 
