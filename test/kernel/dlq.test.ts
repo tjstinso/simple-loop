@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { openDb, migrate } from '../../src/kernel/db.js';
 import { claimNext, createChain, getChain, getJob, recordResult } from '../../src/kernel/queue.js';
-import { deadLetter, discardDeadLetter, listDeadLetters, retryDeadLetter } from '../../src/kernel/dlq.js';
+import { DeadLetterStateError, deadLetter,discardDeadLetter, listDeadLetters, retryDeadLetter } from '../../src/kernel/dlq.js';
 
 function mk() {
   const db = openDb(':memory:');
@@ -102,6 +102,54 @@ describe('dead-letter queue', () => {
     expect(listDeadLetters(db)[0]!.resolvedAt).toBe(300);
     expect(() => createChain(db, { engine: 'e', subjectKey: 'k1', engineState: {}, firstJob: first }, 400)).not.toThrow();
     expect(() => discardDeadLetter(db, job.id, 500)).toThrow(/no unresolved dead letter/);
+  });
+
+  it('refuses to dead-letter a succeeded job and leaves job and chain untouched', () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    db.prepare("UPDATE jobs SET status='succeeded' WHERE id=?").run(job.id);
+    expect(() => deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'e' }, 200)).toThrow(DeadLetterStateError);
+    expect(() => deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'e' }, 200)).toThrow(
+      new RegExp(`job ${job.id}.*succeeded`),
+    );
+    expect(getJob(db, job.id)).toMatchObject({ status: 'succeeded', error: null });
+    expect(getChain(db, chain.id).status).toBe('active');
+    expect(listDeadLetters(db)).toHaveLength(0);
+  });
+
+  it('refuses to dead-letter a job on a cancelled chain and leaves the chain cancelled', () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    db.prepare("UPDATE chains SET status='cancelled' WHERE id=?").run(chain.id);
+    expect(() => deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'e' }, 200)).toThrow(DeadLetterStateError);
+    expect(getChain(db, chain.id).status).toBe('cancelled');
+    expect(getJob(db, job.id).status).toBe('running');
+    expect(listDeadLetters(db)).toHaveLength(0);
+  });
+
+  it('refuses to dead-letter a job on a completed chain', () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    db.prepare("UPDATE chains SET status='completed' WHERE id=?").run(chain.id);
+    expect(() => deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'e' }, 200)).toThrow(/completed/);
+    expect(getChain(db, chain.id).status).toBe('completed');
+  });
+
+  it('retry still refuses a cancelled chain after a refused dead-letter attempt', () => {
+    const db = mk();
+    const { chain, job } = setup(db);
+    db.prepare("UPDATE chains SET status='cancelled' WHERE id=?").run(chain.id);
+    expect(() => deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'e' }, 200)).toThrow(DeadLetterStateError);
+    expect(() => retryDeadLetter(db, job.id, 300)).toThrow(/no unresolved dead letter/);
+    expect(getChain(db, chain.id).status).toBe('cancelled');
+  });
+
+  it('a repeated deadLetter call on an already dead-lettered job still returns the existing row', () => {
+    const db = mk();
+    const { job } = setup(db);
+    const a = deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'a' }, 200);
+    expect(getJob(db, job.id).status).toBe('failed');
+    expect(deadLetter(db, { jobId: job.id, reason: 'runner_error', error: 'b' }, 300)).toEqual(a);
   });
 
   it('listDeadLetters filters unresolved and orders newest first', () => {

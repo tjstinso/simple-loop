@@ -15,6 +15,14 @@ interface DeadLetterRow {
   resolved_at: number | null;
 }
 
+/** Thrown by deadLetter when the job or its chain is already in a terminal state. */
+export class DeadLetterStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeadLetterStateError';
+  }
+}
+
 function rowToDeadLetter(r: DeadLetterRow): DeadLetter {
   return {
     jobId: r.job_id,
@@ -46,12 +54,23 @@ export function deadLetter(
 ): DeadLetter {
   return db
     .transaction((): DeadLetter => {
-      const job = db.prepare('SELECT chain_id FROM jobs WHERE id = ?').get(args.jobId) as
-        | { chain_id: number }
+      const job = db.prepare('SELECT chain_id, status FROM jobs WHERE id = ?').get(args.jobId) as
+        | { chain_id: number; status: string }
         | undefined;
       if (!job) throw new Error(`job ${args.jobId} not found`);
       const existing = findUnresolved(db, args.jobId);
       if (existing) return rowToDeadLetter(existing);
+      if (job.status === 'succeeded' || job.status === 'cancelled') {
+        throw new DeadLetterStateError(`cannot dead-letter job ${args.jobId}: job is ${job.status}`);
+      }
+      const chain = db.prepare('SELECT status FROM chains WHERE id = ?').get(job.chain_id) as
+        | { status: string }
+        | undefined;
+      if (chain && (chain.status === 'cancelled' || chain.status === 'completed')) {
+        throw new DeadLetterStateError(
+          `cannot dead-letter job ${args.jobId}: chain ${job.chain_id} is ${chain.status}`,
+        );
+      }
       db.prepare(
         `UPDATE jobs SET status = 'failed', error = ?, lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
       ).run(args.error, now, args.jobId);
