@@ -3,7 +3,7 @@ import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
 import type { ChainView, DeadLetter, Engine, Job, WorkspaceProvider } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
-import { runSoftwareEffect } from './effects.js';
+import { defaultSleep, runSoftwareEffect, withHostRetry } from './effects.js';
 import type { GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
@@ -101,12 +101,14 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     async buildRunInput(chain, job, ws) {
       const s = chain.state;
-      const issue = await deps.host.getIssue(s.repo, s.issueNumber);
+      // Transient GitHub failures are retried like the effects' (a final failure dead-letters as runner_error).
+      const sleep = deps.sleep ?? defaultSleep;
+      const issue = await withHostRetry(() => deps.host.getIssue(s.repo, s.issueNumber), sleep);
       // Closing the issue stops the chain: dead-lettered (runner_error) before the agent spends budget.
       if (issue.state !== 'open') throw new Error(`issue #${s.issueNumber} is closed`);
       let pr: { number: number; baseBranch: string } | null = null;
       if (job.type === 'review') {
-        const found = await deps.host.findPrByHead(s.repo, s.branch);
+        const found = await withHostRetry(() => deps.host.findPrByHead(s.repo, s.branch), sleep);
         if (!found) throw new Error(`no PR found for review of ${s.branch}`);
         pr = { number: found.number, baseBranch: (ws as SoftwareWorkspace).baseBranch };
       }

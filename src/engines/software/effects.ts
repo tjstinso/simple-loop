@@ -44,26 +44,39 @@ function parse(effect: Effect): Supported {
   return r.data as Supported;
 }
 
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+export const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const isTransient = (e: GitHostError) => e.status === undefined || e.status === 429 || e.status >= 500;
 
 /**
- * Host failure classification. Retries the whole (check-before-act) effect body on a
- * transient GitHostError, so a retried mutation always looks again first and a call that
- * succeeded server-side but failed client-side is not repeated. 4xx fails immediately.
- * StaleDeliveryError, EffectError and non-GitHostError exceptions propagate unchanged.
+ * The host retry policy shared by effects and run-input building: `fn` is retried on a transient
+ * GitHostError (no status, 429, 5xx) up to 3 attempts with 100 ms and 200 ms backoff. A 4xx, the
+ * last transient failure and any other exception propagate unchanged.
  */
-async function classified(ctx: EffectContext, body: () => Promise<void>): Promise<void> {
-  const sleep = ctx.sleep ?? defaultSleep;
+export async function withHostRetry<T>(fn: () => Promise<T>, sleep: (ms: number) => Promise<void> = defaultSleep): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await body();
+      return await fn();
     } catch (e) {
-      if (!(e instanceof GitHostError)) throw e;
-      if (!isTransient(e) || attempt >= MAX_ATTEMPTS) throw new EffectError(e.message, 'effect_error');
+      if (!(e instanceof GitHostError) || !isTransient(e) || attempt >= MAX_ATTEMPTS) throw e;
       await sleep(BASE_DELAY_MS * 2 ** (attempt - 1));
     }
+  }
+}
+
+/**
+ * Host failure classification. Retries the whole (check-before-act) effect body on a
+ * transient GitHostError (withHostRetry), so a retried mutation always looks again first and a call
+ * that succeeded server-side but failed client-side is not repeated. 4xx fails immediately. A final
+ * GitHostError becomes EffectError(effect_error); StaleDeliveryError, EffectError and
+ * non-GitHostError exceptions propagate unchanged.
+ */
+async function classified(ctx: EffectContext, body: () => Promise<void>): Promise<void> {
+  try {
+    await withHostRetry(body, ctx.sleep ?? defaultSleep);
+  } catch (e) {
+    if (e instanceof GitHostError) throw new EffectError(e.message, 'effect_error');
+    throw e;
   }
 }
 

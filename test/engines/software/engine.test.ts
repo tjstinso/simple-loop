@@ -9,6 +9,7 @@ import type { GitPorts } from '../../../src/engines/software/git-ports.js';
 import type { GitWorkspaceProvider, SoftwareWorkspace } from '../../../src/engines/software/workspace.js';
 import { EffectError, type ChainView, type DeadLetter, type EffectFence, type Job } from '../../../src/kernel/types.js';
 import { PolicyStore } from '../../../src/policy/store.js';
+import { GitHostError } from '../../../src/engines/software/github.js';
 import { FakeGitHost } from '../../support/fake-github.js';
 
 const REPO = 'acme/widgets';
@@ -52,7 +53,7 @@ const ws: SoftwareWorkspace = {
   remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
 };
 
-function make() {
+function make(opts: { sleep?: (ms: number) => Promise<void> } = {}) {
   const host = new FakeGitHost();
   host.addIssue({ number: 7, title: 't', body: 'b', labels: [LABEL_IN_PROGRESS] });
   const git = new RecordingGit();
@@ -88,7 +89,7 @@ function make() {
     workspaces,
     policies: new PolicyStore([]),
     config: { defaultProfile: 'supervised', requiredSections: [], historyRetentionDays: 30, keptWorktreeMaxAgeMs: 7 * DAY },
-    sleep: async () => {},
+    sleep: opts.sleep ?? (async () => {}),
   });
   return {
     host, git, engine, prepared, db, teardowns, sweeps,
@@ -187,6 +188,37 @@ describe('software engine', () => {
     host.issues.get(7)!.state = 'closed';
     await expect(engine.buildRunInput(chain(), job(), ws)).rejects.toThrow('issue #7 is closed');
     await expect(engine.buildRunInput(chain(), { ...job(), type: 'review' }, ws)).rejects.toThrow('issue #7 is closed');
+  });
+
+  it('buildRunInput retries a transient getIssue failure three times with backoff, then propagates it', async () => {
+    const delays: number[] = [];
+    const { engine, host } = make({ sleep: async (ms) => void delays.push(ms) });
+    let attempts = 0;
+    host.getIssue = async () => {
+      attempts++;
+      throw new GitHostError('bad gateway', 502);
+    };
+    await expect(engine.buildRunInput(chain(), job(), ws)).rejects.toThrow('bad gateway');
+    expect(attempts).toBe(3);
+    expect(delays).toEqual([100, 200]);
+  });
+
+  it('buildRunInput recovers from a transient failure and does not retry a 404', async () => {
+    const delays: number[] = [];
+    const { engine, host } = make({ sleep: async (ms) => void delays.push(ms) });
+    host.failNext('getIssue', new GitHostError('rate limited', 429));
+    const pr = await host.openPr(REPO, { head: 'factory/issue-7', base: 'main', title: 't', body: 'b' });
+    host.failNext('findPrByHead', new GitHostError('timed out'));
+    const out = await engine.buildRunInput(chain(), { ...job(), type: 'review' }, ws);
+    expect(out.subject).toMatchObject({ kind: 'review', prNumber: pr.number });
+    expect(delays).toEqual([100, 100]);
+    expect(host.calls.filter((c) => c.method === 'getIssue')).toHaveLength(2);
+    expect(host.calls.filter((c) => c.method === 'findPrByHead')).toHaveLength(2);
+
+    delays.length = 0;
+    host.failNext('getIssue', new GitHostError('Not Found', 404));
+    await expect(engine.buildRunInput(chain(), job(), ws)).rejects.toThrow('Not Found');
+    expect(delays).toEqual([]);
   });
 
   it('buildRunInput for a review job also looks up the PR', async () => {
