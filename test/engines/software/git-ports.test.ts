@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -131,6 +131,80 @@ describe('ExecGitPorts', () => {
       if (saved === undefined) delete process.env.GIT_PROXY_COMMAND;
       else process.env.GIT_PROXY_COMMAND = saved;
     }
+  });
+
+  describe('addedChanges', () => {
+    it('returns the added paths and added lines of an uncommitted change after commitAll, not deleted or unchanged files', async () => {
+      git(ws.path, ['rm', '-q', 'README.md']);
+      writeFileSync(join(ws.path, 'new.txt'), 'first line\nsecond line\n');
+      mkdirSync(join(ws.path, 'dir'));
+      writeFileSync(join(ws.path, 'dir', 'b.txt'), 'bee\n');
+      writeFileSync(join(ws.path, 'odd\nname.txt'), 'odd\n');
+      await ports.commitAll(ws, 'work');
+      const c = await ports.addedChanges(ws);
+      expect([...c.paths].sort()).toEqual(['dir/b.txt', 'new.txt', 'odd\nname.txt']);
+      const lines = c.text.split('\n');
+      expect(lines).toEqual(expect.arrayContaining(['first line', 'second line', 'bee', 'odd']));
+      expect(lines).not.toContain('hello'); // README.md's deleted line
+      expect(c.text).not.toMatch(/^\+\+\+|^---|^@@|^diff --git/m);
+      expect(c.truncated).toBe(false);
+    });
+
+    it('keeps only the added lines of a modified file', async () => {
+      writeFileSync(join(ws.path, 'README.md'), 'hello\nadded below\n');
+      await ports.commitAll(ws, 'edit');
+      const c = await ports.addedChanges(ws);
+      expect(c.paths).toEqual(['README.md']);
+      expect(c.text.split('\n')).toContain('added below');
+      expect(c.text.split('\n')).not.toContain('hello');
+    });
+
+    it('covers commits the agent made itself, including a file added in one commit and deleted in the next', async () => {
+      writeFileSync(join(ws.path, '.env'), 'PLANTED=agent-commit-value\n');
+      git(ws.path, ['add', '.']);
+      git(ws.path, ['commit', '-q', '-m', 'agent message line']);
+      git(ws.path, ['rm', '-q', '.env']);
+      git(ws.path, ['commit', '-q', '-m', 'remove it again']);
+      writeFileSync(join(ws.path, 'later.txt'), '++starts with two pluses\n');
+      await ports.commitAll(ws, 'leftover');
+      const c = await ports.addedChanges(ws);
+      expect([...c.paths].sort()).toEqual(['.env', 'later.txt']);
+      const lines = c.text.split('\n');
+      expect(lines).toContain('PLANTED=agent-commit-value');
+      expect(lines).toContain('++starts with two pluses');
+      // Commit metadata is pushed too.
+      expect(lines).toContain('agent message line');
+    });
+
+    it('a .gitattributes in the change cannot hide a text file from the scan', async () => {
+      writeFileSync(join(ws.path, '.gitattributes'), 'hidden.txt -diff\n');
+      writeFileSync(join(ws.path, 'hidden.txt'), 'hidden content\n');
+      await ports.commitAll(ws, 'attrs');
+      const c = await ports.addedChanges(ws);
+      expect(c.text.split('\n')).toContain('hidden content');
+    });
+
+    it('scans a binary file by its path only', async () => {
+      writeFileSync(join(ws.path, 'blob.bin'), Buffer.from([0, 1, 2, 0, 0x41, 0x42, 0x43, 0x0a]));
+      await ports.commitAll(ws, 'bin');
+      const c = await ports.addedChanges(ws);
+      expect(c.paths).toEqual(['blob.bin']);
+      expect(c.text).not.toContain('ABC');
+    });
+
+    it('stops at the cap and reports the change as truncated', async () => {
+      writeFileSync(join(ws.path, 'big.txt'), 'y'.repeat(200) + '\n');
+      const small = new ExecGitPorts({ scanCapBytes: 64 });
+      await small.commitAll(ws, 'big');
+      const c = await small.addedChanges(ws);
+      expect(c.truncated).toBe(true);
+      expect(Buffer.byteLength(c.text)).toBeLessThanOrEqual(64);
+      expect((await new ExecGitPorts({ scanCapBytes: 4096 }).addedChanges(ws)).truncated).toBe(false);
+    });
+
+    it('is empty when HEAD is the seed', async () => {
+      expect(await ports.addedChanges(ws)).toEqual({ paths: [], text: '', truncated: false });
+    });
   });
 
   it('timeout defaults stay below the documented limits', () => {

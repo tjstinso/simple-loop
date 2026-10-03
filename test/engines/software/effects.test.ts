@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type Job } from '../../../src/kernel/types.js';
 import type { SoftwareState } from '../../../src/engines/software/state.js';
 import { GitWorkspaceProvider, type SoftwareWorkspace } from '../../../src/engines/software/workspace.js';
-import { ExecGitPorts, type GitPorts } from '../../../src/engines/software/git-ports.js';
+import { ExecGitPorts, type AddedChanges, type GitPorts } from '../../../src/engines/software/git-ports.js';
 import { GitHostError } from '../../../src/engines/software/github.js';
 import { runSoftwareEffect, type EffectContext } from '../../../src/engines/software/effects.js';
 import { LABEL_IN_PROGRESS, LABEL_READY_FOR_MERGE } from '../../../src/engines/software/schemas.js';
@@ -45,8 +45,11 @@ class RecordingGit implements GitPorts {
   readonly calls: string[] = [];
   async commitAll(): Promise<boolean> { this.calls.push('commitAll'); return false; }
   async headSha(): Promise<string> { this.calls.push('headSha'); return 'x'; }
+  async addedChanges(): Promise<AddedChanges> { this.calls.push('addedChanges'); return CLEAN; }
   async push(): Promise<void> { this.calls.push('push'); }
 }
+
+const CLEAN: AddedChanges = { paths: [], text: '', truncated: false };
 
 const fakeWs: SoftwareWorkspace = {
   repo: 'acme/widgets', path: '/nonexistent', localBranch: 'l', remoteBranch: BRANCH, remoteUrl: '/nonexistent.git',
@@ -135,6 +138,7 @@ describe('runSoftwareEffect', () => {
       pushes = 0;
       commitAll(ws: SoftwareWorkspace, m: string) { return ports.commitAll(ws, m); }
       headSha(ws: SoftwareWorkspace) { return ports.headSha(ws); }
+      addedChanges(ws: SoftwareWorkspace) { return ports.addedChanges(ws); }
       push(ws: SoftwareWorkspace, a: { remoteBranch: string; expectSha: string | null }) { this.pushes++; return ports.push(ws, a); }
     }
 
@@ -208,6 +212,97 @@ describe('runSoftwareEffect', () => {
       expect(remoteHead()).toBe(human);
     });
 
+    describe('secret guard', () => {
+      // Assembled at run time: no literal token-shaped string in the source.
+      const API_KEY = 'sk-ant-' + 'api03-' + 'workerKeyForTests_0123456789';
+      const GH_TOKEN = 'gh' + 'p_' + 'A1b2C3d4'.repeat(5);
+      const secrets = () => [API_KEY];
+      const refuse = async (ws: SoftwareWorkspace) => {
+        const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports, secretValues: secrets }), fence()).catch(
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(EffectError);
+        expect((err as EffectError).reason).toBe('runner_error');
+        expect(git(remote.path, ['branch', '--list', BRANCH])).toBe('');
+        return err as EffectError;
+      };
+
+      it("commit_push refuses to push a file containing the worker's API key and the remote is unchanged", async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'config.txt'), `key = ${API_KEY}\n`);
+        const err = await refuse(ws);
+        expect(err.message).toBe(
+          'refusing to push: the change contains a secret (anthropic-key, known-secret-value); the matched text is not shown',
+        );
+        expect(host.prs.size).toBe(0);
+      });
+
+      it('commit_push refuses a file with a github token pattern', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'src.ts'), `export const t = '${GH_TOKEN}';\n`);
+        expect((await refuse(ws)).message).toMatch(/\(github-token\)/);
+      });
+
+      it('commit_push refuses an added .env file', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, '.env'), 'DEBUG=1\n');
+        expect((await refuse(ws)).message).toMatch(/\(secret-file\)/);
+      });
+
+      it('commit_push allows .env.example', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, '.env.example'), 'API_KEY=\n');
+        await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports, secretValues: secrets }), fence());
+        expect(git(remote.path, ['show', `${remoteHead()}:.env.example`])).toBe('API_KEY=');
+      });
+
+      it('the refusal message and dead letter text do not contain the secret', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'a.txt'), `${API_KEY}\n${GH_TOKEN}\n`);
+        const err = await refuse(ws);
+        const text = `${err.message}\n${err.stack ?? ''}\n${JSON.stringify(err)}`;
+        expect(text).not.toContain(API_KEY);
+        expect(text).not.toContain(GH_TOKEN);
+        expect(text).not.toContain('workerKeyForTests');
+        expect(JSON.stringify(host.calls)).not.toContain(API_KEY);
+      });
+
+      it('a clean change still pushes', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'clean.ts'), 'export const answer = 42;\n');
+        await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports, secretValues: secrets }), fence());
+        expect(git(remote.path, ['show', `${remoteHead()}:clean.ts`])).toBe('export const answer = 42;');
+      });
+
+      it('an agent-made commit containing a secret is refused too', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'leak.txt'), `${API_KEY}\n`);
+        git(ws.path, ['add', '.']);
+        git(ws.path, ['commit', '-q', '-m', 'agent commit']);
+        git(ws.path, ['rm', '-q', 'leak.txt']);
+        git(ws.path, ['commit', '-q', '-m', 'agent removes it again']);
+        expect((await refuse(ws)).message).toMatch(/known-secret-value/);
+      });
+
+      it('a scan that hit its cap refuses the push as scan-truncated', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'big.txt'), 'z'.repeat(500) + '\n');
+        const capped = new ExecGitPorts({ scanCapBytes: 100 });
+        const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: capped }), fence()).catch((e: unknown) => e);
+        expect((err as EffectError).reason).toBe('runner_error');
+        expect((err as Error).message).toMatch(/\(scan-truncated\)/);
+        expect(git(remote.path, ['branch', '--list', BRANCH])).toBe('');
+      });
+
+      it('the commit message built from the issue title is redacted', async () => {
+        host.issues.get(ISSUE)!.title = `Rotate ${API_KEY} now`;
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'ok.txt'), 'ok\n');
+        await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports, secretValues: secrets }), fence());
+        expect(git(remote.path, ['log', '-1', '--format=%s', remoteHead()])).toBe('factory: Rotate [redacted] now (attempt 1)');
+      });
+    });
+
     it('a stale fence stops commit_push before it pushes', async () => {
       const ws = await provider.prepare(chain(), job());
       writeFileSync(join(ws.path, 'a.txt'), 'a\n');
@@ -225,16 +320,18 @@ describe('runSoftwareEffect', () => {
       prepareForPush: async () => void order.push('prepareForPush'),
       commitAll: async () => (order.push('commitAll'), true),
       headSha: async () => (order.push('headSha'), 'new'),
+      addedChanges: async () => (order.push('addedChanges'), CLEAN),
       push: async () => void order.push('push'),
     };
     await runSoftwareEffect({ kind: 'commit_push' }, ctx({ git: g }), fence());
-    expect(order).toEqual(['prepareForPush', 'commitAll', 'headSha', 'push']);
+    expect(order).toEqual(['prepareForPush', 'commitAll', 'headSha', 'addedChanges', 'push']);
   });
 
   it("an execute job's commit_push git or host failure is a runner_error (a retry reruns the agent)", async () => {
     const pushFails: GitPorts = {
       commitAll: async () => true,
       headSha: async () => 'new',
+      addedChanges: async () => CLEAN,
       push: async () => {
         throw new Error('git push failed: Could not resolve host: github.com');
       },
@@ -368,6 +465,23 @@ describe('runSoftwareEffect', () => {
     expect(body.startsWith('Closes #7\n\n')).toBe(true); // the factory's own closing reference is intact
     expect(summary).not.toMatch(/@\w/);
     expect(summary).not.toMatch(/\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\d/i);
+  });
+
+  it('PR body redacts a secret in the summary', async () => {
+    const key = 'sk-ant-' + 'api03-' + 'summaryKey_0123456789abcdef';
+    const known = 'operator-password-value';
+    host.issues.get(ISSUE)!.title = `Add widgets ${known}`;
+    const summary = `Done. I used ${key} and the password ${known}; cc @octocat.`;
+    await runSoftwareEffect(
+      { kind: 'open_pr' },
+      ctx({ job: job({ result: { status: 'ok', summary } }), secretValues: () => [known] }),
+      fence(),
+    );
+    const pr = [...host.prs.values()][0]!;
+    expect(pr.body.split('\n\n')[1]).toBe('Done. I used [redacted] and the password [redacted]; cc @​octocat.');
+    expect(pr.title).toBe('Add widgets [redacted]');
+    expect(JSON.stringify(host.calls)).not.toContain(key);
+    expect(JSON.stringify(host.calls)).not.toContain(known);
   });
 
   it('open_pr caps the agent summary at 2000 characters', async () => {

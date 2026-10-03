@@ -6,7 +6,7 @@ import { LABEL_DEAD_LETTER } from '../../src/engines/software/index.js';
 import type { SoftwareWorkspace } from '../../src/engines/software/workspace.js';
 import { DuplicateChainError } from '../../src/kernel/queue.js';
 import type { RunInput } from '../../src/runner/types.js';
-import { LEASE_MS, makeHarness, ok, type Harness, type HarnessOptions } from '../support/harness.js';
+import { FAKE_API_KEY, LEASE_MS, makeHarness, ok, type Harness, type HarnessOptions } from '../support/harness.js';
 
 const N = 7;
 const BRANCH = `factory/issue-${N}`;
@@ -356,6 +356,44 @@ describe('software engine scenarios', () => {
     const kept = join(h.workspaceRoot, String(chain.id), `j${h.jobs(chain.id)[0]!.id}-d1`);
     expect(h.workspaceLog.at(-1)).toEqual({ op: 'teardown', jobId: job!.id, type: 'execute', delivery: 1, outcome: 'failed', path: kept });
     expect(existsSync(join(kept, 'README.md'))).toBe(true);
+  });
+
+  it('an agent that writes the worker API key into its worktree is dead-lettered and nothing is published', async () => {
+    const h = harness();
+    const { chain } = await h.submit(N);
+    h.scriptExecute((input) => {
+      h.write(input, 'secret.txt', `ANTHROPIC_API_KEY=${FAKE_API_KEY}\n`);
+      return ok('wrote the key as the issue asked');
+    });
+    h.scriptReview([{ verdict: 'approve', feedback: 'lgtm' }]);
+
+    const outcomes = await h.runUntilIdle();
+
+    expect(outcomes.map((o) => [o.type, o.delivery, o.outcome])).toEqual([['execute', 1, 'dead_lettered']]);
+    expect(h.chain(chain.id).status).toBe('dead_lettered');
+    const [job] = h.jobs(chain.id);
+    const dls = h.deadLetters();
+    expect(dls).toEqual([
+      expect.objectContaining({
+        jobId: job!.id,
+        reason: 'runner_error',
+        error: "effect 'commit_push' failed: refusing to push: the change contains a secret (anthropic-key, known-secret-value); the matched text is not shown",
+      }),
+    ]);
+    // Never pushed, no PR.
+    expect(h.remoteBranches()).toEqual(['main']);
+    expect(h.host.prs.size).toBe(0);
+    expect(h.host.calls.map((c) => c.method)).not.toContain('openPr');
+    // The worktree is kept for inspection, secret and all.
+    const kept = join(h.workspaceRoot, String(chain.id), `j${job!.id}-d1`);
+    expect(existsSync(join(kept, 'secret.txt'))).toBe(true);
+    // The key appears nowhere the factory wrote to.
+    const row = h.db.prepare('SELECT * FROM dead_letters').all();
+    expect(JSON.stringify(row)).not.toContain(FAKE_API_KEY);
+    expect(JSON.stringify(dls)).not.toContain(FAKE_API_KEY);
+    expect(h.comments(N).join('\n')).not.toContain(FAKE_API_KEY);
+    expect(h.comments(N).join('\n')).toContain('known-secret-value');
+    expect(JSON.stringify(h.host.calls)).not.toContain(FAKE_API_KEY);
   });
 
   it('dlq retry resumes and completes', async () => {

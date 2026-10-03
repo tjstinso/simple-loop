@@ -29,7 +29,9 @@ export const REPO = 'o/r';
 export const LEASE_MS = 300_000;
 export const KERNEL_CONFIG = { leaseMs: LEASE_MS, heartbeatMs: 30_000, maxDeliveries: 3 };
 export const START_TIME = 1_700_000_000_000;
-export const ISSUE_BODY = '## Goal\nMake the widget work.\n\n## Acceptance criteria\n- the widget works\n';
+/** The worker's (fake) model API key: the engine's secret guard is given it, as the runtime gives the real one. */
+export const FAKE_API_KEY = 'sk-ant-' + 'api03-' + 'harnessFakeWorkerKey_0123456789';
+export const ISSUE_BODY ='## Goal\nMake the widget work.\n\n## Acceptance criteria\n- the widget works\n';
 
 export interface HarnessOptions {
   defaultProfile?: 'supervised' | 'automatic';
@@ -188,6 +190,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
       },
       now: clock,
       sleep: async () => {},
+      secretValues: () => [FAKE_API_KEY],
     });
     const runEffect = engine.runEffect.bind(engine);
     const engines = new EngineRegistry();

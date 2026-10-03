@@ -5,6 +5,7 @@ import { EffectError, StaleDeliveryError, type ChainView, type Effect, type Effe
 import { GitHostError, type GitHost, type Issue } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import type { SoftwareEffect } from './schemas.js';
+import { findingsOf, redactSecrets, scanPaths, scanText, SCAN_TRUNCATED_KIND } from './secret-scan.js';
 import type { SoftwareState } from './state.js';
 import type { SoftwareWorkspace } from './workspace.js';
 
@@ -19,6 +20,11 @@ export interface EffectContext {
   sleep?: (ms: number) => Promise<void>;
   /** Required by the file_followups effect only. */
   followups?: { db: Database.Database; now: () => number };
+  /**
+   * Exact secret values the secret guard looks for in what `commit_push` would push, and redacts from
+   * the commit message and the PR title and body (default: none, so only the patterns apply).
+   */
+  secretValues?: () => readonly string[];
 }
 
 const MAX_ATTEMPTS = 3;
@@ -153,11 +159,37 @@ async function targetNumber(ctx: EffectContext, target: 'issue' | 'pr', missing:
   return target === 'issue' ? ctx.chain.state.issueNumber : prNumber(ctx, missing);
 }
 
+const secretValuesOf = (ctx: EffectContext): readonly string[] => ctx.secretValues?.() ?? [];
+
+/**
+ * The secret guard: refuses (runner_error, nothing pushed) when what a push of HEAD would publish
+ * beyond the seed has a secret-looking file name, a line matching a known token pattern or an exact
+ * secret value, or was too large to scan whole. The message names only the kinds, never the text.
+ */
+async function assertNoSecrets(ctx: EffectContext, ws: SoftwareWorkspace): Promise<void> {
+  const changes = await ctx.git.addedChanges(ws);
+  const values = secretValuesOf(ctx);
+  const kinds = [
+    ...scanPaths(changes.paths),
+    ...scanText(changes.paths.join('\n'), values),
+    ...scanText(changes.text, values),
+    ...(changes.truncated ? [{ kind: SCAN_TRUNCATED_KIND }] : []),
+  ].map((f) => f.kind);
+  if (kinds.length === 0) return;
+  const list = findingsOf(kinds).map((f) => f.kind).join(', ');
+  throw new EffectError(`refusing to push: the change contains a secret (${list}); the matched text is not shown`, 'runner_error');
+}
+
+/** An issue title for a commit message or PR title: one line, secrets redacted. */
+function titleOf(ctx: EffectContext, issue: Issue): string {
+  return oneLine(redactSecrets(issue.title, secretValuesOf(ctx))) || `#${ctx.chain.state.issueNumber}`;
+}
+
 async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
   const issue = await ctx.host.getIssue(repo, issueNumber);
-  const title = oneLine(issue.title) || `#${issueNumber}`;
+  const title = titleOf(ctx, issue);
   // The agent could have written the shared repository config: sanitize before any engine git command.
   await ctx.git.prepareForPush?.(ws);
   await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
@@ -167,6 +199,7 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
     if (ws.remoteHeadSha !== null) return;
     throw new EffectError('no changes produced', 'runner_error');
   }
+  await assertNoSecrets(ctx, ws);
   fence.assertCurrent();
   try {
     await ctx.git.push(ws, { remoteBranch: branch, expectSha: ws.remoteHeadSha });
@@ -189,9 +222,11 @@ async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   if (existing?.state === 'open') return;
   const summary = summaryOf(ctx.job);
   const marker = `<!-- factory:chain=${ctx.chain.id} job=${ctx.job.id} event=open-pr -->`;
-  const body = [`Closes #${issueNumber}`, ...(summary ? [neutralizeSummary(summary)] : []), marker].join('\n\n');
+  // Redacted before neutralizing and capping, so a secret is never cut in half and kept.
+  const safeSummary = summary ? neutralizeSummary(redactSecrets(summary, secretValuesOf(ctx))) : null;
+  const body = [`Closes #${issueNumber}`, ...(safeSummary ? [safeSummary] : []), marker].join('\n\n');
   fence.assertCurrent();
-  await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: oneLine(issue.title) || `#${issueNumber}`, body });
+  await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: titleOf(ctx, issue), body });
 }
 
 async function setLabels(ctx: EffectContext, fence: EffectFence, e: Extract<Supported, { kind: 'set_labels' }>): Promise<void> {

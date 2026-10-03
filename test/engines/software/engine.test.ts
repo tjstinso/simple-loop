@@ -5,7 +5,7 @@ import { migrate, openDb } from '../../../src/kernel/db.js';
 import { createSoftwareEngine } from '../../../src/engines/software/index.js';
 import { ExecutionResultSchema, ReviewVerdictSchema, LABEL_IN_PROGRESS } from '../../../src/engines/software/schemas.js';
 import { SoftwareStateSchema, type SoftwareState } from '../../../src/engines/software/state.js';
-import type { GitPorts } from '../../../src/engines/software/git-ports.js';
+import type { AddedChanges, GitPorts } from '../../../src/engines/software/git-ports.js';
 import type { GitWorkspaceProvider, SoftwareWorkspace } from '../../../src/engines/software/workspace.js';
 import { EffectError, type ChainView, type DeadLetter, type EffectFence, type Job } from '../../../src/kernel/types.js';
 import { PolicyStore } from '../../../src/policy/store.js';
@@ -45,6 +45,8 @@ class RecordingGit implements GitPorts {
   readonly calls: string[] = [];
   async commitAll(): Promise<boolean> { this.calls.push('commitAll'); return true; }
   async headSha(): Promise<string> { this.calls.push('headSha'); return 'x'; }
+  addedText = '';
+  async addedChanges(): Promise<AddedChanges> { this.calls.push('addedChanges'); return { paths: [], text: this.addedText, truncated: false }; }
   async push(): Promise<void> { this.calls.push('push'); }
 }
 
@@ -53,7 +55,7 @@ const ws: SoftwareWorkspace = {
   remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
 };
 
-function make(opts: { sleep?: (ms: number) => Promise<void> } = {}) {
+function make(opts: { sleep?: (ms: number) => Promise<void>; secretValues?: () => readonly string[] } = {}) {
   const host = new FakeGitHost();
   host.addIssue({ number: 7, title: 't', body: 'b', labels: [LABEL_IN_PROGRESS] });
   const git = new RecordingGit();
@@ -90,6 +92,7 @@ function make(opts: { sleep?: (ms: number) => Promise<void> } = {}) {
     policies: new PolicyStore([]),
     config: { defaultProfile: 'supervised', requiredSections: [], historyRetentionDays: 30, keptWorktreeMaxAgeMs: 7 * DAY },
     sleep: opts.sleep ?? (async () => {}),
+    ...(opts.secretValues ? { secretValues: opts.secretValues } : {}),
   });
   return {
     host, git, engine, prepared, db, teardowns, sweeps,
@@ -137,6 +140,18 @@ describe('software engine', () => {
 
   it('describe renders repo, phase, attempt and profile', () => {
     expect(make().engine.describe(chain())).toBe('acme/widgets#7 phase=reviewing attempt=2 profile=supervised');
+  });
+
+  it('runEffect passes the secretValues dependency to commit_push', async () => {
+    const value = 'engine-dependency-secret-value';
+    const { engine, git } = make({ secretValues: () => [value] });
+    await engine.workspace.prepare(chain(), job(1));
+    git.addedText = `x = ${value}`;
+    const err = await engine.runEffect({ kind: 'commit_push' }, { chain: chain(), job: job(1), fence: fence() }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as Error).message).toMatch(/known-secret-value/);
+    expect((err as Error).message).not.toContain(value);
+    expect(git.calls).not.toContain('push');
   });
 
   it('runEffect passes the cached workspace of this delivery to the effect', async () => {

@@ -37,6 +37,11 @@ export interface SoftwareEngineDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Clock for stored rows (epoch ms); injected by the composition root. */
   now: () => number;
+  /**
+   * Exact secret values (evaluated at each push) for `commit_push`'s secret guard and the redaction
+   * of the commit message and PR text; injected by the composition root (default: none).
+   */
+  secretValues?: () => readonly string[];
 }
 
 export { LABEL_DEAD_LETTER };
@@ -129,6 +134,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
           git: deps.git,
           sleep: deps.sleep,
           followups: { db: deps.db, now: deps.now },
+          secretValues: deps.secretValues,
         },
         ctx.fence,
       );
