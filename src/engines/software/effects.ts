@@ -101,7 +101,12 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
   const issue = await ctx.host.getIssue(repo, issueNumber);
   const title = oneLine(issue.title) || `#${issueNumber}`;
   await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
-  if ((await ctx.git.headSha(ws)) === ws.seedSha) throw new EffectError('no changes produced', 'runner_error');
+  if ((await ctx.git.headSha(ws)) === ws.seedSha) {
+    // Nothing new in this delivery. If the branch was already published (e.g. a rerun after a
+    // crash that followed the push), the work is on the remote: succeed so open_pr can proceed.
+    if (ws.remoteHeadSha !== null) return;
+    throw new EffectError('no changes produced', 'runner_error');
+  }
   fence.assertCurrent();
   await ctx.git.push(ws, { remoteBranch: branch, expectSha: ws.remoteHeadSha });
 }

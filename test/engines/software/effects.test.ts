@@ -131,6 +131,56 @@ describe('runSoftwareEffect', () => {
       expect(git(ws.path, ['rev-parse', 'HEAD'])).toBe(head);
     });
 
+    class SpyGit implements GitPorts {
+      pushes = 0;
+      commitAll(ws: SoftwareWorkspace, m: string) { return ports.commitAll(ws, m); }
+      headSha(ws: SoftwareWorkspace) { return ports.headSha(ws); }
+      push(ws: SoftwareWorkspace, a: { remoteBranch: string; expectSha: string | null }) { this.pushes++; return ports.push(ws, a); }
+    }
+
+    it('commit_push on an already-published branch with no new changes succeeds without pushing', async () => {
+      const published = remote.commit(BRANCH, 'done.txt', 'd\n');
+      const ws = await provider.prepare(chain(), job({ delivery: 2 }));
+      expect(ws.remoteHeadSha).toBe(published);
+      const spy = new SpyGit();
+      await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: spy }), fence());
+      expect(spy.pushes).toBe(0);
+      expect(remoteHead()).toBe(published);
+    });
+
+    it('commit_push with no changes and no published branch still throws no changes produced', async () => {
+      const ws = await provider.prepare(chain(), job());
+      const spy = new SpyGit();
+      const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: spy }), fence()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EffectError);
+      expect((err as EffectError).reason).toBe('runner_error');
+      expect((err as Error).message).toBe('no changes produced');
+      expect(spy.pushes).toBe(0);
+    });
+
+    it('after a post-push crash the rerun lets open_pr open the missing PR', async () => {
+      const published = remote.commit(BRANCH, 'done.txt', 'd\n');
+      const ws = await provider.prepare(chain(), job({ delivery: 3 }));
+      await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports }), fence());
+      await runSoftwareEffect({ kind: 'open_pr' }, ctx({ workspace: ws, git: ports }), fence());
+      expect(remoteHead()).toBe(published);
+      const open = [...host.prs.values()].filter((p) => p.head === BRANCH && p.state === 'open');
+      expect(open).toHaveLength(1);
+    });
+
+    it('commit_push replay with a non-null expected sha and the remote already at HEAD is a no-op', async () => {
+      const previous = remote.commit(BRANCH, 'first.txt', '1\n');
+      const ws = await provider.prepare(chain(), job({ delivery: 2 }));
+      expect(ws.remoteHeadSha).toBe(previous);
+      writeFileSync(join(ws.path, 'more.txt'), 'm\n');
+      await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports }), fence());
+      const head = remoteHead();
+      expect(head).not.toBe(previous);
+      await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports }), fence());
+      expect(remoteHead()).toBe(head);
+      expect(git(ws.path, ['rev-parse', 'HEAD'])).toBe(head);
+    });
+
     it('commit_push throws StaleDeliveryError when the remote branch moved', async () => {
       remote.commit(BRANCH, 'first.txt', '1\n');
       const ws = await provider.prepare(chain(), job({ delivery: 2 }));
