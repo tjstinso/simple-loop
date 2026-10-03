@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ChainView, Job, WorkspaceProvider } from '../../kernel/types.js';
 import type { Workspace } from '../../runner/types.js';
@@ -22,6 +22,12 @@ export interface GitWorkspaceOptions {
   cloneUrlFor(repo: string): string;
   root: string;
   keepOnFailure: boolean;
+  /** Give up acquiring a cache lock after this long (default 60s). */
+  lockWaitMs?: number;
+  /** Poll interval while waiting for a cache lock (default 50ms). */
+  lockPollMs?: number;
+  /** A lock directory older than this is stale (default 10 min). */
+  lockStaleMs?: number;
 }
 
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
@@ -81,8 +87,66 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     return join(this.opts.root, String(chainId), `d${delivery}`);
   }
 
-  /** Serialises git mutations on one cache within this process (git's own locks cover other processes). */
-  private serial<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  private async isStale(lock: string): Promise<boolean> {
+    try {
+      const st = await stat(lock);
+      if (Date.now() - st.mtimeMs > (this.opts.lockStaleMs ?? 10 * 60_000)) return true;
+    } catch {
+      return false; // vanished; the next mkdir attempt will sort it out
+    }
+    let pid: number;
+    try {
+      pid = Number((await readFile(join(lock, 'pid'), 'utf8')).trim());
+    } catch {
+      return false; // holder may be between mkdir and writing its pid; age decides
+    }
+    if (!Number.isInteger(pid) || pid <= 0) return true;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  }
+
+  private async acquireLock(lock: string): Promise<void> {
+    const deadline = Date.now() + (this.opts.lockWaitMs ?? 60_000);
+    const poll = this.opts.lockPollMs ?? 50;
+    for (;;) {
+      try {
+        await mkdir(lock);
+        await writeFile(join(lock, 'pid'), String(process.pid));
+        return;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      }
+      if (await this.isStale(lock)) {
+        const trash = `${lock}.stale-${process.pid}-${Date.now()}`;
+        try {
+          await rename(lock, trash);
+          await rm(trash, { recursive: true, force: true });
+        } catch {
+          /* someone else broke it first */
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for cache lock ${lock}`);
+      await new Promise((r) => setTimeout(r, poll));
+    }
+  }
+
+  /** In-process queue plus a cross-process mkdir lock around anything that mutates the shared bare repo. */
+  private withCache<T>(key: string, inner: () => Promise<T>): Promise<T> {
+    const fn = async (): Promise<T> => {
+      await mkdir(join(this.opts.root, '.cache'), { recursive: true });
+      const lock = `${key}.lock`;
+      await this.acquireLock(lock);
+      try {
+        return await inner();
+      } finally {
+        await rm(lock, { recursive: true, force: true });
+      }
+    };
     const prev = this.locks.get(key) ?? Promise.resolve();
     const run = prev.then(fn, fn);
     const tail = run.catch(() => undefined);
@@ -96,17 +160,30 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   private async ensureCache(repo: string): Promise<string> {
     const cache = this.cachePath(repo);
     const url = this.opts.cloneUrlFor(repo);
-    await mkdir(join(this.opts.root, '.cache'), { recursive: true });
-    if (!existsSync(join(cache, 'HEAD'))) {
-      await git(this.opts.root, ['init', '--bare', cache]);
-      await git(cache, ['remote', 'add', 'origin', url]);
-      await git(cache, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
-      await git(cache, ['config', 'user.name', 'factory']);
-      await git(cache, ['config', 'user.email', 'factory@localhost']);
+    if (!existsSync(join(cache, 'HEAD'))) await git(this.opts.root, ['init', '--bare', cache]);
+    let hasOrigin = true;
+    try {
+      await git(cache, ['remote', 'get-url', 'origin']);
+    } catch {
+      hasOrigin = false;
     }
-    await git(cache, ['remote', 'set-url', 'origin', url]);
-    await git(cache, ['config', 'remote.origin.pushurl', DISABLED_PUSH_URL]);
+    if (!hasOrigin) await git(cache, ['remote', 'add', 'origin', url]);
+    await this.setConfig(cache, 'remote.origin.url', url);
+    await this.setConfig(cache, 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*');
+    await this.setConfig(cache, 'remote.origin.pushurl', DISABLED_PUSH_URL);
+    await this.setConfig(cache, 'user.name', 'factory');
+    await this.setConfig(cache, 'user.email', 'factory@localhost');
     return cache;
+  }
+
+  private async setConfig(cache: string, key: string, value: string): Promise<void> {
+    let cur: string | null = null;
+    try {
+      cur = await git(cache, ['config', '--get', key]);
+    } catch {
+      cur = null;
+    }
+    if (cur !== value) await git(cache, ['config', key, value]);
   }
 
   private async detectBase(cache: string): Promise<string> {
@@ -134,12 +211,12 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   async prepare(chain: ChainView<SoftwareState>, job: Job): Promise<SoftwareWorkspace> {
     const { repo, chainId, delivery, issue } = ids(chain, job);
     const path = this.deliveryPath(chainId, delivery);
-    const localBranch = `factory/issue-${issue}-d${delivery}`;
+    const localBranch = `factory/issue-${issue}-c${chainId}-d${delivery}`;
     const remoteBranch = `factory/issue-${issue}`;
     const remoteUrl = this.opts.cloneUrlFor(repo);
     const cache = this.cachePath(repo);
 
-    return this.serial(cache, async () => {
+    return this.withCache(cache, async () => {
       await this.ensureCache(repo);
       await git(cache, ['fetch', 'origin', '--prune']);
       const baseBranch = await this.detectBase(cache);
@@ -166,8 +243,8 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     const { repo, chainId, delivery, issue } = ids(chain, job);
     if (outcome === 'failed' && this.opts.keepOnFailure) return;
     const cache = this.cachePath(repo);
-    await this.serial(cache, () =>
-      this.removeDelivery(cache, this.deliveryPath(chainId, delivery), `factory/issue-${issue}-d${delivery}`),
+    await this.withCache(cache, () =>
+      this.removeDelivery(cache, this.deliveryPath(chainId, delivery), `factory/issue-${issue}-c${chainId}-d${delivery}`),
     );
   }
 
@@ -186,7 +263,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
         if (liveDeliveries.has(`${chainDir.name}:${m[1]}`)) continue;
         const path = join(this.opts.root, chainDir.name, dDir.name);
         for (const cache of caches) {
-          await this.serial(cache, async () => {
+          await this.withCache(cache, async () => {
             // Find the branch this worktree holds so it can be deleted too.
             let branch: string | null = null;
             try {
@@ -206,7 +283,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
         removed.push(path);
       }
     }
-    for (const cache of caches) await this.serial(cache, () => attempt(git(cache, ['worktree', 'prune'])));
+    for (const cache of caches) await this.withCache(cache, () => attempt(git(cache, ['worktree', 'prune'])));
     return removed;
   }
 }

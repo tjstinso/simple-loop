@@ -71,9 +71,9 @@ describe('GitWorkspaceProvider', () => {
     const a = await provider.prepare(chain(1), job(1, 1));
     const b = await provider.prepare(chain(1), job(1, 2));
     expect(a.path).not.toBe(b.path);
-    expect(a.localBranch).toBe('factory/issue-7-d1');
-    expect(b.localBranch).toBe('factory/issue-7-d2');
-    expect(git(a.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('factory/issue-7-d1');
+    expect(a.localBranch).toBe('factory/issue-7-c1-d1');
+    expect(b.localBranch).toBe('factory/issue-7-c1-d2');
+    expect(git(a.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('factory/issue-7-c1-d1');
     writeFileSync(join(a.path, 'only-a.txt'), 'x');
     expect(existsSync(join(b.path, 'only-a.txt'))).toBe(false);
   });
@@ -126,7 +126,7 @@ describe('GitWorkspaceProvider', () => {
     expect(existsSync(join(root, '.cache'))).toBe(true);
     expect(existsSync(join(root, 'junk', 'notes'))).toBe(true);
     const cache = join(root, '.cache', 'acme__widgets.git');
-    expect(git(cache, ['branch', '--list', 'factory/issue-7-d1'])).toBe('');
+    expect(git(cache, ['branch', '--list', 'factory/issue-7-c1-d1'])).toBe('');
   });
 
   it('prepare is idempotent for the same delivery', async () => {
@@ -148,6 +148,59 @@ describe('GitWorkspaceProvider', () => {
     await expect(provider.prepare(chain(1), job(1, -2))).rejects.toThrow(/delivery/);
     await expect(provider.prepare(chain(1.5), job(1, 1))).rejects.toThrow(/chain/);
     await expect(provider.teardown(chain(1, { repo: '../x/y' }), job(1, 1), 'ok')).rejects.toThrow(/repo/);
+  });
+
+  it('prepares delivery 1 of a resubmitted issue while a failed delivery of an earlier chain is kept', async () => {
+    const a = await provider.prepare(chain(1), job(1, 1));
+    await provider.teardown(chain(1), job(1, 1), 'failed');
+    expect(existsSync(a.path)).toBe(true);
+    const b = await provider.prepare(chain(2), job(2, 1));
+    expect(b.path).not.toBe(a.path);
+    expect(b.localBranch).not.toBe(a.localBranch);
+    expect(b.localBranch).toBe('factory/issue-7-c2-d1');
+    expect(existsSync(a.path)).toBe(true);
+    expect(existsSync(b.path)).toBe(true);
+  });
+
+  it('serialises concurrent prepares of the same repo across providers', async () => {
+    const p2 = make();
+    const p3 = make();
+    const ps = [provider, p2, p3];
+    const results = await Promise.all(
+      [1, 2, 3, 4, 5, 6].map((d) => ps[d % 3]!.prepare(chain(1), job(1, d))),
+    );
+    expect(new Set(results.map((r) => r.path)).size).toBe(6);
+    for (const r of results) expect(existsSync(join(r.path, 'README.md'))).toBe(true);
+    expect(existsSync(join(root, '.cache', 'acme__widgets.git.lock'))).toBe(false);
+  });
+
+  it('repairs a half-initialised cache that has no origin remote', async () => {
+    const cache = join(root, '.cache', 'acme__widgets.git');
+    mkdirSync(join(root, '.cache'), { recursive: true });
+    git(root, ['init', '--bare', cache]);
+    const ws = await provider.prepare(chain(1), job(1, 1));
+    expect(existsSync(join(ws.path, 'README.md'))).toBe(true);
+    expect(git(cache, ['remote', 'get-url', 'origin'])).toBe(remote.url);
+  });
+
+  it('breaks a stale lock held by a dead pid', async () => {
+    const dead = execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+    const lock = join(root, '.cache', 'acme__widgets.git.lock');
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(join(lock, 'pid'), dead.trim());
+    const p = new GitWorkspaceProvider({ cloneUrlFor: () => remote.url, root, keepOnFailure: true, lockWaitMs: 2000, lockPollMs: 10 });
+    const ws = await p.prepare(chain(1), job(1, 1));
+    expect(existsSync(ws.path)).toBe(true);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('times out with a clear error when a live holder keeps the lock', async () => {
+    const lock = join(root, '.cache', 'acme__widgets.git.lock');
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(join(lock, 'pid'), String(process.pid));
+    const p = new GitWorkspaceProvider({ cloneUrlFor: () => remote.url, root, keepOnFailure: true, lockWaitMs: 200, lockPollMs: 10 });
+    await expect(p.prepare(chain(1), job(1, 1))).rejects.toThrow(/acme__widgets\.git\.lock/);
+    expect(existsSync(lock)).toBe(true);
   });
 
   it('picks up a commit pushed to the remote between two prepares', async () => {
