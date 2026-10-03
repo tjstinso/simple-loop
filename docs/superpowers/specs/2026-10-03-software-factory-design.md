@@ -213,7 +213,7 @@ Each worker repeats:
    3. Commit the new engine state, chain status, new jobs and the job's `succeeded` status in one transaction, fenced by `delivery`.
 6. Run the engine's `cleanup` for this delivery.
 
-Follow-on jobs are only created at step 5.3, after the effects they depend on (for example the PR a review job needs) have completed. A failed effect dead-letters the job with reason `effect_error` and creates no follow-on jobs.
+Follow-on jobs are only created at step 5.3, after the effects they depend on (for example the PR a review job needs) have completed. A failed effect dead-letters the job and creates no follow-on jobs. The reason is `effect_error` unless the engine's effect error names `runner_error`, which the software engine does when a retry must rerun the runner rather than resume post-processing (section 8: an execute job's `commit_push` and `open_pr`, R33; the review job's pinned merge, R46).
 
 ### Liveness and progress
 
@@ -411,7 +411,7 @@ GitHub is the source of truth, and the engine looks before acting. Before each e
 - **Labels:** set and remove specific labels, never toggle.
 - **Merge:** check the PR state first.
 - **Comments and followup issues:** carry a hidden marker such as `<!-- factory:chain=7 job=42 event=dead-letter -->`, searched before posting. The `followups` table records the filed issue number.
-- **External failures:** retried with backoff a few times, then the job is dead-lettered with reason `effect_error`.
+- **External failures:** retried with backoff a few times, then the job is dead-lettered. For an execute job the workspace-dependent effects (`commit_push`, `open_pr`) classify git and host failures as `runner_error`, so one `dlq retry` reruns the agent in a fresh workspace (R33; a closed issue stays `effect_error`). The review job's `automatic` merge is pinned with `--match-head-commit` to the head the review delivery was seeded from; when that head cannot be verified (the workspace is gone after a crash resume or an `effect_error` retry) the merge is not attempted, and when the host refuses the pinned merge (also after the transient retries, since `gh` may report the refusal without an HTTP status), the job is dead-lettered as `runner_error`, so a retry redoes the review against the current head; the factory never merges an unpinned head (R46). The review job's other effects, and its merge failures before the merge call (missing or closed PR, closed issue), keep `effect_error`.
 
 ### Workspace
 
@@ -436,7 +436,7 @@ Run after every job outcome, including failures and timeouts, in a `finally`-sty
 
 - **Fail fast at submit.** The router rejects ambiguous engine labels; the engine's `submit` rejects invalid input and duplicate open chains.
 - **Atomic transitions.** A job's status change and its follow-on jobs are written in one transaction.
-- **External failures.** Retried with backoff a few times, then the job is dead-lettered with reason `effect_error`.
+- **External failures.** Retried with backoff a few times, then the job is dead-lettered with reason `effect_error`, except an execute job's `commit_push`/`open_pr` failures (R33) and a review job's unverifiable or refused pinned merge (R46), which are `runner_error` so a retry reruns the runner (section 8).
 - **Timeouts.** `AbortSignal` ends the run; `claude-cli` kills the whole process group.
 - **Cost.** Each result records `costUsd`; the policy's budget cap is enforced by the runner.
 
