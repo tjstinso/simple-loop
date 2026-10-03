@@ -122,7 +122,7 @@ export function isProcessAlive(pid: number, startTime: number): boolean {
 }
 
 /** This process's own process group id (field 5 of /proc/self/stat), or null. */
-function ownPgid(): number | null {
+export function ownPgid(): number | null {
   try {
     const stat = readFileSync('/proc/self/stat', 'utf8');
     const n = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[2]);
