@@ -3,6 +3,9 @@ import { GitHostError, type GitHost } from './github.js';
 import type { Followup } from './schemas.js';
 
 type Db = Database.Database;
+/** Applied to agent-written text before it is published (the engine passes the secret redaction). */
+export type Redact = (text: string) => string;
+const asIs: Redact = (t) => t;
 
 export const FOLLOWUP_LABEL = 'factory:followup';
 /** How long a filer owns a row before another may take it over. */
@@ -80,7 +83,7 @@ const markerOf = (r: FollowupRow) => `<!-- factory:chain=${r.chain_id} job=${r.j
  * GitHostError is swallowed (row stays unfiled for the sweep), anything else propagates.
  * Returns true when this call filed the row.
  */
-async function fileRow(db: Db, host: GitHost, r: FollowupRow, now: number, beforeCreate?: () => void): Promise<boolean> {
+async function fileRow(db: Db, host: GitHost, r: FollowupRow, now: number, beforeCreate?: () => void, redact: Redact = asIs): Promise<boolean> {
   const claimed = db
     .prepare(
       `UPDATE followups SET claimed_until = ?
@@ -93,8 +96,8 @@ async function fileRow(db: Db, host: GitHost, r: FollowupRow, now: number, befor
     let n = await host.findIssueByMarker(r.repo, marker, FOLLOWUP_LABEL);
     if (n === null) {
       beforeCreate?.();
-      const body = [r.body, '', `Discovered while working on #${r.issue_number}.`, marker].join('\n');
-      n = await host.createIssue(r.repo, { title: r.title, body, labels: [FOLLOWUP_LABEL] });
+      const body = [redact(r.body), '', `Discovered while working on #${r.issue_number}.`, marker].join('\n');
+      n = await host.createIssue(r.repo, { title: redact(r.title), body, labels: [FOLLOWUP_LABEL] });
     }
     db.prepare('UPDATE followups SET filed_issue_number = ?, claimed_until = NULL WHERE id = ?').run(n, r.id);
     return true;
@@ -105,27 +108,31 @@ async function fileRow(db: Db, host: GitHost, r: FollowupRow, now: number, befor
   }
 }
 
-/** Files every unfiled row of one job. `beforeCreate` runs before each issue creation (fence check). */
+/**
+ * Files every unfiled row of one job. `beforeCreate` runs before each issue creation (fence check);
+ * `redact` is applied to each title and body before it is published.
+ */
 export async function fileFollowups(
   db: Db,
   host: GitHost,
   jobId: number,
   now: number,
   beforeCreate?: () => void,
+  redact: Redact = asIs,
 ): Promise<void> {
   const rows = db
     .prepare('SELECT * FROM followups WHERE job_id = ? AND filed_issue_number IS NULL ORDER BY position')
     .all(jobId) as FollowupRow[];
-  for (const r of rows) await fileRow(db, host, r, now, beforeCreate);
+  for (const r of rows) await fileRow(db, host, r, now, beforeCreate, redact);
 }
 
 /** Files every unfiled row of any job; returns how many this call filed. */
-export async function sweepUnfiledFollowups(db: Db, host: GitHost, now: number): Promise<number> {
+export async function sweepUnfiledFollowups(db: Db, host: GitHost, now: number, redact: Redact = asIs): Promise<number> {
   const rows = db
     .prepare('SELECT * FROM followups WHERE filed_issue_number IS NULL ORDER BY id')
     .all() as FollowupRow[];
   let filed = 0;
-  for (const r of rows) if (await fileRow(db, host, r, now)) filed++;
+  for (const r of rows) if (await fileRow(db, host, r, now, undefined, redact)) filed++;
   return filed;
 }
 

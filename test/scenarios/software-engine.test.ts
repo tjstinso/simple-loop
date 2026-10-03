@@ -396,6 +396,19 @@ describe('software engine scenarios', () => {
     expect(JSON.stringify(h.host.calls)).not.toContain(FAKE_API_KEY);
   });
 
+  it('an execute error summary holding the API key reaches the dead letter and the issue redacted', async () => {
+    const h = harness();
+    await h.submit(N);
+    h.scriptExecute(() => ({ status: 'error', summary: `could not authenticate with ${FAKE_API_KEY}` }));
+    await h.runUntilIdle();
+    expect(h.deadLetters()).toEqual([
+      expect.objectContaining({ reason: 'runner_error', error: 'transition failed: could not authenticate with [redacted]' }),
+    ]);
+    expect(h.comments(N).join('\n')).toContain('could not authenticate with [redacted]');
+    expect(JSON.stringify(h.db.prepare('SELECT * FROM dead_letters').all())).not.toContain(FAKE_API_KEY);
+    expect(JSON.stringify(h.host.calls)).not.toContain(FAKE_API_KEY);
+  });
+
   it('dlq retry resumes and completes', async () => {
     const h = harness();
     const { chain } = await driveToRunnerError(h);

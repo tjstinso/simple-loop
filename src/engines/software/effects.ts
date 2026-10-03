@@ -299,7 +299,8 @@ async function fileFollowupsEffect(effect: Effect, ctx: EffectContext, fence: Ef
   const { db, now } = ctx.followups;
   const { repo, issueNumber } = ctx.chain.state;
   storeFollowups(db, { jobId: ctx.job.id, chainId: ctx.chain.id, repo, issueNumber }, r.data.followups, now());
-  await fileFollowups(db, ctx.host, ctx.job.id, now(), () => fence.assertCurrent());
+  const values = secretValuesOf(ctx);
+  await fileFollowups(db, ctx.host, ctx.job.id, now(), () => fence.assertCurrent(), (t) => redactSecrets(t, values));
 }
 
 /**

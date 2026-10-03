@@ -305,6 +305,53 @@ describe('software engine', () => {
       expect(teardowns).toEqual([{ jobId: 42, delivery: 1, outcome: 'ok' }]);
     });
 
+    describe('redaction of agent text published to GitHub', () => {
+      const KEY = 'sk-ant-' + 'api03-' + 'redactionTestKey_0123456789';
+      const KNOWN = 'worker-password-value-123';
+      const secretValues = () => [KNOWN];
+      const noSecrets = (host: FakeGitHost) => {
+        const all = JSON.stringify(host.calls);
+        expect(all).not.toContain(KEY);
+        expect(all).not.toContain(KNOWN);
+      };
+
+      it('the dead-letter comment redacts the error text', async () => {
+        const { engine, host } = make({ secretValues });
+        await engine.surfaceDeadLetter(chain(), { ...dl(), error: `transition failed: leaked ${KEY} and ${KNOWN}` });
+        expect(host.getComments(7)[0]).toContain('transition failed: leaked [redacted] and [redacted]');
+        noSecrets(host);
+      });
+
+      it('an execute error summary is redacted in the transition error', () => {
+        const { engine } = make({ secretValues });
+        let err: unknown;
+        try {
+          engine.transition(chain(3, { phase: 'executing' }), job(1), { status: 'error', summary: `could not use ${KNOWN}`, steps: [] });
+        } catch (e) {
+          err = e;
+        }
+        expect(err).toBeInstanceOf(EffectError);
+        expect((err as EffectError).reason).toBe('runner_error');
+        expect((err as Error).message).toBe('could not use [redacted]');
+      });
+
+      it('followups filed by the effect and by the sweep are redacted', async () => {
+        const { engine, db, host } = make({ secretValues });
+        seedChain(db);
+        await engine.runEffect(
+          { kind: 'file_followups', followups: [{ title: `Rotate ${KNOWN}`, body: `found ${KEY} in logs` }] },
+          { chain: chain(), job: job(1), fence: fence() },
+        );
+        seedFollowup(db, 5, `sweep title ${KEY}`, null, 1);
+        db.prepare("UPDATE followups SET body = ? WHERE position = 5").run(`sweep body ${KNOWN}`);
+        await engine.sweep!(1_000);
+        const created = host.calls.filter((c) => c.method === 'createIssue').map((c) => c.args[1] as { title: string; body: string });
+        expect(created.map((c) => c.title).sort()).toEqual(['Rotate [redacted]', 'sweep title [redacted]']);
+        expect(created.map((c) => c.body.split('\n')[0]).sort()).toEqual(['found [redacted] in logs', 'sweep body [redacted]']);
+        noSecrets(host);
+      });
+    });
+
     it('sweep retries unfiled followups, prunes filed ones and sweeps workspaces with the live key set', async () => {
       const { engine, db, host, sweeps } = make();
       const NOW = 100 * DAY;

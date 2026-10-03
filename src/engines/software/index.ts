@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
-import type { ChainView, DeadLetter, Engine, Job, WorkspaceProvider } from '../../kernel/types.js';
+import { EffectError, type ChainView, type DeadLetter, type Engine, type Job, type WorkspaceProvider } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
 import { defaultSleep, runSoftwareEffect, withHostRetry } from './effects.js';
@@ -17,6 +17,7 @@ import {
 } from './schemas.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 import { softwareSubmit } from './submit.js';
+import { redactSecrets } from './secret-scan.js';
 import { softwareTransition } from './transition.js';
 import type { GitWorkspaceProvider, SoftwareWorkspace } from './workspace.js';
 
@@ -58,6 +59,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const forget = (chainId: number, jobId: number, delivery: number) => void cache.delete(key(chainId, jobId, delivery));
   const historyRetentionDays = deps.config.historyRetentionDays ?? 30;
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
+  /** Agent-written text on its way to GitHub (or a dead letter): named patterns and known values redacted. */
+  const redact = (text: string) => redactSecrets(text, deps.secretValues?.() ?? []);
 
   /**
    * Deliveries whose workspace must survive a sweep: running jobs and recently dead-lettered (kept)
@@ -121,7 +124,15 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       return buildSoftwareRunInput(chain, job, ws as SoftwareWorkspace, issue, pr);
     },
 
-    transition: softwareTransition,
+    transition(chain, job, result) {
+      try {
+        return softwareTransition(chain, job, result);
+      } catch (e) {
+        // An execute result with status `error` carries the agent's summary as the message.
+        if (e instanceof EffectError) throw new EffectError(redact(e.message), e.reason);
+        throw e;
+      }
+    },
 
     async runEffect(effect, ctx) {
       await runSoftwareEffect(
@@ -155,7 +166,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         '',
         'Error:',
         '```',
-        dl.error.replaceAll('```', "'''"),
+        redact(dl.error).replaceAll('```', "'''"),
         '```',
         '',
         marker,
@@ -198,7 +209,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
           errors.push(e);
         }
       };
-      await step(() => sweepUnfiledFollowups(deps.db, deps.host, now));
+      await step(() => sweepUnfiledFollowups(deps.db, deps.host, now, redact));
       await step(() => pruneFiledFollowups(deps.db, now, historyRetentionDays));
       await step(() => deps.workspaces.sweep(isLiveDelivery(now), now));
       if (errors.length > 0) throw errors[0];
