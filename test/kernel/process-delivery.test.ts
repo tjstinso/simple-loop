@@ -335,6 +335,102 @@ describe('processDelivery', () => {
     expect(s.engine.calls.cleanup).toHaveLength(1);
   });
 
+  function expectAbortedUntouched(s: ReturnType<typeof setup>, job: Job) {
+    expect(getJob(s.db, job.id)).toMatchObject({ status: 'running', delivery: job.delivery, result: null });
+    expect(listDeadLetters(s.db)).toHaveLength(0);
+    expect(s.engine.calls.surfaced).toHaveLength(0);
+    expect(s.engine.calls.cleanup).toHaveLength(1);
+  }
+
+  it('returns aborted and dead-letters nothing when the signal aborts during workspace.prepare', async () => {
+    const s = setup();
+    const ac = new AbortController();
+    s.engine.workspace.prepare = async () => {
+      ac.abort();
+      throw new Error('prepare interrupted');
+    };
+    s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', [{ value: 'x' }]);
+
+    expect(await processDelivery(s.deps, job, 'w1', ac.signal)).toBe('aborted');
+
+    expectAbortedUntouched(s, job);
+    expect(s.fake.calls).toHaveLength(0);
+  });
+
+  it('returns aborted and dead-letters nothing when buildRunInput throws after the signal aborted', async () => {
+    const s = setup();
+    const ac = new AbortController();
+    s.engine.buildRunInput = async () => {
+      ac.abort();
+      throw new Error('fetch cancelled');
+    };
+    s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', [{ value: 'x' }]);
+
+    expect(await processDelivery(s.deps, job, 'w1', ac.signal)).toBe('aborted');
+
+    expectAbortedUntouched(s, job);
+    expect(s.fake.calls).toHaveLength(0);
+  });
+
+  it('returns aborted when the runner rejects with a non-AbortError after the signal aborted', async () => {
+    const s = setup();
+    const ac = new AbortController();
+    s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', () => {
+      ac.abort();
+      return new Error('claude exited with code 143');
+    });
+
+    expect(await processDelivery(s.deps, job, 'w1', ac.signal)).toBe('aborted');
+
+    expectAbortedUntouched(s, job);
+  });
+
+  it('does not run the runner when the signal is already aborted before the run', async () => {
+    let ran = 0;
+    const s = setup({
+      runner: {
+        name: 'fake',
+        configSchema: z.unknown(),
+        async run() {
+          ran++;
+          return { value: 'should not run' };
+        },
+      },
+    });
+    const ac = new AbortController();
+    ac.abort();
+    s.addChain();
+    const job = s.claim();
+
+    expect(await processDelivery(s.deps, job, 'w1', ac.signal)).toBe('aborted');
+
+    expect(ran).toBe(0);
+    expectAbortedUntouched(s, job);
+  });
+
+  it('still processes a result the runner resolved even if the signal aborted meanwhile', async () => {
+    const s = setup();
+    const ac = new AbortController();
+    const chain = s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', () => {
+      ac.abort();
+      return { value: 'done anyway' };
+    });
+
+    expect(await processDelivery(s.deps, job, 'w1', ac.signal)).toBe('succeeded');
+
+    expect(s.engine.notes).toEqual(['done anyway']);
+    expect(getJob(s.db, job.id).status).toBe('succeeded');
+    expect(listJobsForChain(s.db, chain.id)).toHaveLength(2);
+  });
+
   it('records and exits child processes through the run hooks', async () => {
     let liveDuringRun: unknown[] = [];
     const s = setup({

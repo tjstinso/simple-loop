@@ -23,8 +23,10 @@ type Db = Database.Database;
  * - `succeeded`: the transition committed.
  * - `dead_lettered`: this delivery dead-lettered the job (and surfaced it).
  * - `stale`: this delivery no longer owns the job; nothing was written.
- * - `aborted`: the run was cancelled through the signal; nothing was written
- *   and the job is still `running` at this delivery (the caller decides).
+ * - `aborted`: the signal fired before the runner resolved (during workspace
+ *   prepare, input building, or the run itself); nothing was written and the
+ *   job is still `running` at this delivery (the caller decides). Once the
+ *   runner has resolved, an abort no longer stops post-processing.
  */
 export type DeliveryOutcome = 'succeeded' | 'dead_lettered' | 'stale' | 'aborted';
 
@@ -38,10 +40,6 @@ function isCurrent(db: Db, fence: Fence): boolean {
     | { status: string; delivery: number }
     | undefined;
   return r !== undefined && r.status === 'running' && r.delivery === fence.delivery;
-}
-
-function isAbortError(e: unknown): boolean {
-  return e instanceof Error && e.name === 'AbortError';
 }
 
 function isTimeout(e: unknown): boolean {
@@ -155,6 +153,8 @@ async function deliver(
     try {
       workspace = await engine.workspace.prepare(view, job);
     } catch (e) {
+      // An abort (worker stopping, lease lost) is not a failure of the job.
+      if (signal.aborted) return 'aborted';
       return fail('runner_error', `workspace prepare failed: ${message(e)}`);
     }
 
@@ -166,6 +166,7 @@ async function deliver(
       runner = deps.runners.get(policy.runner);
       input = { ...(await engine.buildRunInput(view, job, workspace)), config: policy.config };
     } catch (e) {
+      if (signal.aborted) return 'aborted';
       return fail('runner_error', message(e));
     }
 
@@ -187,11 +188,15 @@ async function deliver(
       },
     };
 
+    if (signal.aborted) return 'aborted';
     let output: unknown;
     try {
       output = await runner.run(input, signal, hooks);
     } catch (e) {
-      if (isAbortError(e) && signal.aborted) return 'aborted';
+      // Any rejection after the signal fired (AbortError, or e.g. an exit-code
+      // error from the killed child) is an abort, not a runner failure. A
+      // result the runner did resolve is still processed below.
+      if (signal.aborted) return 'aborted';
       if (isTimeout(e)) return fail('timeout', message(e));
       return fail('runner_error', message(e));
     }
