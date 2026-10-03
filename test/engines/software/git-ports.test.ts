@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { StaleDeliveryError, type ChainView, type Job } from '../../../src/kernel/types.js';
 import type { SoftwareState } from '../../../src/engines/software/state.js';
@@ -184,12 +184,23 @@ describe('ExecGitPorts', () => {
       expect(c.text.split('\n')).toContain('hidden content');
     });
 
-    it('scans a binary file by its path only', async () => {
+    it("scans a binary file's content as text", async () => {
       writeFileSync(join(ws.path, 'blob.bin'), Buffer.from([0, 1, 2, 0, 0x41, 0x42, 0x43, 0x0a]));
       await ports.commitAll(ws, 'bin');
       const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect(c.paths).toEqual(['blob.bin']);
-      expect(c.text).not.toContain('ABC');
+      expect(c.text).toContain('ABC');
+    });
+
+    it('a file marked binary in the shared info/attributes is still scanned', async () => {
+      const common = git(ws.path, ['rev-parse', '--git-common-dir']);
+      const infoDir = join(isAbsolute(common) ? common : join(ws.path, common), 'info');
+      mkdirSync(infoDir, { recursive: true });
+      writeFileSync(join(infoDir, 'attributes'), '* -diff binary\n');
+      writeFileSync(join(ws.path, 'plain.txt'), 'marked binary by info/attributes\n');
+      await ports.commitAll(ws, 'info');
+      const c = await ports.addedChanges(ws, await ports.headSha(ws));
+      expect(c.text.split('\n')).toContain('marked binary by info/attributes');
     });
 
     it('stops at the cap and reports the change as truncated', async () => {

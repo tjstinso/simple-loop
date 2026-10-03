@@ -173,6 +173,8 @@ async function assertNoSecrets(ctx: EffectContext, ws: SoftwareWorkspace, sha: s
     ...scanPaths(changes.paths),
     ...scanText(changes.paths.join('\n'), values),
     ...scanText(changes.text, values),
+    // UTF-16 text (and other NUL-padded encodings) only matches once the NUL bytes are gone.
+    ...(changes.text.includes('\0') ? scanText(changes.text.replaceAll('\0', ''), values) : []),
     ...(changes.truncated ? [{ kind: SCAN_TRUNCATED_KIND }] : []),
   ].map((f) => f.kind);
   if (kinds.length === 0) return;

@@ -17,7 +17,7 @@ export interface GitPorts {
    * What a push of `sha` would publish beyond `ws.seedSha` (the range `seedSha..sha`, every commit
    * of it, so commits the agent made itself and files added then deleted again are included): the
    * added or modified paths, and the added lines plus each commit's author, committer and message.
-   * Binary files contribute their paths only. `truncated` is true when the text hit the scan cap.
+   * Binary files are read as text too (`--text`). `truncated` is true when the text hit the scan cap.
    */
   addedChanges(ws: SoftwareWorkspace, sha: string): Promise<AddedChanges>;
   /**
@@ -36,11 +36,6 @@ export interface AddedChanges {
 
 /** Most text `addedChanges` captures (UTF-8 bytes); more is reported as `truncated`. */
 export const SECRET_SCAN_CAP_BYTES = 5 * 1024 * 1024;
-
-// The empty tree: as the attribute source it makes git ignore the change's own .gitattributes, so a
-// `-diff` or `binary` attribute cannot hide a text file's lines from the scan (git >= 2.42; older
-// versions ignore the variable).
-const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 /** Limits for one git command; a hung command is killed (SIGKILL). Network ones stay below the cache lock's stale age. */
 export const GIT_LOCAL_TIMEOUT_MS = 60_000;
@@ -296,14 +291,13 @@ export class ExecGitPorts implements GitPorts {
     await collect(['log', '--format=%an%n%ae%n%cn%n%ce%n%B', ...perCommit], {}, (line) => out.add(line));
 
     // Added lines only (`+` lines inside hunks; the `+++` file header is outside them, so an added
-    // line that itself starts with `++` is kept). No external diff, no textconv, and the attributes
-    // come from the empty tree, so the change cannot hide its lines; binary files show no lines.
-    const emptyTree = await must(ws.path, ['hash-object', '-t', 'tree', '--stdin'], this.local, '');
-    if (!SHA_RE.test(emptyTree)) throw new Error('git hash-object returned no tree id');
+    // line that itself starts with `++` is kept). `--text` diffs every file as text, so neither real
+    // binary content nor a `-diff`/`binary` attribute (in the change or in the shared repository's
+    // info/attributes) hides lines; no external diff and no textconv.
     let inHunk = false;
     await collect(
-      ['log', '--format=', '-p', '--unified=0', '--no-ext-diff', '--no-textconv', '-M', ...perCommit],
-      { GIT_ATTR_SOURCE: emptyTree },
+      ['log', '--format=', '-p', '--text', '--unified=0', '--no-ext-diff', '--no-textconv', '-M', ...perCommit],
+      {},
       (line) => {
         if (line.startsWith('diff --git ')) inHunk = false;
         else if (line.startsWith('@@')) inHunk = true;

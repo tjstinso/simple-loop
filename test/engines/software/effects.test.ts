@@ -267,6 +267,20 @@ describe('runSoftwareEffect', () => {
         expect(JSON.stringify(host.calls)).not.toContain(API_KEY);
       });
 
+      it('commit_push refuses a binary file holding the key after a NUL byte', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'data.bin'), Buffer.concat([Buffer.from([0, 0xff, 0]), Buffer.from(API_KEY), Buffer.from([0])]));
+        expect((await refuse(ws)).message).toMatch(/known-secret-value/);
+      });
+
+      it('commit_push refuses a UTF-16LE file holding the key', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'notes.txt'), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(`key=${API_KEY}\n`, 'utf16le')]));
+        const err = await refuse(ws);
+        expect(err.message).toMatch(/anthropic-key/);
+        expect(err.message).toMatch(/known-secret-value/);
+      });
+
       it('a clean change still pushes', async () => {
         const ws = await provider.prepare(chain(), job());
         writeFileSync(join(ws.path, 'clean.ts'), 'export const answer = 42;\n');
