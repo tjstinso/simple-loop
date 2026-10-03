@@ -30,7 +30,10 @@ export interface WorkerOptions {
   pollMs?: number;
   /** Interval of `runMaintenance` (default 60 s). */
   maintenanceMs?: number;
-  /** How long `stop()` waits for the current delivery to settle (default 10 s). */
+  /**
+   * How long `stop()`, and the worker after losing a lease, wait for the current delivery to settle
+   * before moving on (default 10 s).
+   */
   stopTimeoutMs?: number;
   /** Receives delivery errors (with the job) and maintenance errors (without). Default: console.error. */
   onError?: ErrorHandler;
@@ -143,6 +146,9 @@ interface Delivery {
   stopRequested: boolean;
   finalized: boolean;
   settled: Promise<Settled>;
+  /** Resolves 'timeout' stopTimeoutMs after the lease was lost (bounds the wait for a runner ignoring the abort). */
+  abandoned: Promise<'timeout'>;
+  abandonTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 /** Resolves with `p`'s value, or 'timeout' after `ms`. The timer is always cleared. */
@@ -259,6 +265,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
     if (d.finalized) return;
     d.finalized = true;
     stopHeartbeat(d);
+    clearTimeout(d.abandonTimer);
     // Finished or abandoned: the reaper must no longer treat this worker as the delivery's owner.
     clearCurrent();
     if (d.leaseLost || d.stopRequested) killChildren(d);
@@ -277,6 +284,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
   const runJob = async (job: Job): Promise<void> => {
     const fence: Fence = { jobId: job.id, delivery: job.delivery };
     let leaseExpiresAt = job.leaseExpiresAt ?? clock() + config.leaseMs;
+    let abandon!: () => void;
     const d: Delivery = {
       job,
       ac: new AbortController(),
@@ -285,6 +293,8 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       stopRequested: false,
       finalized: false,
       settled: undefined as unknown as Promise<Settled>,
+      abandoned: new Promise<'timeout'>((r) => (abandon = () => r('timeout'))),
+      abandonTimer: undefined,
     };
 
     const loseLease = (): void => {
@@ -292,6 +302,8 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       stopHeartbeat(d);
       clearCurrent();
       d.ac.abort(new Error(`lease lost for job ${job.id} delivery ${job.delivery}`));
+      // Like stop(): do not wait forever for a runner that ignores the abort.
+      d.abandonTimer = setTimeout(abandon, stopTimeoutMs);
     };
 
     d.heartbeat = setInterval(() => {
@@ -330,7 +342,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       }
     })();
     try {
-      finalize(d, await d.settled);
+      finalize(d, await Promise.race([d.settled, d.abandoned]));
     } finally {
       if (current === d) current = undefined;
     }

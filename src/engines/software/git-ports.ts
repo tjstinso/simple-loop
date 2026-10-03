@@ -20,6 +20,12 @@ export interface GitPorts {
   prepareForPush?(ws: SoftwareWorkspace): Promise<void>;
 }
 
+/** Limits for one git command; a hung command is killed (SIGKILL). Network ones stay below the cache lock's stale age. */
+export const GIT_LOCAL_TIMEOUT_MS = 60_000;
+export const GIT_NETWORK_TIMEOUT_MS = 300_000;
+/** ssh must fail instead of prompting (host key, passphrase) when the worker has no terminal. */
+export const GIT_SSH_BATCH = 'ssh -o BatchMode=yes';
+
 export const FACTORY_GIT_NAME = 'factory';
 export const FACTORY_GIT_EMAIL = 'factory@localhost';
 
@@ -40,6 +46,7 @@ function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
+    GIT_SSH_COMMAND: GIT_SSH_BATCH,
     GIT_AUTHOR_NAME: FACTORY_GIT_NAME,
     GIT_AUTHOR_EMAIL: FACTORY_GIT_EMAIL,
     GIT_COMMITTER_NAME: FACTORY_GIT_NAME,
@@ -49,15 +56,19 @@ function gitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function run(cwd: string, args: string[], input?: string): Promise<GitResult> {
+function run(cwd: string, args: string[], timeoutMs: number, input?: string): Promise<GitResult> {
   return new Promise((resolve) => {
     const child = execFile(
       'git',
       [...SAFE_CONFIG, ...args],
-      { cwd, env: gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+      { cwd, env: gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
         if (!err) return resolve({ stdout, stderr, code: 0 });
-        const code = (err as NodeJS.ErrnoException & { code?: unknown }).code;
+        const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string | null };
+        if (e.killed === true && e.signal === 'SIGKILL') {
+          return resolve({ stdout: stdout ?? '', stderr: `git ${args[0]} timed out after ${timeoutMs} ms`, code: -1 });
+        }
+        const code = e.code;
         resolve({ stdout: stdout ?? '', stderr: String(stderr || err.message), code: typeof code === 'number' ? code : 1 });
       },
     );
@@ -68,8 +79,8 @@ function run(cwd: string, args: string[], input?: string): Promise<GitResult> {
   });
 }
 
-async function must(cwd: string, args: string[], input?: string): Promise<string> {
-  const r = await run(cwd, args, input);
+async function must(cwd: string, args: string[], timeoutMs: number, input?: string): Promise<string> {
+  const r = await run(cwd, args, timeoutMs, input);
   if (r.code !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
   return r.stdout.trim();
 }
@@ -77,27 +88,37 @@ async function must(cwd: string, args: string[], input?: string): Promise<string
 export interface ExecGitPortsOptions {
   /** Run by `prepareForPush`; the composition root passes `GitWorkspaceProvider.sanitizeForPush`. */
   prepareForPush?: (ws: SoftwareWorkspace) => Promise<void>;
+  /** Limit for local git commands (default GIT_LOCAL_TIMEOUT_MS). */
+  localTimeoutMs?: number;
+  /** Limit for `git push` (default GIT_NETWORK_TIMEOUT_MS). */
+  networkTimeoutMs?: number;
 }
 
 export class ExecGitPorts implements GitPorts {
-  constructor(private readonly opts: ExecGitPortsOptions = {}) {}
+  private readonly local: number;
+  private readonly network: number;
+
+  constructor(private readonly opts: ExecGitPortsOptions = {}) {
+    this.local = opts.localTimeoutMs ?? GIT_LOCAL_TIMEOUT_MS;
+    this.network = opts.networkTimeoutMs ?? GIT_NETWORK_TIMEOUT_MS;
+  }
 
   async prepareForPush(ws: SoftwareWorkspace): Promise<void> {
     await this.opts.prepareForPush?.(ws);
   }
 
   async commitAll(ws: SoftwareWorkspace, message: string): Promise<boolean> {
-    await must(ws.path, ['add', '-A']);
-    const diff = await run(ws.path, ['diff', '--cached', '--quiet']);
+    await must(ws.path, ['add', '-A'], this.local);
+    const diff = await run(ws.path, ['diff', '--cached', '--quiet'], this.local);
     if (diff.code === 0) return false;
     if (diff.code !== 1) throw new Error(`git diff failed: ${diff.stderr.trim()}`);
     // Message on stdin: untrusted text never sits in argv.
-    await must(ws.path, ['commit', '--quiet', '--no-verify', '--cleanup=whitespace', '-F', '-'], message);
+    await must(ws.path, ['commit', '--quiet', '--no-verify', '--cleanup=whitespace', '-F', '-'], this.local, message);
     return true;
   }
 
   async headSha(ws: SoftwareWorkspace): Promise<string> {
-    return must(ws.path, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    return must(ws.path, ['rev-parse', '--verify', 'HEAD^{commit}'], this.local);
   }
 
   async push(ws: SoftwareWorkspace, a: { remoteBranch: string; expectSha: string | null }): Promise<void> {
@@ -116,8 +137,9 @@ export class ExecGitPorts implements GitPorts {
       '--',
       ws.remoteUrl,
       `HEAD:${ref}`,
-    ]);
+    ], this.network);
     if (r.code === 0) return;
+    if (r.code === -1) throw new Error(`git push failed: ${r.stderr}`);
     const out = `${r.stdout}\n${r.stderr}`;
     if (/\(stale info\)/.test(out)) {
       throw new StaleDeliveryError(`remote branch ${a.remoteBranch} moved under this delivery`);

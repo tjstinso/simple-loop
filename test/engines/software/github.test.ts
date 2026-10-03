@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GhCliHost, GitHostError, type ExecFn } from '../../../src/engines/software/github.js';
+import { GH_TIMEOUT_MS, GhCliHost, GitHostError, defaultExec, type ExecFn } from '../../../src/engines/software/github.js';
 import { FakeGitHost } from '../../support/fake-github.js';
 
 const R = 'o/r';
@@ -228,5 +228,38 @@ describe('GhCliHost', () => {
     const { exec, inputs } = stub([{ stdout: '[]' }]);
     await new GhCliHost({ exec }).setLabels(R, 5, ['a', 'b', 'a'], []);
     expect(JSON.parse(inputs[0]!)).toEqual({ labels: ['a', 'b'] });
+  });
+});
+
+describe('gh subprocess timeouts', () => {
+  it('GhCliHost passes ghTimeoutMs (default 60 s) to every gh call', async () => {
+    expect(GH_TIMEOUT_MS).toBe(60_000);
+    const seen: Array<number | undefined> = [];
+    const exec: ExecFn = async (_f, _a, opts) => {
+      seen.push(opts?.timeoutMs);
+      return { stdout: JSON.stringify({ number: 1, title: 't', body: '', state: 'open', labels: [] }), stderr: '', exitCode: 0 };
+    };
+    await new GhCliHost({ exec }).getIssue(R, 1);
+    await new GhCliHost({ exec, ghTimeoutMs: 1234 }).getIssue(R, 1);
+    expect(seen).toEqual([60_000, 1234]);
+  });
+
+  it('a timed-out gh call is a GitHostError without status (transient)', async () => {
+    const exec: ExecFn = async () => ({ stdout: '', stderr: '', exitCode: 1, timedOut: true });
+    const err = await new GhCliHost({ exec, ghTimeoutMs: 5 }).getIssue(R, 1).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitHostError);
+    expect((err as GitHostError).status).toBeUndefined();
+    expect((err as Error).message).toMatch(/gh api timed out after 5 ms/);
+  });
+
+  it('defaultExec kills a hung child at its timeout and reports timedOut', async () => {
+    const started = process.hrtime.bigint();
+    const r = await defaultExec(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { timeoutMs: 50 });
+    expect(r.timedOut).toBe(true);
+    expect(r.exitCode).not.toBe(0);
+    expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(5_000);
+    const ok = await defaultExec(process.execPath, ['-e', 'process.stdout.write("hi")'], { timeoutMs: 5_000 });
+    expect(ok).toMatchObject({ stdout: 'hi', exitCode: 0 });
+    expect(ok.timedOut).toBeFalsy();
   });
 });

@@ -262,6 +262,38 @@ describe('worker loop', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('after a lease loss, waits at most stopTimeoutMs for a runner that ignores the abort, then moves on', async () => {
+    let first: number | undefined;
+    const s = track(
+      setup({
+        runner: customRunner(async (input, _signal, hooks) => {
+          if (first === undefined || input.job.id === first) {
+            first = input.job.id;
+            hooks?.onSpawn?.({ pid: 999, pgid: 999, startTime: 0 });
+            return new Promise(() => {}); // ignores the abort entirely
+          }
+          return { value: 'second' };
+        }),
+      }),
+    );
+    const a = await s.kernel.enqueue('echo', { key: 'a' });
+    const b = await s.kernel.enqueue('echo', { key: 'b' });
+    const w = s.start({ stopTimeoutMs: 2_000 });
+    await tick();
+    expect(first).toBe(a.job.id);
+    s.db.prepare("UPDATE jobs SET delivery = delivery + 1, claimed_by = 'other' WHERE id = ?").run(a.job.id);
+    await tick(HEARTBEAT); // lease lost
+    await tick(1_000);
+    expect(getJob(s.db, b.job.id).status).toBe('queued'); // still waiting for the hung delivery
+    expect(s.killGroup).not.toHaveBeenCalled();
+    await tick(1_000);
+    await tick();
+    // Gave up on the hung delivery: its recorded children were killed and the worker moved on.
+    expect(s.killGroup).toHaveBeenCalledWith(999);
+    expect(getJob(s.db, b.job.id).status).toBe('succeeded');
+    await w.stop();
+  });
+
   it('runs the reaper on an interval', async () => {
     const s = track(setup());
     s.fake.script('echo', [{ value: 'one' }, { value: 'two' }]);

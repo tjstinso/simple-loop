@@ -329,4 +329,22 @@ describe('GitWorkspaceProvider', () => {
       expect(existsSync(marker)).toBe(false);
     });
   });
+
+  it('a hung fetch is killed at networkTimeoutMs and prepare fails with a clear error', async () => {
+    const proxy = join(root, 'proxy.sh');
+    writeFileSync(proxy, '#!/bin/sh\nexec cat 3>&1 > /dev/null\n', { mode: 0o755 });
+    const saved = process.env.GIT_PROXY_COMMAND;
+    process.env.GIT_PROXY_COMMAND = proxy;
+    try {
+      const p = new GitWorkspaceProvider({
+        cloneUrlFor: () => 'git://factory-test.invalid/r.git', root, keepOnFailure: false, networkTimeoutMs: 100,
+      });
+      const started = process.hrtime.bigint();
+      await expect(p.prepare(chain(1), job(1, 1))).rejects.toThrow(/git fetch origin --prune timed out after 100 ms/);
+      expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(5_000);
+    } finally {
+      if (saved === undefined) delete process.env.GIT_PROXY_COMMAND;
+      else process.env.GIT_PROXY_COMMAND = saved;
+    }
+  });
 });

@@ -37,24 +37,37 @@ export class GitHostError extends Error {
   }
 }
 
+/** Default limit for one `gh` call; a hung call is killed (SIGKILL) and fails as a transient error. */
+export const GH_TIMEOUT_MS = 60_000;
+
 export type ExecFn = (
   file: string,
   args: string[],
-  opts?: { input?: string },
-) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  opts?: { input?: string; timeoutMs?: number },
+) => Promise<{ stdout: string; stderr: string; exitCode: number; timedOut?: boolean }>;
 
 export const defaultExec: ExecFn = (file, args, opts) =>
   new Promise((resolve) => {
-    const child = execFile(file, args, { maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (!err) return resolve({ stdout, stderr, exitCode: 0 });
-      const code = (err as NodeJS.ErrnoException & { code?: unknown }).code;
-      resolve({
-        stdout: stdout ?? '',
-        stderr: stderr || err.message,
-        exitCode: typeof code === 'number' ? code : 1,
-      });
-    });
+    const child = execFile(
+      file,
+      args,
+      { maxBuffer: 64 * 1024 * 1024, timeout: opts?.timeoutMs ?? 0, killSignal: 'SIGKILL' },
+      (err, stdout, stderr) => {
+        if (!err) return resolve({ stdout, stderr, exitCode: 0 });
+        const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string | null };
+        const code = e.code;
+        resolve({
+          stdout: stdout ?? '',
+          stderr: stderr || err.message,
+          exitCode: typeof code === 'number' ? code : 1,
+          timedOut: opts?.timeoutMs !== undefined && opts.timeoutMs > 0 && e.killed === true && e.signal === 'SIGKILL',
+        });
+      },
+    );
+    // gh may exit without reading stdin (EPIPE); its exit code decides the outcome.
+    child.stdin?.on('error', () => undefined);
     if (opts?.input !== undefined) child.stdin?.end(opts.input);
+    else child.stdin?.end();
   });
 
 export type MergeMethod = 'squash' | 'merge' | 'rebase';
@@ -144,14 +157,21 @@ interface RestPr {
 export class GhCliHost implements GitHost {
   private readonly exec: ExecFn;
   private readonly mergeMethod: MergeMethod;
+  private readonly ghTimeoutMs: number;
 
-  constructor(opts: { exec?: ExecFn; mergeMethod?: MergeMethod } = {}) {
+  constructor(opts: { exec?: ExecFn; mergeMethod?: MergeMethod; ghTimeoutMs?: number } = {}) {
     this.exec = opts.exec ?? defaultExec;
     this.mergeMethod = opts.mergeMethod ?? 'squash';
+    this.ghTimeoutMs = opts.ghTimeoutMs ?? GH_TIMEOUT_MS;
   }
 
   private async run(args: string[], input?: unknown): Promise<string> {
-    const r = await this.exec('gh', args, input === undefined ? undefined : { input: JSON.stringify(input) });
+    const r = await this.exec('gh', args, {
+      ...(input === undefined ? {} : { input: JSON.stringify(input) }),
+      timeoutMs: this.ghTimeoutMs,
+    });
+    // No status: the effects' classification treats it as transient and retries.
+    if (r.timedOut) throw new GitHostError(`gh ${args[0]} timed out after ${this.ghTimeoutMs} ms`);
     if (r.exitCode !== 0) {
       const m = /HTTP (\d{3})/.exec(r.stderr);
       throw new GitHostError(r.stderr.trim() || `gh exited with ${r.exitCode}`, m ? Number(m[1]) : undefined);

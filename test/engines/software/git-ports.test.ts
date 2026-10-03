@@ -1,12 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { StaleDeliveryError, type ChainView, type Job } from '../../../src/kernel/types.js';
 import type { SoftwareState } from '../../../src/engines/software/state.js';
 import { GitWorkspaceProvider, type SoftwareWorkspace } from '../../../src/engines/software/workspace.js';
-import { ExecGitPorts } from '../../../src/engines/software/git-ports.js';
+import { ExecGitPorts, GIT_LOCAL_TIMEOUT_MS, GIT_NETWORK_TIMEOUT_MS } from '../../../src/engines/software/git-ports.js';
+import { DEFAULT_LOCK_STALE_MS, DEFAULT_LOCK_WAIT_MS } from '../../../src/engines/software/workspace.js';
 import { GIT_TEST_ENV, makeRemote, type TempRemote } from '../../support/temp-repo.js';
 
 const git = (cwd: string, args: string[]) =>
@@ -106,5 +107,38 @@ describe('ExecGitPorts', () => {
   it('rejects a remote branch name that could be read as an option or a bad ref', async () => {
     await expect(ports.push(ws, { remoteBranch: '--delete', expectSha: null })).rejects.toThrow(/invalid remote branch/);
     await expect(ports.push(ws, { remoteBranch: 'a b', expectSha: null })).rejects.toThrow(/invalid remote branch/);
+  });
+
+  it('a git network command that hangs is killed at networkTimeoutMs, with ssh in batch mode', async () => {
+    // GIT_PROXY_COMMAND makes git:// go through this script, which records the environment and then
+    // never answers (fd 3 keeps its stdout pipe to git open; it exits when git dies and closes its stdin).
+    const envFile = join(root, 'proxy-env');
+    const proxy = join(root, 'proxy.sh');
+    writeFileSync(proxy, `#!/bin/sh\necho "$GIT_SSH_COMMAND" > ${envFile}\nexec cat 3>&1 > /dev/null\n`, { mode: 0o755 });
+    const saved = process.env.GIT_PROXY_COMMAND;
+    process.env.GIT_PROXY_COMMAND = proxy;
+    try {
+      writeFileSync(join(ws.path, 'n.txt'), 'n\n');
+      const p = new ExecGitPorts({ networkTimeoutMs: 100 });
+      await p.commitAll(ws, 'n');
+      const started = process.hrtime.bigint();
+      await expect(p.push({ ...ws, remoteUrl: 'git://factory-test.invalid/r.git' }, { remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toThrow(
+        /git push timed out after 100 ms/,
+      );
+      expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(5_000);
+      expect(readFileSync(envFile, 'utf8').trim()).toBe('ssh -o BatchMode=yes');
+    } finally {
+      if (saved === undefined) delete process.env.GIT_PROXY_COMMAND;
+      else process.env.GIT_PROXY_COMMAND = saved;
+    }
+  });
+
+  it('timeout defaults stay below the documented limits', () => {
+    expect(GIT_LOCAL_TIMEOUT_MS).toBe(60_000);
+    expect(GIT_NETWORK_TIMEOUT_MS).toBe(300_000);
+    expect(DEFAULT_LOCK_STALE_MS).toBe(600_000);
+    expect(DEFAULT_LOCK_WAIT_MS).toBe(600_000);
+    // A fetch under the cache lock ends (or is killed) before the lock could be judged stale.
+    expect(GIT_NETWORK_TIMEOUT_MS).toBeLessThan(DEFAULT_LOCK_STALE_MS);
   });
 });
