@@ -108,6 +108,21 @@ function oneLine(s: string, max = 200): string {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
+const SUMMARY_MAX = 2000;
+const ZERO_WIDTH_SPACE = '\u200b';
+// GitHub closing keywords followed by an issue reference; the agent must not close other issues.
+const CLOSING_REF = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s+)#(?=\d)/gi;
+
+/**
+ * The agent's summary is untrusted text that goes into the PR body: cap it at 2000 characters, turn
+ * every `@` into `@` + zero-width space (no mentions or team pings) and put a zero-width space after
+ * the `#` of every closing-keyword reference (`Fixes #12` would close issue 12 on merge).
+ */
+export function neutralizeSummary(s: string): string {
+  const capped = s.length > SUMMARY_MAX ? `${s.slice(0, SUMMARY_MAX - 1)}…` : s;
+  return capped.replaceAll('@', `@${ZERO_WIDTH_SPACE}`).replace(CLOSING_REF, `$1$2#${ZERO_WIDTH_SPACE}`);
+}
+
 function summaryOf(job: Job): string | null {
   const r = job.result;
   if (r && typeof r === 'object' && typeof (r as { summary?: unknown }).summary === 'string') {
@@ -164,7 +179,7 @@ async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   if (existing?.state === 'open') return;
   const summary = summaryOf(ctx.job);
   const marker = `<!-- factory:chain=${ctx.chain.id} job=${ctx.job.id} event=open-pr -->`;
-  const body = [`Closes #${issueNumber}`, ...(summary ? [summary] : []), marker].join('\n\n');
+  const body = [`Closes #${issueNumber}`, ...(summary ? [neutralizeSummary(summary)] : []), marker].join('\n\n');
   fence.assertCurrent();
   await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: oneLine(issue.title) || `#${issueNumber}`, body });
 }

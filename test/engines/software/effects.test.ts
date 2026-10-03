@@ -356,6 +356,28 @@ describe('runSoftwareEffect', () => {
     expect(f.checks).toBeGreaterThanOrEqual(2);
   });
 
+  it('open_pr neutralizes a hostile agent summary: no mentions, no closing keywords, capped at 2000 characters', async () => {
+    const ZW = '\u200b';
+    const hostile = 'Done. cc @octocat and @org/team. Fixes #12, closes #3, Resolved  #44, fix #5 and FIXES #6.';
+    await runSoftwareEffect({ kind: 'open_pr' }, ctx({ job: job({ result: { status: 'ok', summary: hostile } }) }), fence());
+    const body = [...host.prs.values()][0]!.body;
+    const summary = body.split('\n\n')[1]!;
+    expect(summary).toBe(
+      `Done. cc @${ZW}octocat and @${ZW}org/team. Fixes #${ZW}12, closes #${ZW}3, Resolved  #${ZW}44, fix #${ZW}5 and FIXES #${ZW}6.`,
+    );
+    expect(body.startsWith('Closes #7\n\n')).toBe(true); // the factory's own closing reference is intact
+    expect(summary).not.toMatch(/@\w/);
+    expect(summary).not.toMatch(/\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\d/i);
+  });
+
+  it('open_pr caps the agent summary at 2000 characters', async () => {
+    const long = 'x'.repeat(5000);
+    await runSoftwareEffect({ kind: 'open_pr' }, ctx({ job: job({ result: { status: 'ok', summary: long } }) }), fence());
+    const summary = [...host.prs.values()][0]!.body.split('\n\n')[1]!;
+    expect(summary.length).toBe(2000);
+    expect(summary.endsWith('…')).toBe(true);
+  });
+
   it('open_pr body omits the summary when the job has no result', async () => {
     await runSoftwareEffect({ kind: 'open_pr' }, ctx(), fence());
     const pr = [...host.prs.values()][0]!;
