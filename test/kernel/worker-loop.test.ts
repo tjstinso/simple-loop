@@ -35,7 +35,7 @@ function untilAborted(signal: AbortSignal): Promise<never> {
   });
 }
 
-function setup(o: { runner?: Runner; engines?: Engine<any>[] } = {}) {
+function setup(o: { runner?: Runner; engines?: Engine<any>[]; historyRetentionDays?: number } = {}) {
   const echo = makeEchoEngine('echo');
   const engines = new EngineRegistry();
   engines.register(echo);
@@ -52,7 +52,12 @@ function setup(o: { runner?: Runner; engines?: Engine<any>[] } = {}) {
     runners,
     policies,
     clock: () => Date.now(),
-    config: { leaseMs: LEASE, heartbeatMs: HEARTBEAT, maxDeliveries: 3 },
+    config: {
+      leaseMs: LEASE,
+      heartbeatMs: HEARTBEAT,
+      maxDeliveries: 3,
+      ...(o.historyRetentionDays !== undefined ? { historyRetentionDays: o.historyRetentionDays } : {}),
+    },
   });
   const db = kernel.deps.db;
   const killGroup = vi.fn<(pgid: number) => void>();
@@ -317,6 +322,56 @@ describe('worker loop', () => {
 
     expect(getJob(s.db, job.id)).toMatchObject({ status: 'queued', delivery: 1 });
     expect(swept).toEqual([NOW + 2_000]);
+  });
+
+  it('maintenance prunes history after reaping and before engine sweeps', async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    let s!: ReturnType<typeof setup>;
+    const seen: Array<{ children: number; deadLetters: number }> = [];
+    const a = Object.assign(makeEchoEngine('a'), {
+      sweep: async () => {
+        seen.push({
+          children: (s.db.prepare('SELECT COUNT(*) AS n FROM child_processes').get() as { n: number }).n,
+          deadLetters: (s.db.prepare('SELECT COUNT(*) AS n FROM dead_letters').get() as { n: number }).n,
+        });
+      },
+    });
+    s = track(setup({ engines: [a] }));
+    const old = await s.kernel.enqueue('echo', { key: 'old' });
+    const reaped = await s.kernel.enqueue('echo', { key: 'reaped' });
+    claimNext(s.db, 'ghost', NOW, 1_000);
+    claimNext(s.db, 'ghost', NOW, 1_000);
+    s.db.prepare('UPDATE jobs SET delivery = 3 WHERE id = ?').run(reaped.job.id); // the reaper dead-letters it
+    s.db.prepare('UPDATE jobs SET lease_expires_at = ? WHERE id = ?').run(NOW + 100 * DAY, old.job.id);
+    s.db
+      .prepare("INSERT INTO workers (id, pid, pgid, process_start_time, host, started_at, last_seen_at) VALUES ('w', 1, 1, '0', 'h', 0, 0)")
+      .run();
+    s.db
+      .prepare('INSERT INTO child_processes (worker_id, job_id, delivery, pid, pgid, started_at, exited_at) VALUES (?, ?, 1, 1, 1, 0, 1)')
+      .run('w', old.job.id);
+    s.db
+      .prepare("INSERT INTO dead_letters (job_id, chain_id, reason, error, created_at, resolved_at) VALUES (?, ?, 'timeout', 'x', 0, 1)")
+      .run(old.job.id, old.chain.id);
+    vi.setSystemTime(NOW + 60 * DAY);
+
+    await runMaintenance(s.kernel.deps);
+
+    // The reaper's own dead letter exists (reaping ran first) and survives; the old rows are gone before the sweep.
+    expect(getJob(s.db, reaped.job.id).status).toBe('failed');
+    expect(seen).toEqual([{ children: 0, deadLetters: 1 }]);
+  });
+
+  it('a pruning error is reported to onError and does not stop the engine sweeps', async () => {
+    const swept: number[] = [];
+    const a = Object.assign(makeEchoEngine('a'), { sweep: async (now: number) => void swept.push(now) });
+    const s = track(setup({ engines: [a], historyRetentionDays: Number.NaN }));
+    const errors: Array<{ err: unknown; job?: Job }> = [];
+
+    await runMaintenance(s.kernel.deps, { onError: (err, job) => errors.push({ err, job }) });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.err).toBeInstanceOf(RangeError);
+    expect(swept).toHaveLength(1);
   });
 
   it('maintenance surfaces a reaper dead letter through the engine and survives a surfacing error', async () => {

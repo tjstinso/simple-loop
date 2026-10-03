@@ -162,5 +162,11 @@ export interface KernelDeps {
   runners: RunnerRegistry;
   policies: PolicyStore;
   clock: Clock;
-  config: { leaseMs: number; heartbeatMs: number; maxDeliveries: number };
+  config: {
+    leaseMs: number;
+    heartbeatMs: number;
+    maxDeliveries: number;
+    /** History tables are pruned by age after this many days (default 30). */
+    historyRetentionDays?: number;
+  };
 }

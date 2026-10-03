@@ -5,6 +5,7 @@ import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
 import { listDeadLetters } from './dlq.js';
 import { claimNext, getChain, getJob, renewLease, requeueJob } from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
+import { pruneHistory } from './retention.js';
 import type { ChainView, Fence, Job, KernelDeps } from './types.js';
 import {
   killProcessGroupNow,
@@ -56,7 +57,7 @@ const defaultOnError: ErrorHandler = (err, job) => {
 /**
  * Periodic kernel maintenance: reap expired leases (kill before reclaim,
  * requeue or dead-letter), surface each job the reaper dead-lettered through
- * its chain's engine, then run every engine's optional `sweep`. Errors are
+ * its chain's engine, prune aged history, then run every engine's optional `sweep`. Errors are
  * passed to `onError` and never stop the remaining steps or other jobs.
  */
 export async function runMaintenance(
@@ -84,6 +85,11 @@ export async function runMaintenance(
     } catch (e) {
       onError(e, job);
     }
+  }
+  try {
+    pruneHistory(deps.db, deps.clock(), deps.config.historyRetentionDays ?? 30);
+  } catch (e) {
+    onError(e);
   }
   for (const id of deps.engines.ids()) {
     const engine = deps.engines.get(id);
