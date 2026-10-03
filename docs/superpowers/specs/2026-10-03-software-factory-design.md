@@ -273,7 +273,7 @@ Idempotency handles an effect being *repeated*. A zombie is two actors running *
 **Layer 1: isolate each delivery.**
 
 1. **A private workspace per delivery.** Each claim gets its own workspace, seeded from the last *published* state. A zombie keeps working in its own directory and cannot corrupt the replacement's. A redelivered job starts clean; uncommitted partial work from a crashed delivery is discarded and the agent redoes it.
-2. **Publishing is only an engine effect.** A runner never publishes. The engine's effect publishes from that delivery's workspace, after the fence check. The runner's environment is stripped of the GitHub credentials it could inherit (GH_*/GITHUB_* variables, git and gh configuration, SSH agent and askpass variables) but it still runs with the operator's HOME, so this is hardening and not a guarantee (see README "Credentials"). A runner with a general shell could still reach an external system through ambient credentials, so the environment is stripped of them and `allowedTools` is kept narrow.
+2. **Publishing is only an engine effect.** A runner never publishes. The engine's effect publishes from that delivery's workspace, after the fence check. By default the `claude-cli` runner starts the agent in bare mode (`claude --bare`, which per its help never reads the CLI's OAuth login or the keychain): the agent's environment is built from an allow-list (locale, `PATH`, `TMPDIR`, the model API variables, proxy and CA variables, plus the names a policy lists in `passEnv`), HOME and the XDG base directories point at an empty per-run directory, git's global and system config are off and `gh` sees an empty config directory. So the default lookups of git, gh, ssh and keyring clients find no credential to use. This is hardening and not a guarantee (see README "Credentials"): the agent still runs as the operator's OS user, so a shell-capable agent can read or write any file that user can by its absolute path, its environment holds the model API key, and its network is not restricted. A real boundary needs a dedicated OS user or a container with filesystem and network limits, which is deployment, not code. `bare: false` keeps the older, weaker mode (the operator's environment minus a deny-list, with the operator's HOME).
 
 **Layer 2: reduce zombies.**
 
@@ -453,7 +453,7 @@ Run after every job outcome, including failures and timeouts, in a `finally`-sty
   - stale-worker result rejected by the fence;
   - a zombie delivery working in its own workspace cannot publish and cannot affect its replacement's workspace;
   - a runner result that fails its schema dead-letters the job;
-  - a crash during post-processing resumes without rerunning the runner;
+  - a crash during post-processing resumes without rerunning the runner, except a review whose `merge_pr` is still pending: without the review's workspace the reviewed head cannot be verified, so the job dead-letters as `runner_error` (the factory never merges an unpinned head) and a retry redoes the review;
   - the review job is not claimable until the PR exists, and a failed effect creates no follow-on jobs;
   - followups filed, and a failed filing retried without failing the chain;
   - worktree teardown.
