@@ -179,9 +179,12 @@ export function childEnv(overrides: Record<string, string> = {}, ghConfigDir?: s
   return { ...env, ...overrides };
 }
 
-/** Variables bare mode takes from the worker's environment (plus `LC_*` and the config's `passEnv`). */
+/** Variables bare mode takes from the worker's environment (plus the config's `passEnv`). */
 const BARE_ALLOWED_VARS = new Set([
-  'PATH', 'LANG', 'TERM', 'TZ', 'TMPDIR',
+  'PATH', 'TERM', 'TZ', 'TMPDIR',
+  // locale: LANG, LANGUAGE and the POSIX/glibc categories (an explicit list, not an LC_ prefix)
+  'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_NUMERIC', 'LC_TIME', 'LC_COLLATE', 'LC_MONETARY', 'LC_MESSAGES',
+  'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION',
   'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
   'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
   'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
@@ -200,8 +203,8 @@ export interface BareEnvOptions {
 }
 
 /**
- * The agent's environment in bare mode, built from an allow-list: only `BARE_ALLOWED_VARS`, `LC_*`
- * and the names in `passEnv` are taken from `parent`, then `overrides`; HOME and XDG_CONFIG_HOME,
+ * The agent's environment in bare mode, built from an allow-list: only `BARE_ALLOWED_VARS` (with an
+ * explicit list of locale variables) and the names in `passEnv` are taken from `parent`, then `overrides`; HOME and XDG_CONFIG_HOME,
  * XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME point at the empty `home`, git's global and
  * system config are off and `gh` uses the empty `ghConfigDir`. These isolation variables are set
  * last, so neither `passEnv` nor `overrides` can undo them. Nothing else from the parent reaches
@@ -222,7 +225,7 @@ export function bareChildEnv(opts: BareEnvOptions): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(opts.parent)) {
     if (v === undefined) continue;
-    if (BARE_ALLOWED_VARS.has(k) || k.startsWith('LC_') || pass.has(k)) env[k] = v;
+    if (BARE_ALLOWED_VARS.has(k) || pass.has(k)) env[k] = v;
   }
   Object.assign(env, opts.overrides ?? {});
   for (const k of ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) env[k] = opts.home;

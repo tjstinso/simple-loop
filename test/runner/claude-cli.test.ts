@@ -393,7 +393,9 @@ describe('ClaudeCliRunner', () => {
 
 describe('ClaudeCliRunner bare mode (R47)', () => {
   const ALLOWED = new Set([
-    'PATH', 'LANG', 'TERM', 'TZ', 'TMPDIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
+    'PATH', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_NUMERIC', 'LC_TIME', 'LC_COLLATE', 'LC_MONETARY', 'LC_MESSAGES',
+    'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION',
+    'TERM', 'TZ', 'TMPDIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
     'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
     'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
     // set by the runner itself
@@ -495,7 +497,7 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
         GIT_ASKPASS: '/bin/askpass', AWS_SECRET_ACCESS_KEY: 'aws-secret', GNOME_KEYRING_CONTROL: '/run/user/1000/keyring',
         KRB5CCNAME: 'FILE:/tmp/krb', GOOGLE_APPLICATION_CREDENTIALS: '/x.json', AZURE_CLIENT_SECRET: 'az',
         FACTORY_RANDOM: 'not-allowed', HOME: '/home/real', ANTHROPIC_API_KEY: 'sk-parent', HTTPS_PROXY: 'http://proxy:3128',
-        LC_ALL: 'C.UTF-8', GH_CONFIG_DIR: '/home/real/.config/gh', XDG_CONFIG_HOME: '/home/real/.config',
+        LC_ALL: 'C.UTF-8', LC_TIME: 'C', LANGUAGE: 'en', LC_FOO: 'not-a-category', GH_CONFIG_DIR: '/home/real/.config/gh', XDG_CONFIG_HOME: '/home/real/.config',
       },
       async () => {
         const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'echo', STUB_LIST_HOME: '1' } });
@@ -504,11 +506,14 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
           homeEntries: Record<string, string[] | null>;
         };
         const env = res.env;
-        const unexpected = Object.keys(env).filter((k) => !ALLOWED.has(k) && !k.startsWith('LC_'));
+        const unexpected = Object.keys(env).filter((k) => !ALLOWED.has(k));
         expect(unexpected).toEqual([]);
         expect(env.ANTHROPIC_API_KEY).toBe('sk-parent');
         expect(env.HTTPS_PROXY).toBe('http://proxy:3128');
         expect(env.LC_ALL).toBe('C.UTF-8');
+        expect(env.LC_TIME).toBe('C');
+        expect(env.LANGUAGE).toBe('en');
+        expect(env.LC_FOO).toBeUndefined(); // only the POSIX/glibc locale categories, not an LC_ prefix
         for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'GIT_ASKPASS',
           'AWS_SECRET_ACCESS_KEY', 'GNOME_KEYRING_CONTROL', 'KRB5CCNAME', 'GOOGLE_APPLICATION_CREDENTIALS', 'AZURE_CLIENT_SECRET', 'FACTORY_RANDOM']) {
           expect(env[k], k).toBeUndefined();
