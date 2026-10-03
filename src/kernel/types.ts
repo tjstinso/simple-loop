@@ -101,7 +101,7 @@ export interface Transition<S> {
 }
 
 /**
- * The fence handed to `Engine.runEffect`. `assertCurrent` re-reads the job
+ * The fence passed to `Engine.runEffect` as `RunEffectContext.fence`. `assertCurrent` re-reads the job
  * from the database and throws StaleDeliveryError unless the job is still
  * `running` at this fence's delivery; effects call it before acting.
  */
@@ -109,16 +109,17 @@ export interface EffectFence extends Fence {
   assertCurrent(): void;
 }
 
-/**
- * Prepares the private workspace for one job delivery. Engines are constructed
- * with their own ports; teardown belongs to `Engine.cleanup`, never the kernel.
- */
+/** Everything the kernel hands to `Engine.runEffect`: the chain view, the job being delivered and its fence. */
 export interface RunEffectContext<S> {
   chain: ChainView<S>;
   job: Job;
   fence: EffectFence;
 }
 
+/**
+ * Prepares the private workspace for one job delivery. Engines are constructed
+ * with their own ports; teardown belongs to `Engine.cleanup`, never the kernel.
+ */
 export interface WorkspaceProvider {
   prepare(chain: ChainView<any>, job: Job): Promise<Workspace>;
 }
@@ -136,7 +137,10 @@ export interface Engine<S = unknown> {
   buildRunInput(chain: ChainView<S>, job: Job, workspace: Workspace): Promise<Omit<RunInput, 'config'>>;
   /** Pure: no I/O. */
   transition(chain: ChainView<S>, job: Job, result: unknown): Transition<S>;
-  /** Idempotent, check-before-act. Runs before the transition commits. */
+  /**
+   * Idempotent, check-before-act. Runs before the transition commits. `ctx` carries the chain view,
+   * the job and the fence (`RunEffectContext`).
+   */
   runEffect(effect: Effect, ctx: RunEffectContext<S>): Promise<void>;
   describe(chain: ChainView<S>): string;
   surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
