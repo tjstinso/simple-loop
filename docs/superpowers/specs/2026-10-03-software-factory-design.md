@@ -415,7 +415,7 @@ GitHub is the source of truth, and the engine looks before acting. Before each e
 
 ### Workspace
 
-Each job delivery gets its own private git worktree, with a local branch named `factory/issue-<n>-c<chainId>-d<delivery>`. This isolates a zombie worker from its replacement (section 5).
+Each job delivery gets its own private git worktree at `<root>/<chainId>/j<jobId>-d<delivery>` (the delivery counter restarts at 1 for every job, so the job id is part of the identity), with a local branch named `factory/issue-<n>-c<chainId>-j<jobId>-d<delivery>`. This isolates a zombie worker from its replacement (section 5).
 
 - An execute delivery is seeded from the remote `factory/issue-<n>` head if the branch exists (a revise attempt starts from the previously published commits), otherwise from the base branch.
 - A review delivery is seeded from the PR head and is read-only by policy.

@@ -17,7 +17,7 @@
 - Job statuses: `queued`, `running`, `succeeded`, `failed`, `cancelled`. Chain statuses: `active`, `waiting`, `dead_lettered`, `completed`, `cancelled`.
 - Dead-letter reasons: `runner_error`, `timeout`, `max_deliveries`, `effect_error`.
 - Labels: `factory:in-progress`, `factory:ready-for-merge`, `factory:needs-human`, `factory:dead-letter`, `factory:followup`; profile selector `factory:profile:automatic`; engine selector prefix `factory:engine:`; default engine `software`.
-- Software engine: subject key `owner/repo#<issue>`; remote branch `factory/issue-<n>`; per-delivery local branch `factory/issue-<n>-c<chainId>-d<delivery>`; phases `executing`, `reviewing`, `awaiting_merge`, `needs_human`, `merged`; job types `execute` and `review`; policy kinds `execute` and `review`.
+- Software engine: subject key `owner/repo#<issue>`; remote branch `factory/issue-<n>`; per-delivery local branch `factory/issue-<n>-c<chainId>-j<jobId>-d<delivery>`; phases `executing`, `reviewing`, `awaiting_merge`, `needs_human`, `merged`; job types `execute` and `review`; policy kinds `execute` and `review`.
 - Required issue sections (default, configurable): `## Goal` and `## Acceptance criteria`.
 - Hidden marker format: `<!-- factory:chain=7 job=42 event=dead-letter -->`.
 - `claude-cli` runner uses `claude -p` with `--output-format stream-json`, `--allowedTools` and `--max-budget-usd`.
@@ -419,14 +419,14 @@ test/
 - Produces:
   - `interface SoftwareWorkspace extends Workspace { path: string; localBranch: string; seedSha: string; baseBranch: string }`
   - `class GitWorkspaceProvider { constructor(opts: { cloneUrlFor(repo: string): string; root: string; keepOnFailure: boolean }); prepare(chain: ChainView<SoftwareState>, job: Job): Promise<SoftwareWorkspace>; teardown(chain, job, outcome: 'ok' | 'failed'): Promise<void>; sweep(liveDeliveries: Set<string>): Promise<string[]> }`
-  - Path is derived: `<root>/<chainId>/d<delivery>`.
+  - Path is derived: `<root>/<chainId>/j<jobId>-d<delivery>`.
 - `temp-repo.ts`: `makeRemote(): { url: string; path: string; cleanup(): void }` creating a bare repo with a `main` commit.
 
 - [ ] **Step 1: Write the failing tests** with real `git` on temp repos:
   - `it('seeds an execute delivery from the base branch when the remote branch is absent')`.
   - `it('seeds a revise delivery from the pushed remote branch head')`.
   - `it('seeds a review delivery from the PR head')`.
-  - `it('gives each delivery its own path and local branch factory/issue-<n>-c<chainId>-d<delivery>')`.
+  - `it('gives each delivery its own path and local branch factory/issue-<n>-c<chainId>-j<jobId>-d<delivery>')`.
   - `it('disables the push URL on the workspace remote')` (a plain `git push` from the workspace fails).
   - `it('teardown removes the worktree and local branch on success')`.
   - `it('teardown keeps the worktree on failure when keepOnFailure is true')`.
