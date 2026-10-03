@@ -46,6 +46,14 @@ function parse(effect: Effect): Supported {
 
 export const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** A pinned merge the host refused (or that kept failing): classified `runner_error` by `classified`. */
+class PinnedMergeRefusedError extends GitHostError {
+  constructor(cause: GitHostError) {
+    super(cause.message, cause.status);
+    this.name = 'PinnedMergeRefusedError';
+  }
+}
+
 const isTransient = (e: GitHostError) => e.status === undefined || e.status === 429 || e.status >= 500;
 
 /**
@@ -68,13 +76,15 @@ export async function withHostRetry<T>(fn: () => Promise<T>, sleep: (ms: number)
  * Host failure classification. Retries the whole (check-before-act) effect body on a
  * transient GitHostError (withHostRetry), so a retried mutation always looks again first and a call
  * that succeeded server-side but failed client-side is not repeated. 4xx fails immediately. A final
- * GitHostError becomes EffectError(effect_error); StaleDeliveryError, EffectError and
- * non-GitHostError exceptions propagate unchanged.
+ * GitHostError becomes EffectError(effect_error), except a refused pinned merge, which becomes
+ * runner_error so one retry redoes the review on the current head (R46); StaleDeliveryError,
+ * EffectError and non-GitHostError exceptions propagate unchanged.
  */
 async function classified(ctx: EffectContext, body: () => Promise<void>): Promise<void> {
   try {
     await withHostRetry(body, ctx.sleep ?? defaultSleep);
   } catch (e) {
+    if (e instanceof PinnedMergeRefusedError) throw new EffectError(`merge refused for the reviewed head: ${e.message}`, 'runner_error');
     if (e instanceof GitHostError) throw new EffectError(e.message, 'effect_error');
     throw e;
   }
@@ -198,16 +208,17 @@ async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   if (pr.state === 'closed') throw new EffectError('PR is closed and cannot be merged', 'effect_error');
   // `automatic` must not merge code for an issue someone closed meanwhile.
   await openIssue(ctx);
+  // The merge is pinned to the head the reviewer saw: the review delivery was seeded from it. Without
+  // the workspace (crash resume, effect_error retry) that head is unknown: never merge unpinned. A
+  // runner_error dead letter clears the verdict on retry, so the review reruns on the current head.
+  if (!ctx.workspace) throw new EffectError('cannot verify the reviewed head; the review will be redone', 'runner_error');
   fence.assertCurrent();
-  // Pin the merge to the head the reviewer saw: the review delivery was seeded from it. After a crash
-  // resume the workspace is gone (null) and the merge is not pinned.
-  const pin = ctx.workspace ? { expectHeadSha: ctx.workspace.seedSha } : undefined;
   try {
-    await ctx.host.mergePr(repo, pr.number, pin);
+    await ctx.host.mergePr(repo, pr.number, { expectHeadSha: ctx.workspace.seedSha });
   } catch (err) {
-    if (err instanceof GitHostError && (err.status === 405 || err.status === 409)) {
-      throw new EffectError(`merge refused: ${err.message}`, 'effect_error');
-    }
+    // Still a GitHostError (same status), so a transient one is retried before `classified` turns it
+    // into runner_error (real gh reports a refused pinned merge without an HTTP status).
+    if (err instanceof GitHostError) throw new PinnedMergeRefusedError(err);
     throw err;
   }
 }
@@ -271,7 +282,8 @@ async function asRunnerError(body: () => Promise<void>): Promise<void> {
  * Runs one software effect: idempotent (looks before acting), fenced (the fence is checked
  * at the start and again immediately before each externally visible mutation), with host
  * failures classified into EffectError reasons (`commit_push` and `open_pr` of an execute job fail
- * as `runner_error`, see WORKSPACE_EFFECTS). StaleDeliveryError always propagates.
+ * as `runner_error`, see WORKSPACE_EFFECTS; so does a `merge_pr` with no reviewed head to pin or
+ * whose pinned merge is refused, R46). StaleDeliveryError always propagates.
  */
 export async function runSoftwareEffect(effect: Effect, ctx: EffectContext, fence: EffectFence): Promise<void> {
   if (effect?.kind === 'file_followups') return fileFollowupsEffect(effect, ctx, fence);

@@ -136,9 +136,106 @@ describe('software engine scenarios', () => {
     ]);
     expect(h.pr(BRANCH)).toMatchObject({ state: 'open' });
     expect(h.deadLetters()).toEqual([
-      expect.objectContaining({ reason: 'effect_error', error: "effect 'merge_pr' failed: merge refused: head commit changed" }),
+      expect.objectContaining({
+        reason: 'runner_error',
+        error: "effect 'merge_pr' failed: merge refused for the reviewed head: head commit changed",
+      }),
     ]);
     expect(h.chain(chain.id).status).toBe('dead_lettered');
+  });
+
+  it('after a refused pinned merge, dlq retry re-reviews the current head before merging', async () => {
+    const h = harness();
+    const { chain } = await h.submit(N, ['factory:profile:automatic']);
+    writesPerAttempt(h);
+    let pushed: string | null = null;
+    h.scriptReview(() => ({ verdict: 'approve', feedback: 'ship it' }));
+    h.beforeEffect = (effect) => {
+      if (effect.kind === 'merge_pr' && pushed === null) {
+        h.remote.commit(BRANCH, 'sneaky.txt', 'unreviewed\n'); // lands after the review, before the merge
+        pushed = h.remoteHead(BRANCH);
+      }
+    };
+
+    const first = await h.runUntilIdle();
+    expect(first.map((o) => [o.type, o.outcome])).toEqual([
+      ['execute', 'succeeded'],
+      ['review', 'dead_lettered'],
+    ]);
+    const review = h.jobs(chain.id).find((j) => j.type === 'review')!;
+    const reviewedHead = ws(h.callsOf('review')[0]!).seedSha;
+    expect(pushed).not.toBeNull();
+    expect(reviewedHead).not.toBe(pushed);
+    expect(h.deadLetters()).toEqual([
+      expect.objectContaining({
+        jobId: review.id,
+        reason: 'runner_error',
+        error: "effect 'merge_pr' failed: merge refused for the reviewed head: head commit changed",
+      }),
+    ]);
+    expect(h.pr(BRANCH)).toMatchObject({ state: 'open' });
+
+    const retried = await h.kernel.retryDeadLetter(review.id);
+    expect(retried).toMatchObject({ status: 'queued', result: null }); // the verdict is not kept
+    const second = await h.runUntilIdle();
+
+    expect(second.map((o) => [o.type, o.outcome])).toEqual([['review', 'succeeded']]);
+    const reviews = h.callsOf('review');
+    expect(reviews).toHaveLength(2);
+    expect(ws(reviews[1]!).seedSha).toBe(pushed);
+    expect(h.host.calls.filter((x) => x.method === 'mergePr').map((x) => x.args)).toEqual([
+      ['o/r', 8, { expectHeadSha: reviewedHead }],
+      ['o/r', 8, { expectHeadSha: pushed }],
+    ]);
+    expect(h.pr(BRANCH)).toMatchObject({ state: 'merged' });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'completed', state: { phase: 'merged' } });
+  });
+
+  it('a review resumed without its workspace never merges unpinned: it dead-letters runner_error', async () => {
+    const h = harness();
+    const { chain } = await h.submit(N, ['factory:profile:automatic']);
+    writesPerAttempt(h);
+    h.scriptReview(() => ({ verdict: 'approve', feedback: 'ship it' }));
+    let failed = false;
+    h.beforeEffect = (effect) => {
+      if (effect.kind === 'merge_pr' && !failed) {
+        failed = true;
+        h.host.failNext('findPrByHead', new GitHostError('Validation Failed', 422)); // a non-retryable effect_error
+      }
+    };
+
+    const first = await h.runUntilIdle();
+    expect(first.map((o) => [o.type, o.outcome])).toEqual([
+      ['execute', 'succeeded'],
+      ['review', 'dead_lettered'],
+    ]);
+    const review = h.jobs(chain.id).find((j) => j.type === 'review')!;
+    expect(h.deadLetters()).toEqual([expect.objectContaining({ jobId: review.id, reason: 'effect_error' })]);
+
+    // effect_error retry keeps the verdict: post-processing resumes without a workspace.
+    await h.kernel.retryDeadLetter(review.id);
+    const second = await h.runUntilIdle();
+    expect(second.map((o) => [o.type, o.outcome])).toEqual([['review', 'dead_lettered']]);
+    expect(h.callsOf('review')).toHaveLength(1);
+    expect(h.host.calls.filter((x) => x.method === 'mergePr')).toEqual([]);
+    expect(h.pr(BRANCH)).toMatchObject({ state: 'open' });
+    expect(h.deadLetters().filter((d) => d.resolvedAt === null)).toEqual([
+      expect.objectContaining({
+        jobId: review.id,
+        reason: 'runner_error',
+        error: "effect 'merge_pr' failed: cannot verify the reviewed head; the review will be redone",
+      }),
+    ]);
+
+    // runner_error retry: the review runs again and the merge is pinned to what it saw.
+    await h.kernel.retryDeadLetter(review.id);
+    const third = await h.runUntilIdle();
+    expect(third.map((o) => [o.type, o.outcome])).toEqual([['review', 'succeeded']]);
+    expect(h.callsOf('review')).toHaveLength(2);
+    expect(h.host.calls.filter((x) => x.method === 'mergePr').map((x) => x.args)).toEqual([
+      ['o/r', 8, { expectHeadSha: h.remoteHead(BRANCH) }],
+    ]);
+    expect(h.pr(BRANCH)).toMatchObject({ state: 'merged' });
   });
 
   it('revise loop: two request_changes then approve', async () => {

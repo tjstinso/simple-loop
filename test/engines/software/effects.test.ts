@@ -405,38 +405,48 @@ describe('runSoftwareEffect', () => {
     expect((err as Error).message).toBe('no PR found for label target');
   });
 
-  it("merge_pr pins the review workspace's seed sha (the head the reviewer saw), and does not pin without a workspace", async () => {
+  it("merge_pr pins the review workspace's seed sha (the head the reviewer saw)", async () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     host.setPrHead(pr.number, 'pushed-after-review');
     const review = job({ type: 'review' });
     const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence()).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(EffectError);
-    expect((err as Error).message).toBe('merge refused: head commit changed');
+    expect((err as EffectError).reason).toBe('runner_error');
+    expect((err as Error).message).toBe('merge refused for the reviewed head: head commit changed');
     expect(host.calls.filter((c) => c.method === 'mergePr').map((c) => c.args)).toEqual([[REPO, pr.number, { expectHeadSha: 'seed' }]]);
     expect(host.prs.get(pr.number)?.state).toBe('open');
 
     host.setPrHead(pr.number, 'seed');
     await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence());
     expect(host.prs.get(pr.number)?.state).toBe('merged');
+  });
 
-    // After a crash resume the workspace is gone: merge without a pin.
-    const other = await host.openPr(REPO, { head: 'factory/issue-9', base: 'main', title: 't', body: 'b' });
-    host.addIssue({ number: 9, title: 'nine', body: 'b', labels: [] });
+  it('merge_pr without a workspace throws runner_error and never calls mergePr', async () => {
+    // After a crash resume or an effect_error retry the workspace is gone: no reviewed head to pin.
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     host.calls.length = 0;
-    await runSoftwareEffect(
-      { kind: 'merge_pr' },
-      ctx({ job: review, workspace: null, chain: chain({ issueNumber: 9, branch: 'factory/issue-9' }) }),
-      fence(),
+    const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: job({ type: 'review' }), workspace: null }), fence()).catch(
+      (e: unknown) => e,
     );
-    expect(host.calls.filter((c) => c.method === 'mergePr').map((c) => c.args)).toEqual([[REPO, other.number, undefined]]);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as EffectError).reason).toBe('runner_error');
+    expect((err as Error).message).toBe('cannot verify the reviewed head; the review will be redone');
+    expect(host.calls.map((c) => c.method)).not.toContain('mergePr');
+    expect(host.prs.get(pr.number)?.state).toBe('open');
+    expect(delays).toEqual([]);
   });
 
   it('merge_pr checks PR state first and is a no-op when already merged', async () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
-    await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ workspace: null }), fence());
+    host.setPrHead(pr.number, 'seed');
+    await runSoftwareEffect({ kind: 'merge_pr' }, ctx(), fence());
     expect(host.prs.get(pr.number)?.state).toBe('merged');
     host.calls.length = 0;
     await runSoftwareEffect({ kind: 'merge_pr' }, ctx(), fence());
+    expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead']);
+    // Also without a workspace: an already merged PR needs no pin.
+    host.calls.length = 0;
+    await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ workspace: null }), fence());
     expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead']);
   });
 
@@ -449,17 +459,61 @@ describe('runSoftwareEffect', () => {
     expect((err as Error).message).toBe('PR is closed and cannot be merged');
   });
 
-  it('merge refused (GitHostError 405 and 409) becomes effect_error and leaves the PR open', async () => {
+  it('a pinned merge refused by the host becomes runner_error', async () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     for (const status of [405, 409]) {
       host.failNext('mergePr', new GitHostError('Pull Request is not mergeable', status));
       const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx(), fence()).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(EffectError);
-      expect((err as EffectError).reason).toBe('effect_error');
-      expect((err as Error).message).toBe('merge refused: Pull Request is not mergeable');
+      expect((err as EffectError).reason).toBe('runner_error');
+      expect((err as Error).message).toBe('merge refused for the reviewed head: Pull Request is not mergeable');
       expect(host.prs.get(pr.number)?.state).toBe('open');
     }
-    expect(delays).toEqual([]);
+    expect(delays).toEqual([]); // a 4xx is not retried
+
+    // Real gh reports a refused --match-head-commit merge without an HTTP status: it is retried as
+    // transient first, then classified runner_error.
+    let attempts = 0;
+    host.mergePr = async (_repo, _n, opts) => {
+      attempts++;
+      expect(opts).toEqual({ expectHeadSha: 'seed' });
+      throw new GitHostError('GraphQL: Head branch was modified');
+    };
+    const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: job({ type: 'review' }) }), fence()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as EffectError).reason).toBe('runner_error');
+    expect((err as Error).message).toBe('merge refused for the reviewed head: GraphQL: Head branch was modified');
+    expect(attempts).toBe(3);
+    expect(delays).toEqual([100, 200]);
+    expect(host.prs.get(pr.number)?.state).toBe('open');
+  });
+
+  it('an unpinned merge failure stays effect_error', async () => {
+    // No merge is attempted unpinned any more (no workspace is runner_error before mergePr), so the
+    // effect_error cases left are the missing PR, the closed issue and the closed PR: unchanged.
+    const review = job({ type: 'review' });
+    const noPr = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review, workspace: null }), fence()).catch((e: unknown) => e);
+    expect(noPr).toBeInstanceOf(EffectError);
+    expect((noPr as EffectError).reason).toBe('effect_error');
+    expect((noPr as Error).message).toBe('no PR found to merge');
+
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.issues.get(ISSUE)!.state = 'closed';
+    const closedIssue = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review, workspace: null }), fence()).catch(
+      (e: unknown) => e,
+    );
+    expect(closedIssue).toBeInstanceOf(EffectError);
+    expect((closedIssue as EffectError).reason).toBe('effect_error');
+    expect((closedIssue as Error).message).toBe(`issue #${ISSUE} is closed`);
+
+    host.prs.get(pr.number)!.state = 'closed';
+    for (const workspace of [null, fakeWs]) {
+      const closedPr = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review, workspace }), fence()).catch((e: unknown) => e);
+      expect(closedPr).toBeInstanceOf(EffectError);
+      expect((closedPr as EffectError).reason).toBe('effect_error');
+      expect((closedPr as Error).message).toBe('PR is closed and cannot be merged');
+    }
+    expect(host.calls.map((c) => c.method)).not.toContain('mergePr');
   });
 
   it('a GitHostError 404 on the issue becomes effect_error', async () => {
