@@ -40,7 +40,13 @@ All other fields keep their defaults (see the README configuration table). Defin
 alias factory='node /absolute/path/to/this/repository/dist/src/cli/main.js --config /tmp/factory-smoke/factory.config.json'
 ```
 
-Create the labels `factory:profile:automatic` in the sandbox repository (optional; GitHub also creates a label the first time it is applied, but you need it on the issue before submit for the automatic run).
+Required: create the `factory:profile:automatic` label in the sandbox repository before step (b). `gh issue create --label` fails when the label does not exist, whereas the factory's own label calls (the REST add-labels endpoint) create labels on first use. The command is safe to re-run because of `--force`:
+
+```
+gh label create "factory:profile:automatic" --repo <owner>/<repo> --description "Run the factory without a human merge" --force
+```
+
+The other `factory:*` labels (`in-progress`, `ready-for-merge`, `needs-human`, `dead-letter`, `followup`) are applied only by the factory through the API and need no pre-creation. This runbook uses `gh issue create --label` only for the profile label.
 
 The `sqlite3` command-line tool is used below to peek into the database; any SQLite client works.
 
