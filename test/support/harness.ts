@@ -145,8 +145,9 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     const clock = () => now;
 
     const host = new FakeGitHost();
-    const git = new ExecGitPorts();
     const workspaces = new GitWorkspaceProvider({ cloneUrlFor: () => r.url, root: workspaceRoot, keepOnFailure: true });
+    // Wired as in the production composition root (src/cli/runtime.ts).
+    const git = new ExecGitPorts({ prepareForPush: (ws) => workspaces.sanitizeForPush(ws) });
 
     // Record what the engine asks the provider to do (paths, deliveries, outcomes).
     const workspaceLog: WorkspaceEvent[] = [];

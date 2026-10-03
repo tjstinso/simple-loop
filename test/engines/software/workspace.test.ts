@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ChainView, Job } from '../../../src/kernel/types.js';
 import type { SoftwareState } from '../../../src/engines/software/state.js';
+import { ExecGitPorts } from '../../../src/engines/software/git-ports.js';
 import { GitWorkspaceProvider } from '../../../src/engines/software/workspace.js';
 import { GIT_TEST_ENV, makeRemote, type TempRemote } from '../../support/temp-repo.js';
 
@@ -231,5 +232,101 @@ describe('GitWorkspaceProvider', () => {
     expect(second.remoteHeadSha).toBe(sha);
     expect(second.seedSha).toBe(sha);
     expect(existsSync(join(second.path, 'late.txt'))).toBe(true);
+  });
+
+  describe('sanitizeConfig (shared cache config the agent can write)', () => {
+    const cacheOf = () => join(root, '.cache', 'acme__widgets.git');
+    const localKeys = (cache: string) => git(cache, ['config', '--local', '--list', '--name-only']).split('\n').filter(Boolean);
+    const poison = (cache: string, decoy: string) => {
+      git(cache, ['config', `url.${decoy}.insteadOf`, remote.url]);
+      git(cache, ['config', `url.${decoy}.pushInsteadOf`, remote.url]);
+      git(cache, ['config', 'credential.helper', '!echo steal']);
+      git(cache, ['config', 'core.sshCommand', 'ssh -i /tmp/stolen-key']);
+      git(cache, ['config', 'core.fsmonitor', 'touch /tmp/factory-pwned']);
+      git(cache, ['config', 'include.path', '/nonexistent/evil.inc']);
+    };
+
+    it('removes poisoned keys and keeps the allowed ones', async () => {
+      const ws = await provider.prepare(chain(1), job(1, 1));
+      const cache = cacheOf();
+      const decoy = join(root, 'decoy.git');
+      poison(cache, decoy);
+      git(cache, ['config', 'extensions.worktreeConfig', 'true']);
+      const admin = git(ws.path, ['rev-parse', '--git-dir']);
+      writeFileSync(join(admin, 'config.worktree'), '[credential]\n\thelper = !echo steal\n');
+      git(cache, ['config', 'gc.auto', '0']);
+
+      await provider.sanitizeConfig('acme/widgets');
+
+      const keys = localKeys(cache);
+      for (const bad of [
+        `url.${decoy}.insteadof`,
+        `url.${decoy}.pushinsteadof`,
+        'credential.helper',
+        'core.sshcommand',
+        'core.fsmonitor',
+        'include.path',
+        'extensions.worktreeconfig',
+      ]) {
+        expect(keys, bad).not.toContain(bad);
+      }
+      expect(keys).toEqual(
+        expect.arrayContaining([
+          'core.repositoryformatversion', 'core.bare', 'remote.origin.url', 'remote.origin.fetch',
+          'remote.origin.pushurl', 'user.name', 'user.email', 'gc.auto',
+        ]),
+      );
+      expect(git(cache, ['config', 'remote.origin.url'])).toBe(remote.url);
+      expect(git(cache, ['config', 'remote.origin.pushurl'])).toBe('no_push://disabled');
+      expect(existsSync(join(admin, 'config.worktree'))).toBe(false);
+    });
+
+    it('prepare sanitizes the cache config before it fetches', async () => {
+      await provider.prepare(chain(1), job(1, 1));
+      const cache = cacheOf();
+      poison(cache, join(root, 'decoy.git'));
+      await provider.prepare(chain(1), job(1, 2));
+      const keys = localKeys(cache);
+      expect(keys).not.toContain('credential.helper');
+      expect(keys.some((k) => k.startsWith('url.'))).toBe(false);
+    });
+
+    it('a push after sanitizing uses the real URL', async () => {
+      const decoy = join(root, 'decoy.git');
+      git(root, ['init', '--bare', decoy]);
+      const ws = await provider.prepare(chain(1), job(1, 1));
+      writeFileSync(join(ws.path, 'x.txt'), 'x\n');
+      const plain = new ExecGitPorts();
+      await plain.commitAll(ws, 'work');
+      git(cacheOf(), ['config', `url.${decoy}.pushInsteadOf`, remote.url]);
+
+      // Without sanitizing, the poisoned config redirects the engine's push to the decoy.
+      await plain.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null });
+      expect(git(decoy, ['branch', '--list', 'factory/issue-7'])).toContain('factory/issue-7');
+      expect(git(remote.path, ['branch', '--list', 'factory/issue-7'])).toBe('');
+
+      const safe = new ExecGitPorts({ prepareForPush: (w) => provider.sanitizeForPush(w) });
+      await safe.prepareForPush(ws);
+      await safe.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null });
+      expect(git(remote.path, ['rev-parse', 'refs/heads/factory/issue-7'])).toBe(git(ws.path, ['rev-parse', 'HEAD']));
+    });
+
+    it('sanitizeForPush refuses a worktree whose .git file was redirected', async () => {
+      const ws = await provider.prepare(chain(1), job(1, 1));
+      const elsewhere = join(root, 'elsewhere.git');
+      git(root, ['init', '--bare', elsewhere]);
+      writeFileSync(join(ws.path, '.git'), `gitdir: ${elsewhere}\n`);
+      await expect(provider.sanitizeForPush(ws)).rejects.toThrow(/not a worktree of the factory cache/);
+    });
+
+    it('runs its own git commands with hooks disabled', async () => {
+      await provider.prepare(chain(1), job(1, 1));
+      const marker = join(root, 'hook-ran');
+      const hook = join(cacheOf(), 'hooks', 'post-checkout');
+      mkdirSync(join(cacheOf(), 'hooks'), { recursive: true });
+      writeFileSync(hook, `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+      await provider.prepare(chain(1), job(1, 2));
+      expect(existsSync(marker)).toBe(false);
+    });
   });
 });

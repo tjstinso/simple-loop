@@ -36,7 +36,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
     const engine = createSoftwareEngine({
       db,
       host: new GhCliHost(),
-      git: new ExecGitPorts(),
+      git: new ExecGitPorts({ prepareForPush: (ws) => workspaces.sanitizeForPush(ws) }),
       workspaces,
       policies,
       config: {

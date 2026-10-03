@@ -1,12 +1,14 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import type { ChainView, Job, WorkspaceProvider } from '../../kernel/types.js';
 import type { Workspace } from '../../runner/types.js';
 import type { SoftwareState } from './state.js';
 
 export interface SoftwareWorkspace extends Workspace {
+  /** `owner/name`; identifies the shared cache repository this worktree belongs to. */
+  repo: string;
   path: string;
   localBranch: string;
   remoteBranch: string;
@@ -32,6 +34,35 @@ export interface GitWorkspaceOptions {
 
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 const DISABLED_PUSH_URL = 'no_push://disabled';
+
+/**
+ * Local config keys of the shared cache repository that survive `sanitizeConfig`: what git itself and
+ * this provider write. Everything else (url.*.insteadOf, credential.*, core.sshCommand, core.fsmonitor,
+ * include.path, filters, aliases, ...) could redirect or hijack the engine's own git commands and is
+ * removed. `extensions.worktreeConfig` is removed too: it would enable per-worktree config files the
+ * agent can write.
+ */
+const ALLOWED_KEYS = new Set([
+  'core.repositoryformatversion',
+  'core.filemode',
+  'core.bare',
+  'core.logallrefupdates',
+  'core.hookspath',
+  'commit.gpgsign',
+  'remote.origin.url',
+  'remote.origin.fetch',
+  'remote.origin.pushurl',
+  'user.name',
+  'user.email',
+]);
+const ALLOWED_PREFIXES = ['extensions.', 'worktree.', 'gc.'];
+const DENIED_KEYS = new Set(['extensions.worktreeconfig']);
+
+function isAllowedKey(key: string): boolean {
+  const k = key.toLowerCase();
+  if (DENIED_KEYS.has(k)) return false;
+  return ALLOWED_KEYS.has(k) || ALLOWED_PREFIXES.some((p) => k.startsWith(p));
+}
 
 interface Ids {
   repo: string;
@@ -61,7 +92,10 @@ function gitEnv(): NodeJS.ProcessEnv {
 
 function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile('git', args, { cwd, env: gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    // Hooks off: the agent can write the shared cache (hooks/, core.hooksPath) and must not get
+    // code run by the worker's own git commands (worktree add runs post-checkout).
+    const argv = ['-c', 'core.hooksPath=/dev/null', ...args];
+    execFile('git', argv, { cwd, env: gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error(`git ${args.join(' ')} failed: ${String(stderr).trim() || err.message}`));
       else resolve(stdout.trim());
     });
@@ -164,6 +198,63 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     return run;
   }
 
+  /**
+   * Removes every local config key of the cache that is not allow-listed and every per-worktree
+   * config file. Caller holds the cache lock. A missing cache is a no-op.
+   */
+  private async sanitizeLocked(cache: string): Promise<void> {
+    if (!existsSync(join(cache, 'HEAD'))) return;
+    const out = await git(cache, ['config', '--local', '--list', '--name-only']);
+    const keys = [...new Set(out.split('\n').map((k) => k.trim()).filter(Boolean))];
+    for (const key of keys) {
+      if (!isAllowedKey(key)) await git(cache, ['config', '--local', '--unset-all', key]);
+    }
+    const admin = join(cache, 'worktrees');
+    if (existsSync(admin)) {
+      for (const d of await readdir(admin)) await rm(join(admin, d, 'config.worktree'), { force: true });
+    }
+  }
+
+  /**
+   * Removes config the agent could have written into the shared cache repository (redirecting URLs,
+   * credential helpers, ssh commands, fsmonitor, includes...), keeping only allow-listed keys. Runs
+   * at the start of every `prepare` and, through `sanitizeForPush`, right before the engine commits
+   * and pushes.
+   */
+  async sanitizeConfig(repo: string): Promise<void> {
+    if (!REPO_RE.test(repo) || repo.split('/').some((p) => p === '.' || p === '..')) {
+      throw new Error(`invalid repo: ${JSON.stringify(repo)}`);
+    }
+    const cache = this.cachePath(repo);
+    if (!existsSync(cache)) return;
+    await this.withCache(cache, () => this.sanitizeLocked(cache));
+  }
+
+  /**
+   * Before the engine runs git in a delivery's worktree under the worker's own environment: checks
+   * that the worktree's `.git` file (which the agent can rewrite) still points at this delivery's
+   * administrative directory inside the cache and that the latter still points back at the cache,
+   * then sanitizes the cache config. Throws when the worktree was redirected.
+   */
+  async sanitizeForPush(ws: SoftwareWorkspace): Promise<void> {
+    const cache = this.cachePath(ws.repo);
+    const refuse = (why: string): never => {
+      throw new Error(`refusing to publish from ${ws.path}: not a worktree of the factory cache (${why})`);
+    };
+    const gitFile = join(ws.path, '.git');
+    const st = await lstat(gitFile).catch(() => null);
+    if (!st || !st.isFile()) refuse('.git is not a regular file');
+    const m = /^gitdir: (.+)$/m.exec(await readFile(gitFile, 'utf8'));
+    if (!m) refuse('.git has no gitdir line');
+    const realCache = await realpath(cache);
+    const adminDir = await realpath(resolve(ws.path, m![1]!.trim())).catch(() => refuse('gitdir does not exist'));
+    if (!adminDir.startsWith(join(realCache, 'worktrees') + sep)) refuse('gitdir is outside the cache');
+    const common = await readFile(join(adminDir, 'commondir'), 'utf8').catch(() => refuse('no commondir'));
+    const realCommon = await realpath(resolve(adminDir, common.trim())).catch(() => refuse('commondir does not exist'));
+    if (realCommon !== realCache) refuse('commondir is not the cache');
+    await this.sanitizeConfig(ws.repo);
+  }
+
   private async ensureCache(repo: string): Promise<string> {
     const cache = this.cachePath(repo);
     const url = this.opts.cloneUrlFor(repo);
@@ -224,6 +315,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     const cache = this.cachePath(repo);
 
     return this.withCache(cache, async () => {
+      await this.sanitizeLocked(cache);
       await this.ensureCache(repo);
       await git(cache, ['fetch', 'origin', '--prune']);
       const baseBranch = await this.detectBase(cache);
@@ -242,7 +334,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       await mkdir(join(this.opts.root, String(chainId)), { recursive: true });
       await git(cache, ['worktree', 'add', '-b', localBranch, path, seedSha]);
 
-      return { path, localBranch, remoteBranch, remoteUrl, remoteHeadSha, seedSha, baseBranch };
+      return { repo, path, localBranch, remoteBranch, remoteUrl, remoteHeadSha, seedSha, baseBranch };
     });
   }
 

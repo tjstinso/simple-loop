@@ -12,6 +12,12 @@ export interface GitPorts {
    * (`null`: the branch must not exist). A failed lease throws StaleDeliveryError.
    */
   push(ws: SoftwareWorkspace, args: { remoteBranch: string; expectSha: string | null }): Promise<void>;
+  /**
+   * Optional: called by `commit_push` before it commits and pushes, to make the engine's own git
+   * commands independent of repository config the agent could have written (see
+   * `GitWorkspaceProvider.sanitizeForPush`).
+   */
+  prepareForPush?(ws: SoftwareWorkspace): Promise<void>;
 }
 
 export const FACTORY_GIT_NAME = 'factory';
@@ -68,7 +74,18 @@ async function must(cwd: string, args: string[], input?: string): Promise<string
   return r.stdout.trim();
 }
 
+export interface ExecGitPortsOptions {
+  /** Run by `prepareForPush`; the composition root passes `GitWorkspaceProvider.sanitizeForPush`. */
+  prepareForPush?: (ws: SoftwareWorkspace) => Promise<void>;
+}
+
 export class ExecGitPorts implements GitPorts {
+  constructor(private readonly opts: ExecGitPortsOptions = {}) {}
+
+  async prepareForPush(ws: SoftwareWorkspace): Promise<void> {
+    await this.opts.prepareForPush?.(ws);
+  }
+
   async commitAll(ws: SoftwareWorkspace, message: string): Promise<boolean> {
     await must(ws.path, ['add', '-A']);
     const diff = await run(ws.path, ['diff', '--cached', '--quiet']);

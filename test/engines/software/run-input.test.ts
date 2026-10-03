@@ -19,7 +19,7 @@ const job = (type: string, payload: unknown = {}): Job => ({
   claimedBy: 'w', leaseExpiresAt: null, delivery: 1, error: null,
 });
 const ws: SoftwareWorkspace = {
-  path: '/ws', localBranch: 'l', remoteBranch: 'factory/issue-7', remoteUrl: '/r.git',
+  repo: 'acme/widgets', path: '/ws', localBranch: 'l', remoteBranch: 'factory/issue-7', remoteUrl: '/r.git',
   remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
 };
 const issue = { number: 7, title: 'Add thing', body: '## Goal\nx', labels: ['bug'], state: 'open', author: 'eve', url: 'http://x' } as Issue;

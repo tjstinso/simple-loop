@@ -104,6 +104,8 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
   const { repo, issueNumber, branch } = ctx.chain.state;
   const issue = await ctx.host.getIssue(repo, issueNumber);
   const title = oneLine(issue.title) || `#${issueNumber}`;
+  // The agent could have written the shared repository config: sanitize before any engine git command.
+  await ctx.git.prepareForPush?.(ws);
   await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
   if ((await ctx.git.headSha(ws)) === ws.seedSha) {
     // Nothing new in this delivery. If the branch was already published (e.g. a rerun after a

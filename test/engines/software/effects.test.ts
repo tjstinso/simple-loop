@@ -49,7 +49,7 @@ class RecordingGit implements GitPorts {
 }
 
 const fakeWs: SoftwareWorkspace = {
-  path: '/nonexistent', localBranch: 'l', remoteBranch: BRANCH, remoteUrl: '/nonexistent.git',
+  repo: 'acme/widgets', path: '/nonexistent', localBranch: 'l', remoteBranch: BRANCH, remoteUrl: '/nonexistent.git',
   remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
 };
 
@@ -201,6 +201,18 @@ describe('runSoftwareEffect', () => {
       expect(git(remote.path, ['branch', '--list', BRANCH])).toBe('');
       expect(host.calls).toEqual([]);
     });
+  });
+
+  it('commit_push sanitizes the shared repository config before it commits and pushes', async () => {
+    const order: string[] = [];
+    const g: GitPorts = {
+      prepareForPush: async () => void order.push('prepareForPush'),
+      commitAll: async () => (order.push('commitAll'), true),
+      headSha: async () => (order.push('headSha'), 'new'),
+      push: async () => void order.push('push'),
+    };
+    await runSoftwareEffect({ kind: 'commit_push' }, ctx({ git: g }), fence());
+    expect(order).toEqual(['prepareForPush', 'commitAll', 'headSha', 'push']);
   });
 
   it('commit_push with a missing workspace throws EffectError runner_error', async () => {
