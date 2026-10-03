@@ -176,6 +176,19 @@ describe('ExecGitPorts', () => {
       expect(lines).toContain('agent message line');
     });
 
+    it('reads every header of a hand-built commit object, not only author, committer and message', async () => {
+      const tree = git(ws.path, ['rev-parse', 'HEAD^{tree}']);
+      const obj =
+        `tree ${tree}\nparent ${ws.seedSha}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n` +
+        'x-note custom-header-value\nencoding encoding-header-value\n\nplain message\n';
+      const c = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: ws.path, env: GIT_TEST_ENV, input: obj, encoding: 'utf8' }).trim();
+      git(ws.path, ['reset', '-q', '--soft', c]);
+      const changes = await ports.addedChanges(ws, c);
+      expect(changes.text).toContain('custom-header-value');
+      expect(changes.text).toContain('encoding-header-value');
+      expect(changes.text).toContain('plain message');
+    });
+
     it('a .gitattributes in the change cannot hide a text file from the scan', async () => {
       writeFileSync(join(ws.path, '.gitattributes'), 'hidden.txt -diff\n');
       writeFileSync(join(ws.path, 'hidden.txt'), 'hidden content\n');

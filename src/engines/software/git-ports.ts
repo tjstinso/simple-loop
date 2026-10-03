@@ -16,7 +16,8 @@ export interface GitPorts {
   /**
    * What a push of `sha` would publish beyond `ws.seedSha` (the range `seedSha..sha`, every commit
    * of it, so commits the agent made itself and files added then deleted again are included): the
-   * added or modified paths, and the added lines plus each commit's author, committer and message.
+   * added or modified paths, and the added lines plus each commit object exactly as stored (every
+   * header, including ones only a hand-built commit has) and its message as git displays it.
    * Binary files are read as text too (`--text`). `truncated` is true when the text hit the scan cap.
    */
   addedChanges(ws: SoftwareWorkspace, sha: string): Promise<AddedChanges>;
@@ -107,9 +108,13 @@ function stream(
   timeoutMs: number,
   extraEnv: NodeJS.ProcessEnv,
   onData: (chunk: string) => boolean,
+  input?: string,
 ): Promise<{ code: number; stderr: string; stopped: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn('git', [...SAFE_CONFIG, ...args], { cwd, env: { ...gitEnv(), ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('git', [...SAFE_CONFIG, ...args], { cwd, env: { ...gitEnv(), ...extraEnv }, stdio: ['pipe', 'pipe', 'pipe'] });
+    // git may exit without reading stdin (EPIPE); its exit code decides the outcome.
+    child.stdin.on('error', () => undefined);
+    child.stdin.end(input ?? '');
     let stopped = false;
     let timedOut = false;
     let stderr = '';
@@ -278,17 +283,23 @@ export class ExecGitPorts implements GitPorts {
     const paths = [...new Set(names.stdout.split('\0').filter((p) => p !== ''))];
 
     const out = new CappedText(this.scanCap);
-    const collect = async (args: string[], extraEnv: NodeJS.ProcessEnv, onLine: (line: string) => boolean) => {
+    const collect = async (args: string[], extraEnv: NodeJS.ProcessEnv, onLine: (line: string) => boolean, input?: string) => {
       if (out.truncated) return;
       const lines = lineSplitter(onLine, (pending) => out.overflows(pending));
-      const r = await stream(ws.path, args, this.local, extraEnv, (chunk) => lines.push(chunk));
+      const r = await stream(ws.path, args, this.local, extraEnv, (chunk) => lines.push(chunk), input);
       if (r.stopped) return;
       if (r.code !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
       lines.end();
     };
 
-    // Author, committer and message of each commit: pushed too.
-    await collect(['log', '--format=%an%n%ae%n%cn%n%ce%n%B', ...perCommit], {}, (line) => out.add(line));
+    // The commit objects are pushed too. Read each exactly as stored (`cat-file --batch`): every
+    // header, including an extra header a hand-built commit carries and the `encoding` header, which
+    // `--pretty=raw` does not print. Then each message as git displays it (re-encoded to UTF-8).
+    const commits = await run(ws.path, ['rev-list', range], this.local);
+    if (commits.code !== 0) throw new Error(`git rev-list failed: ${commits.stderr.trim() || `exit ${commits.code}`}`);
+    const shas = commits.stdout.split('\n').filter((l) => SHA_RE.test(l));
+    if (shas.length > 0) await collect(['cat-file', '--batch'], {}, (line) => out.add(line), `${shas.join('\n')}\n`);
+    await collect(['log', '--format=%B', ...perCommit], {}, (line) => out.add(line));
 
     // Added lines only (`+` lines inside hunks; the `+++` file header is outside them, so an added
     // line that itself starts with `++` is kept). `--text` diffs every file as text, so neither real

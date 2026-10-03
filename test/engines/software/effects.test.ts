@@ -281,6 +281,19 @@ describe('runSoftwareEffect', () => {
         expect(err.message).toMatch(/known-secret-value/);
       });
 
+      it('commit_push refuses a hand-built commit carrying the key in a custom header on an unchanged tree', async () => {
+        const ws = await provider.prepare(chain(), job());
+        const tree = git(ws.path, ['rev-parse', 'HEAD^{tree}']);
+        const obj =
+          `tree ${tree}\nparent ${ws.seedSha}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n` +
+          `x-note ${API_KEY}\n\nharmless message\n`;
+        const c = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: ws.path, env: GIT_TEST_ENV, input: obj, encoding: 'utf8' }).trim();
+        git(ws.path, ['reset', '-q', '--soft', c]);
+        const err = await refuse(ws);
+        expect(err.message).toMatch(/known-secret-value/);
+        expect(err.message).not.toContain(API_KEY);
+      });
+
       it('a clean change still pushes', async () => {
         const ws = await provider.prepare(chain(), job());
         writeFileSync(join(ws.path, 'clean.ts'), 'export const answer = 42;\n');
