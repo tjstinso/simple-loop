@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS dead_letters (
   error TEXT NOT NULL,
   step_log_path TEXT,
   created_at INTEGER NOT NULL,
-  resolved_at INTEGER
+  resolved_at INTEGER,
+  -- Set once the chain's engine surfaced the dead letter; NULL rows are retried by maintenance.
+  surfaced_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS dead_letters_job ON dead_letters(job_id);
 `;

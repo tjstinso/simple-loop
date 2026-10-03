@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { deadLetter, discardDeadLetter, listDeadLetters, retryDeadLetter } from '../../src/kernel/dlq.js';
 import { EngineRegistry } from '../../src/kernel/engine-registry.js';
+import { processDelivery } from '../../src/kernel/process-delivery.js';
 import { createKernel, type Kernel } from '../../src/kernel/kernel.js';
 import { DuplicateChainError, claimNext, getChain, getJob, listJobsForChain } from '../../src/kernel/queue.js';
 import type { Engine, Job } from '../../src/kernel/types.js';
@@ -399,6 +401,59 @@ describe('worker loop', () => {
     expect((errors[0]!.err as Error).message).toContain('surface failed');
     expect(errors[0]!.job).toMatchObject({ id: first.job.id });
     expect(surfaced).toEqual([{ chainId: second.chain.id, state: { count: 0 }, jobId: second.job.id, reason: 'max_deliveries' }]);
+  });
+
+  it('a failed surfacing is retried by the next maintenance and then marked', async () => {
+    const s = track(setup());
+    const { job } = await s.kernel.enqueue('echo', { key: 'a' });
+    claimNext(s.db, 'w1', NOW, LEASE);
+    let fail = true;
+    let attempts = 0;
+    s.echo.surfaceDeadLetter = async (_chain, dl) => {
+      attempts++;
+      if (fail) throw new Error('502 bad gateway');
+      s.echo.calls.surfaced.push(dl);
+    };
+    // A delivery dead-letters the job; its own surfacing fails.
+    s.fake.script('echo', [new Error('boom')]);
+    const reported: string[] = [];
+    s.kernel.deps.onError = (_err, context) => reported.push(context);
+    await processDelivery(s.kernel.deps, getJob(s.db, job.id), 'w1', new AbortController().signal);
+    expect(listDeadLetters(s.db)[0]).toMatchObject({ jobId: job.id, surfacedAt: null });
+    expect(reported).toHaveLength(1);
+
+    // Maintenance retries; the host is still failing: the error is reported, the row stays unsurfaced.
+    const errors: Array<{ err: unknown; job?: Job }> = [];
+    await runMaintenance(s.kernel.deps, { onError: (err, j) => errors.push({ err, job: j }) });
+    expect(errors.map((e) => (e.err as Error).message)).toEqual(['502 bad gateway']);
+    expect(errors[0]!.job).toMatchObject({ id: job.id });
+    expect(listDeadLetters(s.db)[0]!.surfacedAt).toBeNull();
+
+    // The host recovers: the next maintenance surfaces and marks it; later passes leave it alone.
+    fail = false;
+    vi.setSystemTime(NOW + 5_000);
+    await runMaintenance(s.kernel.deps, { onError: (err, j) => errors.push({ err, job: j }) });
+    expect(errors).toHaveLength(1);
+    expect(s.echo.calls.surfaced.map((d) => d.jobId)).toEqual([job.id]);
+    expect(listDeadLetters(s.db)[0]!.surfacedAt).toBe(NOW + 5_000);
+    await runMaintenance(s.kernel.deps, { onError: (err, j) => errors.push({ err, job: j }) });
+    expect(attempts).toBe(3);
+  });
+
+  it("maintenance does not surface a resolved or cancelled chain's dead letter", async () => {
+    const s = track(setup());
+    const retried = await s.kernel.enqueue('echo', { key: 'r' });
+    const discarded = await s.kernel.enqueue('echo', { key: 'd' });
+    for (const j of [retried.job, discarded.job]) {
+      claimNext(s.db, 'w1', NOW, LEASE);
+      deadLetter(s.db, { jobId: j.id, reason: 'runner_error', error: 'x' }, NOW);
+    }
+    retryDeadLetter(s.db, retried.job.id, NOW);
+    discardDeadLetter(s.db, discarded.job.id, NOW);
+    const errors: unknown[] = [];
+    await runMaintenance(s.kernel.deps, { onError: (err) => errors.push(err) });
+    expect(errors).toEqual([]);
+    expect(s.echo.calls.surfaced).toEqual([]);
   });
 
   it('registers itself and records children through RunHooks', async () => {

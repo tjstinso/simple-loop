@@ -135,7 +135,8 @@ describe('processDelivery', () => {
     const [dl] = listDeadLetters(s.db);
     expect(dl).toMatchObject({ jobId: job.id, reason: 'runner_error' });
     expect(dl.error).toMatch(/value/);
-    expect(s.engine.calls.surfaced).toEqual([dl]);
+    // The engine saw the row before it was marked surfaced.
+    expect(s.engine.calls.surfaced).toEqual([{ ...dl, surfacedAt: null }]);
     expect(getJob(s.db, job.id)).toMatchObject({ status: 'failed', result: null });
     expect(getChain(s.db, chain.id).status).toBe('dead_lettered');
     expect(s.engine.calls.transition).toHaveLength(0);
@@ -286,6 +287,36 @@ describe('processDelivery', () => {
     const job = s.claim();
     s.fake.script('echo', [{ value: 1 }]);
     expect(await processDelivery(s.deps, job, 'w1', signal())).toBe('dead_lettered');
+  });
+
+  it('marks a dead letter surfaced after a successful surfaceDeadLetter', async () => {
+    const s = setup();
+    s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', [{ value: 1 }]);
+    expect(await processDelivery(s.deps, job, 'w1', signal())).toBe('dead_lettered');
+    expect(s.engine.calls.surfaced).toHaveLength(1);
+    expect(listDeadLetters(s.db)[0]).toMatchObject({ jobId: job.id, surfacedAt: NOW });
+  });
+
+  it('leaves a dead letter unsurfaced and reports to deps.onError when surfacing or cleanup fails', async () => {
+    const s = setup();
+    const reported: Array<{ err: unknown; context: string }> = [];
+    s.deps.onError = (err, context) => reported.push({ err, context });
+    s.engine.surfaceDeadLetter = async () => {
+      throw new Error('surface broke');
+    };
+    s.engine.cleanup = async () => {
+      throw new Error('cleanup broke');
+    };
+    s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', [{ value: 1 }]);
+    expect(await processDelivery(s.deps, job, 'w1', signal())).toBe('dead_lettered');
+    expect(listDeadLetters(s.db)[0]).toMatchObject({ jobId: job.id, surfacedAt: null });
+    expect(reported.map((r) => (r.err as Error).message)).toEqual(['surface broke', 'cleanup broke']);
+    expect(reported[0]!.context).toMatch(new RegExp(`surfacing.*job ${job.id}`));
+    expect(reported[1]!.context).toMatch(new RegExp(`cleanup.*job ${job.id}`));
   });
 
   it("two engines register and each job is dispatched to its chain's engine", async () => {

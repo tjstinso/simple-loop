@@ -37,7 +37,7 @@ const job = (delivery = 1): Job => ({
 });
 const fence = (): EffectFence => ({ jobId: 42, delivery: 1, assertCurrent: () => {} });
 const dl = (): DeadLetter => ({
-  jobId: 42, chainId: 3, reason: 'max_deliveries', error: 'it exploded', stepLogPath: null, createdAt: 1, resolvedAt: null,
+  id: 1, jobId: 42, chainId: 3, reason: 'max_deliveries', error: 'it exploded', stepLogPath: null, createdAt: 1, resolvedAt: null, surfacedAt: null,
 });
 
 class RecordingGit implements GitPorts {

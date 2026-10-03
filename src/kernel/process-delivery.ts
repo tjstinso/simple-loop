@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import type { RunHooks, RunInput, Workspace } from '../runner/types.js';
-import { DeadLetterStateError, deadLetter } from './dlq.js';
+import { DeadLetterStateError, deadLetter, markDeadLetterSurfaced } from './dlq.js';
 import { commitTransition, getChain, recordResult } from './queue.js';
 import { EffectError, StaleDeliveryError } from './types.js';
 import type {
@@ -40,6 +40,15 @@ function isCurrent(db: Db, fence: Fence): boolean {
     | { status: string; delivery: number }
     | undefined;
   return r !== undefined && r.status === 'running' && r.delivery === fence.delivery;
+}
+
+/** Passes a swallowed error to `deps.onError`; a throwing handler is itself ignored. */
+export function report(deps: KernelDeps, err: unknown, context: string): void {
+  try {
+    deps.onError?.(err, context);
+  } catch {
+    // An error handler must never change an outcome.
+  }
 }
 
 function isTimeout(e: unknown): boolean {
@@ -113,8 +122,10 @@ export async function processDelivery(
     if (dl === 'stale') return 'stale';
     try {
       await engine.surfaceDeadLetter(view, dl);
-    } catch {
-      // Surfacing is best effort; the engine owns its own logging.
+      markDeadLetterSurfaced(db, dl.id, clock());
+    } catch (e) {
+      // Left unsurfaced: kernel maintenance retries it (surfacePending).
+      report(deps, e, `surfacing the dead letter of job ${job.id}`);
     }
     return 'dead_lettered';
   };
@@ -127,8 +138,9 @@ export async function processDelivery(
   } finally {
     try {
       await engine.cleanup(view, job);
-    } catch {
-      // Cleanup failures never change the outcome; the engine owns its own logging.
+    } catch (e) {
+      // Cleanup failures never change the outcome.
+      report(deps, e, `cleanup of job ${job.id} delivery ${job.delivery}`);
     }
   }
 }

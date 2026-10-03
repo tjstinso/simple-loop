@@ -55,6 +55,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       runners,
       policies,
       clock,
+      onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),
       config: {
         leaseMs: 300_000,
         heartbeatMs: 30_000,

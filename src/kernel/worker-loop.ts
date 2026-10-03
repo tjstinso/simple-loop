@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { readProcessStartTime } from '../util/proc.js';
 import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
-import { listDeadLetters } from './dlq.js';
+import { listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
 import { claimNext, getChain, getJob, renewLease, requeueJob } from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
 import { pruneHistory } from './retention.js';
@@ -56,8 +56,9 @@ const defaultOnError: ErrorHandler = (err, job) => {
 
 /**
  * Periodic kernel maintenance: reap expired leases (kill before reclaim,
- * requeue or dead-letter), surface each job the reaper dead-lettered through
- * its chain's engine, prune aged history, then run every engine's optional `sweep`. Errors are
+ * requeue or dead-letter), surface every dead letter not yet surfaced (the
+ * reaper's own, and any whose surfacing failed earlier) through its chain's
+ * engine, prune aged history, then run every engine's optional `sweep`. Errors are
  * passed to `onError` and never stop the remaining steps or other jobs.
  */
 export async function runMaintenance(
@@ -65,27 +66,17 @@ export async function runMaintenance(
   opts: { onError?: ErrorHandler; reap?: ReapOverrides } = {},
 ): Promise<void> {
   const onError = opts.onError ?? defaultOnError;
-  let deadLettered: number[] = [];
   try {
     const report = reapExpired(deps.db, {
       ...opts.reap,
       now: deps.clock(),
       maxDeliveries: deps.config.maxDeliveries,
     });
-    deadLettered = report.deadLettered;
     for (const e of report.errors) onError(new Error(`reaper: job ${e.jobId}: ${e.error}`));
   } catch (e) {
     onError(e);
   }
-  for (const jobId of deadLettered) {
-    let job: Job | undefined;
-    try {
-      job = getJob(deps.db, jobId);
-      await surfaceReaped(deps, job);
-    } catch (e) {
-      onError(e, job);
-    }
-  }
+  await surfacePending(deps, onError);
   try {
     pruneHistory(deps.db, deps.clock(), deps.config.historyRetentionDays ?? 30);
   } catch (e) {
@@ -102,22 +93,42 @@ export async function runMaintenance(
   }
 }
 
-/** Surfaces a reaper dead letter through the chain's engine (the reaper itself has no engine). */
-async function surfaceReaped(deps: KernelDeps, job: Job): Promise<void> {
-  const dl = listDeadLetters(deps.db, { unresolved: true }).find((d) => d.jobId === job.id);
-  if (!dl) return; // already retried or discarded
-  const chain = getChain(deps.db, job.chainId);
-  const engine = deps.engines.get(chain.engine);
-  const parsed = engine.stateSchema.safeParse(chain.engineState);
-  if (!parsed.success) throw new Error(`invalid engine state for chain ${chain.id}: ${parsed.error.message}`);
-  const view: ChainView<unknown> = {
-    id: chain.id,
-    engine: chain.engine,
-    subjectKey: chain.subjectKey,
-    status: chain.status,
-    state: parsed.data,
-  };
-  await engine.surfaceDeadLetter(view, dl);
+/**
+ * Surfaces every unresolved, not yet surfaced dead letter through its chain's engine (the reaper has
+ * no engine, and a delivery's own surfacing may have failed) and marks each one surfaced on success.
+ * A dead letter whose chain is no longer dead_lettered is skipped. Each error goes to `onError`
+ * (with the job when known) and the row stays unsurfaced for the next pass.
+ */
+async function surfacePending(deps: KernelDeps, onError: ErrorHandler): Promise<void> {
+  let pending;
+  try {
+    pending = listUnsurfacedDeadLetters(deps.db);
+  } catch (e) {
+    onError(e);
+    return;
+  }
+  for (const dl of pending) {
+    let job: Job | undefined;
+    try {
+      job = getJob(deps.db, dl.jobId);
+      const chain = getChain(deps.db, dl.chainId);
+      if (chain.status !== 'dead_lettered') continue;
+      const engine = deps.engines.get(chain.engine);
+      const parsed = engine.stateSchema.safeParse(chain.engineState);
+      if (!parsed.success) throw new Error(`invalid engine state for chain ${chain.id}: ${parsed.error.message}`);
+      const view: ChainView<unknown> = {
+        id: chain.id,
+        engine: chain.engine,
+        subjectKey: chain.subjectKey,
+        status: chain.status,
+        state: parsed.data,
+      };
+      await engine.surfaceDeadLetter(view, dl);
+      markDeadLetterSurfaced(deps.db, dl.id, deps.clock());
+    } catch (e) {
+      onError(e, job);
+    }
+  }
 }
 
 type Settled = DeliveryOutcome | 'threw' | 'timeout';

@@ -90,4 +90,18 @@ describe('Kernel.retryDeadLetter', () => {
     expect(listDeadLetters(s.db, { unresolved: true })).toEqual([]);
     s.close();
   });
+
+  it('Kernel.retryDeadLetter reports a hook error to deps.onError and keeps the retry', async () => {
+    const boom = new Error('hook failed');
+    const s = setup(async () => {
+      throw boom;
+    });
+    const reported: Array<{ err: unknown; context: string }> = [];
+    s.kernel.deps.onError = (err, context) => reported.push({ err, context });
+    const { job } = await s.deadLettered();
+    await s.kernel.retryDeadLetter(job.id);
+    expect(reported).toEqual([{ err: boom, context: `afterRetry for job ${job.id}` }]);
+    expect(getJob(s.db, job.id).status).toBe('queued');
+    s.close();
+  });
 });

@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { migrate, openDb } from './db.js';
 import { retryDeadLetter } from './dlq.js';
+import { report } from './process-delivery.js';
 import { createChain, getChain } from './queue.js';
 import type { Chain, ChainView, Job, KernelDeps } from './types.js';
 import { startWorker, type Worker, type WorkerOptions } from './worker-loop.js';
@@ -16,7 +17,7 @@ export interface Kernel {
   /**
    * Re-queue a dead-lettered job (`retryDeadLetter` in dlq.ts), then call the chain engine's
    * optional `afterRetry` hook with the chain view and the re-queued job. A hook error is
-   * swallowed; the retry stands. Rejects (nothing changed) when the retry itself is refused.
+   * passed to `deps.onError` and otherwise swallowed; the retry stands. Rejects (nothing changed) when the retry itself is refused.
    */
   retryDeadLetter(jobId: number): Promise<Job>;
   startWorker(opts?: WorkerOptions): Worker;
@@ -83,8 +84,9 @@ export function createKernel(
           };
           await engine.afterRetry(view, job);
         }
-      } catch {
-        // Best effort: the retry already committed and the kernel has no logger.
+      } catch (e) {
+        // Best effort: the retry already committed.
+        report(deps, e, `afterRetry for job ${jobId}`);
       }
       return job;
     },

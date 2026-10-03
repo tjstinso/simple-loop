@@ -13,6 +13,7 @@ interface DeadLetterRow {
   step_log_path: string | null;
   created_at: number;
   resolved_at: number | null;
+  surfaced_at: number | null;
 }
 
 /** Thrown by deadLetter when the job or its chain is already in a terminal state. */
@@ -25,6 +26,7 @@ export class DeadLetterStateError extends Error {
 
 function rowToDeadLetter(r: DeadLetterRow): DeadLetter {
   return {
+    id: r.id,
     jobId: r.job_id,
     chainId: r.chain_id,
     reason: r.reason as DeadLetterReason,
@@ -32,6 +34,7 @@ function rowToDeadLetter(r: DeadLetterRow): DeadLetter {
     stepLogPath: r.step_log_path,
     createdAt: r.created_at,
     resolvedAt: r.resolved_at,
+    surfacedAt: r.surfaced_at,
   };
 }
 
@@ -96,6 +99,19 @@ export function listDeadLetters(db: Db, opts: { unresolved?: boolean } = {}): De
     .prepare(`SELECT * FROM dead_letters ${where} ORDER BY created_at DESC, id DESC`)
     .all() as DeadLetterRow[];
   return rows.map(rowToDeadLetter);
+}
+
+/** Unresolved dead letters not yet surfaced by their engine, oldest first (retried by maintenance). */
+export function listUnsurfacedDeadLetters(db: Db): DeadLetter[] {
+  const rows = db
+    .prepare('SELECT * FROM dead_letters WHERE resolved_at IS NULL AND surfaced_at IS NULL ORDER BY id')
+    .all() as DeadLetterRow[];
+  return rows.map(rowToDeadLetter);
+}
+
+/** Records that the engine surfaced dead letter `id` (first success wins). */
+export function markDeadLetterSurfaced(db: Db, id: number, now: number): void {
+  db.prepare('UPDATE dead_letters SET surfaced_at = ? WHERE id = ? AND surfaced_at IS NULL').run(now, id);
 }
 
 /**

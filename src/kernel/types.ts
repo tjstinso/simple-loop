@@ -70,6 +70,7 @@ export interface ChainView<S> {
 }
 
 export interface DeadLetter {
+  id: number;
   jobId: number;
   chainId: number;
   reason: DeadLetterReason;
@@ -77,6 +78,8 @@ export interface DeadLetter {
   stepLogPath: string | null;
   createdAt: number;
   resolvedAt: number | null;
+  /** When the engine surfaced it (null: not yet, or every attempt so far failed). */
+  surfacedAt: number | null;
 }
 
 export class EffectError extends Error {
@@ -169,4 +172,10 @@ export interface KernelDeps {
     /** History tables are pruned by age after this many days (default 30). */
     historyRetentionDays?: number;
   };
+  /**
+   * Receives errors the kernel swallows so they never change an outcome: dead-letter surfacing and
+   * cleanup failures in a delivery, and errors from engine hooks (`afterRetry`, `afterCancel`).
+   * `context` names what failed. Default: ignored.
+   */
+  onError?: (err: unknown, context: string) => void;
 }

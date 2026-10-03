@@ -317,6 +317,7 @@ describe('software engine scenarios', () => {
 
     expect(h.deadLetters()).toEqual([
       {
+        id: expect.any(Number),
         jobId: job.id,
         chainId: chain.id,
         reason: 'max_deliveries',
@@ -324,6 +325,7 @@ describe('software engine scenarios', () => {
         stepLogPath: null,
         createdAt: deadAt,
         resolvedAt: null,
+        surfacedAt: deadAt,
       },
     ]);
     expect(h.jobs(chain.id)).toEqual([expect.objectContaining({ status: 'failed', delivery: 3 })]);

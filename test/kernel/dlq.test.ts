@@ -1,7 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { openDb, migrate } from '../../src/kernel/db.js';
 import { claimNext, createChain, getChain, getJob, recordResult } from '../../src/kernel/queue.js';
-import { DeadLetterStateError, deadLetter,discardDeadLetter, listDeadLetters, retryDeadLetter } from '../../src/kernel/dlq.js';
+import {
+  DeadLetterStateError,
+  deadLetter,
+  discardDeadLetter,
+  listDeadLetters,
+  listUnsurfacedDeadLetters,
+  markDeadLetterSurfaced,
+  retryDeadLetter,
+} from '../../src/kernel/dlq.js';
 
 function mk() {
   const db = openDb(':memory:');
@@ -161,5 +169,26 @@ describe('dead-letter queue', () => {
     discardDeadLetter(db, a.job.id, 300);
     expect(listDeadLetters(db).map((d) => d.jobId)).toEqual([b.id, a.job.id]);
     expect(listDeadLetters(db, { unresolved: true }).map((d) => d.jobId)).toEqual([b.id]);
+  });
+
+  it('a new dead letter is unsurfaced until markDeadLetterSurfaced records the time', () => {
+    const db = mk();
+    const { job } = setup(db);
+    const dl = deadLetter(db, { jobId: job.id, reason: 'timeout', error: 'x' }, 200);
+    expect(dl).toMatchObject({ id: expect.any(Number), surfacedAt: null });
+    expect(listUnsurfacedDeadLetters(db).map((d) => d.jobId)).toEqual([job.id]);
+    markDeadLetterSurfaced(db, dl.id, 250);
+    expect(listDeadLetters(db)[0]).toMatchObject({ jobId: job.id, surfacedAt: 250 });
+    expect(listUnsurfacedDeadLetters(db)).toEqual([]);
+  });
+
+  it('listUnsurfacedDeadLetters skips resolved dead letters', () => {
+    const db = mk();
+    const a = setup(db, 'a');
+    const b = setup(db, 'b');
+    deadLetter(db, { jobId: a.job.id, reason: 'timeout', error: 'x' }, 200);
+    deadLetter(db, { jobId: b.job.id, reason: 'timeout', error: 'y' }, 201);
+    discardDeadLetter(db, a.job.id, 300);
+    expect(listUnsurfacedDeadLetters(db).map((d) => d.jobId)).toEqual([b.job.id]);
   });
 });
