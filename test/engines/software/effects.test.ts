@@ -317,6 +317,7 @@ describe('runSoftwareEffect', () => {
 
   it('the closed-issue check re-reads the issue through the transient retry', async () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.setPrHead(pr.number, 'seed'); // the head the review workspace was seeded from
     host.failNext('getIssue', new GitHostError('bad gateway', 502));
     await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: job({ type: 'review' }) }), fence());
     expect(host.prs.get(pr.number)?.state).toBe('merged');
@@ -380,6 +381,32 @@ describe('runSoftwareEffect', () => {
     expect(err).toBeInstanceOf(EffectError);
     expect((err as EffectError).reason).toBe('effect_error');
     expect((err as Error).message).toBe('no PR found for label target');
+  });
+
+  it("merge_pr pins the review workspace's seed sha (the head the reviewer saw), and does not pin without a workspace", async () => {
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.setPrHead(pr.number, 'pushed-after-review');
+    const review = job({ type: 'review' });
+    const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as Error).message).toBe('merge refused: head commit changed');
+    expect(host.calls.filter((c) => c.method === 'mergePr').map((c) => c.args)).toEqual([[REPO, pr.number, { expectHeadSha: 'seed' }]]);
+    expect(host.prs.get(pr.number)?.state).toBe('open');
+
+    host.setPrHead(pr.number, 'seed');
+    await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence());
+    expect(host.prs.get(pr.number)?.state).toBe('merged');
+
+    // After a crash resume the workspace is gone: merge without a pin.
+    const other = await host.openPr(REPO, { head: 'factory/issue-9', base: 'main', title: 't', body: 'b' });
+    host.addIssue({ number: 9, title: 'nine', body: 'b', labels: [] });
+    host.calls.length = 0;
+    await runSoftwareEffect(
+      { kind: 'merge_pr' },
+      ctx({ job: review, workspace: null, chain: chain({ issueNumber: 9, branch: 'factory/issue-9' }) }),
+      fence(),
+    );
+    expect(host.calls.filter((c) => c.method === 'mergePr').map((c) => c.args)).toEqual([[REPO, other.number, undefined]]);
   });
 
   it('merge_pr checks PR state first and is a no-op when already merged', async () => {

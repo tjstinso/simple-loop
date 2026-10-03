@@ -184,8 +184,11 @@ async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   // `automatic` must not merge code for an issue someone closed meanwhile.
   await openIssue(ctx);
   fence.assertCurrent();
+  // Pin the merge to the head the reviewer saw: the review delivery was seeded from it. After a crash
+  // resume the workspace is gone (null) and the merge is not pinned.
+  const pin = ctx.workspace ? { expectHeadSha: ctx.workspace.seedSha } : undefined;
   try {
-    await ctx.host.mergePr(repo, pr.number);
+    await ctx.host.mergePr(repo, pr.number, pin);
   } catch (err) {
     if (err instanceof GitHostError && (err.status === 405 || err.status === 409)) {
       throw new EffectError(`merge refused: ${err.message}`, 'effect_error');

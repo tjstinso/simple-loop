@@ -25,7 +25,11 @@ export interface GitHost {
   comment(repo: string, n: number, body: string): Promise<void>;
   findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null>;
   createIssue(repo: string, args: { title: string; body: string; labels: string[] }): Promise<number>;
-  mergePr(repo: string, n: number): Promise<void>;
+  /**
+   * Merge the PR. With `expectHeadSha`, refuse (GitHostError) when the PR head is no longer that
+   * commit, so code nobody reviewed is never merged.
+   */
+  mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void>;
 }
 
 export class GitHostError extends Error {
@@ -131,8 +135,17 @@ export const buildCreateIssueArgs = (repo: string): string[] => [
 ];
 
 // `gh pr merge` handles merge-method flags and auto-detects the repo/branch rules.
-export const buildMergePrArgs = (repo: string, n: number, method: MergeMethod): string[] => [
+// --delete-branch removes factory/issue-<n> after the merge, so a later resubmit of the issue does not
+// seed from a stale merged branch; --match-head-commit refuses the merge if the head moved.
+export const buildMergePrArgs = (
+  repo: string,
+  n: number,
+  method: MergeMethod,
+  opts: { deleteBranch?: boolean; matchHeadCommit?: string } = {},
+): string[] => [
   'pr', 'merge', String(n), '--repo', repo, `--${method}`,
+  ...(opts.deleteBranch ? ['--delete-branch'] : []),
+  ...(opts.matchHeadCommit !== undefined ? ['--match-head-commit', opts.matchHeadCommit] : []),
 ];
 
 // ---- Adapter ----
@@ -158,11 +171,13 @@ export class GhCliHost implements GitHost {
   private readonly exec: ExecFn;
   private readonly mergeMethod: MergeMethod;
   private readonly ghTimeoutMs: number;
+  private readonly deleteBranch: boolean;
 
-  constructor(opts: { exec?: ExecFn; mergeMethod?: MergeMethod; ghTimeoutMs?: number } = {}) {
+  constructor(opts: { exec?: ExecFn; mergeMethod?: MergeMethod; ghTimeoutMs?: number; deleteBranch?: boolean } = {}) {
     this.exec = opts.exec ?? defaultExec;
     this.mergeMethod = opts.mergeMethod ?? 'squash';
     this.ghTimeoutMs = opts.ghTimeoutMs ?? GH_TIMEOUT_MS;
+    this.deleteBranch = opts.deleteBranch ?? true;
   }
 
   private async run(args: string[], input?: unknown): Promise<string> {
@@ -272,7 +287,12 @@ export class GhCliHost implements GitHost {
     return r.number;
   }
 
-  async mergePr(repo: string, n: number): Promise<void> {
-    await this.run(buildMergePrArgs(repo, n, this.mergeMethod));
+  async mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void> {
+    await this.run(
+      buildMergePrArgs(repo, n, this.mergeMethod, {
+        deleteBranch: this.deleteBranch,
+        ...(opts?.expectHeadSha !== undefined ? { matchHeadCommit: opts.expectHeadSha } : {}),
+      }),
+    );
   }
 }

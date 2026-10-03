@@ -112,10 +112,33 @@ describe('software engine scenarios', () => {
     expect(c.status).toBe('completed');
     expect(c.state.phase).toBe('merged');
     expect(h.pr(BRANCH)).toMatchObject({ number: 8, state: 'merged' });
-    expect(h.host.calls.filter((x) => x.method === 'mergePr').map((x) => x.args)).toEqual([['o/r', 8]]);
+    // Pinned to the head the reviewer saw (the review delivery's seed).
+    expect(h.host.calls.filter((x) => x.method === 'mergePr').map((x) => x.args)).toEqual([
+      ['o/r', 8, { expectHeadSha: h.remoteHead(BRANCH) }],
+    ]);
     expect(h.issueLabels(N)).toEqual(['factory:profile:automatic']);
     expect(h.remoteFile(BRANCH, 'attempt-1.txt')).toBe('attempt 1');
     expect(deliveryDirs(h, chain.id)).toEqual([]);
+  });
+
+  it('automatic: a push to the PR branch after the review started blocks the merge', async () => {
+    const h = harness();
+    const { chain } = await h.submit(N, ['factory:profile:automatic']);
+    writesPerAttempt(h);
+    h.scriptReview(() => {
+      h.remote.commit(BRANCH, 'sneaky.txt', 'unreviewed\n'); // lands while the reviewer looks at the old head
+      return { verdict: 'approve', feedback: 'ship it' };
+    });
+    const outcomes = await h.runUntilIdle();
+    expect(outcomes.map((o) => [o.type, o.outcome])).toEqual([
+      ['execute', 'succeeded'],
+      ['review', 'dead_lettered'],
+    ]);
+    expect(h.pr(BRANCH)).toMatchObject({ state: 'open' });
+    expect(h.deadLetters()).toEqual([
+      expect.objectContaining({ reason: 'effect_error', error: "effect 'merge_pr' failed: merge refused: head commit changed" }),
+    ]);
+    expect(h.chain(chain.id).status).toBe('dead_lettered');
   });
 
   it('revise loop: two request_changes then approve', async () => {

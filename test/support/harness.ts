@@ -318,6 +318,9 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
       },
     };
 
+    // PR heads follow the real remote branch, so the merge pin compares real shas.
+    host.headShaOf = (branch) => h.remoteHead(branch);
+
     engine.runEffect = async (effect, ctx) => {
       if (h.beforeEffect) await h.beforeEffect(effect, ctx as RunEffectContext<SoftwareState>);
       return runEffect(effect, ctx);

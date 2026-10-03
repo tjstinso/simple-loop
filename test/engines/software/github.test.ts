@@ -49,6 +49,18 @@ describe('FakeGitHost', () => {
     await expect(gh.getIssue(R, 99)).rejects.toMatchObject({ status: 404, message: 'Not Found' });
   });
 
+  it('mergePr refuses (409) when the PR head is not the expected sha, and merges when it is', async () => {
+    const gh = new FakeGitHost();
+    const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
+    gh.setPrHead(pr.number, 'new-head');
+    await expect(gh.mergePr(R, pr.number, { expectHeadSha: 'reviewed-head' })).rejects.toMatchObject({
+      message: 'head commit changed', status: 409,
+    });
+    expect((await gh.getPr(R, pr.number)).state).toBe('open');
+    await gh.mergePr(R, pr.number, { expectHeadSha: 'new-head' });
+    expect((await gh.getPr(R, pr.number)).state).toBe('merged');
+  });
+
   it('mergePr is a no-op on an already merged PR', async () => {
     const gh = new FakeGitHost();
     const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
@@ -140,10 +152,20 @@ describe('GhCliHost', () => {
   it('mergePr passes the configured merge method', async () => {
     const a = stub([{}]);
     await new GhCliHost({ exec: a.exec }).mergePr(R, 9);
-    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash']]]);
+    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--delete-branch']]]);
     const b = stub([{}]);
     await new GhCliHost({ exec: b.exec, mergeMethod: 'rebase' }).mergePr(R, 9);
-    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--rebase']]]);
+    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--rebase', '--delete-branch']]]);
+  });
+
+  it('mergePr pins the reviewed head with --match-head-commit and deletes the branch unless disabled', async () => {
+    const sha = 'a'.repeat(40);
+    const a = stub([{}]);
+    await new GhCliHost({ exec: a.exec }).mergePr(R, 9, { expectHeadSha: sha });
+    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--delete-branch', '--match-head-commit', sha]]]);
+    const b = stub([{}]);
+    await new GhCliHost({ exec: b.exec, deleteBranch: false }).mergePr(R, 9);
+    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash']]]);
   });
 
   it('findComment pages until it finds the marker', async () => {

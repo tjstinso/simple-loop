@@ -21,6 +21,11 @@ export class FakeGitHost implements GitHost {
   private comments = new Map<number, string[]>();
   private nextNumber = 1;
   private failures = new Map<string, Error>();
+  /**
+   * When set, a PR's head sha is resolved from its branch on every read (the harness points this at
+   * the real temp remote), so pushes after opening are visible, as on GitHub.
+   */
+  headShaOf: ((branch: string) => string | null) | null = null;
 
   // ---- seeding / inspection ----
   addIssue(a: { number?: number; title: string; body: string; labels: string[]; state?: 'open' | 'closed' }): number {
@@ -71,8 +76,12 @@ export class FakeGitHost implements GitHost {
     return pr;
   }
 
+  private headOf(pr: StoredPr): string {
+    return this.headShaOf?.(pr.head) ?? pr.headSha;
+  }
+
   private view(pr: StoredPr): Pr {
-    return { number: pr.number, state: pr.state, headSha: pr.headSha, baseBranch: pr.baseBranch };
+    return { number: pr.number, state: pr.state, headSha: this.headOf(pr), baseBranch: pr.baseBranch };
   }
 
   // ---- GitHost ----
@@ -143,11 +152,15 @@ export class FakeGitHost implements GitHost {
     return this.addIssue({ title: a.title, body: a.body, labels: a.labels });
   }
 
-  async mergePr(repo: string, n: number): Promise<void> {
-    this.enter('mergePr', [repo, n]);
+  async mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void> {
+    this.enter('mergePr', [repo, n, opts]);
     const pr = this.prOrThrow(n);
     if (pr.state === 'merged') return;
     if (pr.state === 'closed') throw new GitHostError('not mergeable', 405);
+    // Like `gh pr merge --match-head-commit`: refuse when the head moved.
+    if (opts?.expectHeadSha !== undefined && opts.expectHeadSha !== this.headOf(pr)) {
+      throw new GitHostError('head commit changed', 409);
+    }
     pr.state = 'merged';
   }
 }
