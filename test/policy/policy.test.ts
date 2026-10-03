@@ -47,6 +47,29 @@ describe('policy matching', () => {
   });
 });
 
+describe('PolicyStore validation', () => {
+  it('rejects two default policies of the same kind and names both ids', () => {
+    const mk = () =>
+      new PolicyStore([p('d1', [], { default: true }), p('d2', [], { default: true })]);
+    expect(mk).toThrow(/d1.*d2/);
+  });
+  it('accepts one default per kind for different kinds, and a default of kind A is not returned for kind B', () => {
+    const s = new PolicyStore([
+      p('da', [], { default: true, kind: 'A' }),
+      p('db', [], { default: true, kind: 'B' }),
+    ]);
+    expect(s.match('A', []).id).toBe('da');
+    expect(s.match('B', []).id).toBe('db');
+    expect(() => s.match('C', [])).toThrow(NoPolicyError);
+  });
+  it('rejects a default policy with non-empty match.labels', () => {
+    expect(() => new PolicyStore([p('d', ['x'], { default: true })])).toThrow(/d/);
+  });
+  it('rejects a non-default policy with empty match.labels', () => {
+    expect(() => new PolicyStore([p('n', [])])).toThrow(/n/);
+  });
+});
+
 describe('loadPolicies', () => {
   it('loads valid yaml files', () => {
     const d = tmp({

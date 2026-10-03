@@ -40,9 +40,26 @@ export class PolicyStore {
 
   constructor(policies: Policy[]) {
     this.policies = policies;
+    const defaults = new Map<string, string>();
     for (const p of policies) {
       if (this.ids.has(p.id)) throw new Error(`duplicate policy id '${p.id}'`);
       this.ids.set(p.id, p);
+      if (p.default) {
+        if (p.match.labels.length > 0) {
+          throw new Error(`default policy '${p.id}' must have empty match.labels`);
+        }
+        const prior = defaults.get(p.kind);
+        if (prior !== undefined) {
+          throw new Error(
+            `multiple default policies for kind '${p.kind}': '${prior}' and '${p.id}'`,
+          );
+        }
+        defaults.set(p.kind, p.id);
+      } else if (p.match.labels.length === 0) {
+        throw new Error(
+          `non-default policy '${p.id}' must have non-empty match.labels (missing default: true?)`,
+        );
+      }
     }
   }
 
