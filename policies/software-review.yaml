@@ -11,8 +11,13 @@ config:
   timeoutMs: 900000
   inactivityTimeoutMs: 600000
   resultFormat: json
-  # Load only the operator's user settings: the branch under review was written by the execute
-  # agent and must not supply hooks or permission rules through its own .claude/settings.json.
+  # Bare mode: `claude --bare`, an allow-listed environment and an empty per-run HOME, so the agent
+  # starts with no ambient credentials. Needs ANTHROPIC_API_KEY in the worker's environment (or a
+  # provider's variables in passEnv). Not a sandbox: see README "Credentials".
+  bare: true
+  # Load only user settings: the branch under review was written by the execute agent and must not
+  # supply hooks or permission rules through its own .claude/settings.json. In bare mode HOME is an
+  # empty per-run directory, so no user settings exist either.
   settingSources: user
   prompt: |
     You are reviewing a pull request branch that is checked out read-only in the current

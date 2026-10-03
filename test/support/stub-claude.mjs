@@ -15,8 +15,10 @@
 //   exit-nonzero  write to stderr and exit 3 with no result event
 //   orphan     spawn a grandchild that holds stdout open, emit a result, exit 0
 //
-// When STUB_PID_FILE is set, the stub writes {"pid":..,"grandchild":..} to it
-// (after spawning the grandchild, if any) so tests can verify process death.
+// When STUB_PID_FILE is set, the stub writes {"pid":..,"grandchild":..,"home":..} to it
+// (after spawning the grandchild, if any) so tests can verify process death and
+// the removal of the per-run HOME. With STUB_LIST_HOME set, echo mode also reports
+// the entries of HOME and of each XDG_*_HOME directory as `homeEntries`.
 import { spawn } from 'node:child_process';
 import { readdirSync, writeFileSync } from 'node:fs';
 
@@ -34,7 +36,7 @@ function spawnGrandchild(stdout = 'ignore') {
 
 function writePids(grandchild) {
   if (process.env.STUB_PID_FILE) {
-    writeFileSync(process.env.STUB_PID_FILE, JSON.stringify({ pid: process.pid, grandchild }));
+    writeFileSync(process.env.STUB_PID_FILE, JSON.stringify({ pid: process.pid, grandchild, home: process.env.HOME ?? null }));
   }
 }
 
@@ -59,6 +61,16 @@ switch (mode) {
         payload.ghConfigEntries = readdirSync(process.env.GH_CONFIG_DIR ?? '');
       } catch {
         payload.ghConfigEntries = null;
+      }
+    }
+    if (process.env.STUB_LIST_HOME) {
+      payload.homeEntries = {};
+      for (const k of ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) {
+        try {
+          payload.homeEntries[k] = readdirSync(process.env[k] ?? '');
+        } catch {
+          payload.homeEntries[k] = null;
+        }
       }
     }
     // Escape backticks so the prompt's own ``` fences cannot end the block early.

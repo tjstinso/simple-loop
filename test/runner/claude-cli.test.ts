@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeCliRunner, childEnv } from '../../src/runner/claude-cli.js';
+import { loadPolicies } from '../../src/policy/store.js';
 import { parseStreamLine } from '../../src/runner/stream.js';
 import type { RunHooks, RunInput } from '../../src/runner/types.js';
 import type { Job } from '../../src/kernel/types.js';
@@ -89,8 +90,25 @@ function input(over: Partial<RunInput> & { config?: unknown } = {}): RunInput {
   };
 }
 
+// Bare mode (the default) refuses to start without a model credential, so the stub runner
+// supplies a fake ANTHROPIC_API_KEY through the constructor env (the stub never uses it).
 function runner(mode: string, extraEnv: Record<string, string> = {}): ClaudeCliRunner {
-  return new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: mode, ...extraEnv } });
+  return new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: mode, ANTHROPIC_API_KEY: 'test-key', ...extraEnv } });
+}
+
+/** Runs `fn` with `vars` set in process.env (undefined deletes), restoring the environment afterwards. */
+async function withParentEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const saved = { ...process.env };
+  for (const [k, v] of Object.entries(vars)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
 }
 
 /** Hooks that remember the spawned pid so afterEach can reap it on failure. */
@@ -265,7 +283,7 @@ describe('ClaudeCliRunner', () => {
     process.env.FACTORY_KEEP_ME = 'kept';
     process.env.GH_CONFIG_DIR = '/home/operator/.config/gh';
     try {
-      const inp = input({ config: config({ resultFormat: 'json' }) });
+      const inp = input({ config: config({ resultFormat: 'json', bare: false }) });
       const { env } = (await runner('echo', { EXTRA_OVERRIDE: 'yes' }).run(inp, signal())) as { env: Record<string, string> };
       expect(env.GH_TOKEN).toBeUndefined();
       expect(env.GITHUB_TOKEN).toBeUndefined();
@@ -294,7 +312,7 @@ describe('ClaudeCliRunner', () => {
       HOME: process.env.HOME ?? '/home/me',
     });
     try {
-      const inp = input({ config: config({ resultFormat: 'json' }) });
+      const inp = input({ config: config({ resultFormat: 'json', bare: false }) });
       const { env } = (await runner('echo').run(inp, signal())) as { env: Record<string, string> };
       for (const k of ['SSH_AUTH_SOCK', 'SSH_ASKPASS', 'GIT_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH']) {
         expect(env[k], k).toBeUndefined();
@@ -366,8 +384,244 @@ describe('ClaudeCliRunner', () => {
   });
 
   it('rejects when the binary cannot be spawned', async () => {
-    const r = new ClaudeCliRunner({ bin: join(tmpdir(), 'definitely-not-a-claude-binary') });
+    const r = new ClaudeCliRunner({ bin: join(tmpdir(), 'definitely-not-a-claude-binary'), env: { ANTHROPIC_API_KEY: 'test-key' } });
     await expect(r.run(input(), signal())).rejects.toThrow();
+  });
+});
+
+describe('ClaudeCliRunner bare mode (R47)', () => {
+  const ALLOWED = new Set([
+    'PATH', 'LANG', 'TERM', 'TZ', 'TMPDIR', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+    'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    // set by the runner itself
+    'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GH_CONFIG_DIR',
+    // the test's constructor env
+    'STUB_MODE', 'STUB_LIST_HOME', 'STUB_LIST_GH_CONFIG',
+  ]);
+
+  it('the config schema defaults bare to true', () => {
+    const parsed = new ClaudeCliRunner().configSchema.parse(config()) as { bare: boolean };
+    expect(parsed.bare).toBe(true);
+  });
+
+  it('bare mode adds --bare and --add-dir for the worktree', async () => {
+    const inp = input({ config: config({ resultFormat: 'json', settingSources: 'user' }) });
+    const { argv } = (await runner('echo').run(inp, signal())) as { argv: string[] };
+    expect(argv).toContain('--bare');
+    expect(argv).toContain(`--add-dir=${inp.workspace.path}`);
+    // still headless stream-json with the allow-list, the budget and the setting sources
+    expect(argv).toContain('-p');
+    expect(argv.join(' ')).toMatch(/--output-format stream-json/);
+    expect(argv).toContain('--verbose');
+    expect(argv.join(' ')).toMatch(/--permission-prompts none/);
+    expect(argv).toContain('--allowedTools=Read,Edit,Bash(git *)');
+    expect(argv.join(' ')).toMatch(/--max-budget-usd 1\.5/);
+    expect(argv.join(' ')).toMatch(/--setting-sources user/);
+    // every option comes before the `--` that precedes the prompt
+    const dashdash = argv.indexOf('--');
+    expect(argv.indexOf('--bare')).toBeLessThan(dashdash);
+    expect(argv.indexOf(`--add-dir=${inp.workspace.path}`)).toBeLessThan(dashdash);
+  });
+
+  it('bare mode loads the worktree CLAUDE.md through --add-dir, but not one symlinked outside the worktree', async () => {
+    const run = async (ws: string) =>
+      ((await runner('echo').run(input({ workspace: { path: ws }, config: config({ resultFormat: 'json' }) }), signal())) as { argv: string[] }).argv;
+    const extra = (argv: string[]) => argv.filter((a) => a.startsWith('--add-dir') || a.includes('system-prompt'));
+
+    const withFile = tmp('cli-ws-md-');
+    writeFileSync(join(withFile, 'CLAUDE.md'), '# rules');
+    expect(extra(await run(withFile))).toEqual([`--add-dir=${withFile}`]);
+
+    const without = tmp('cli-ws-nomd-');
+    expect(extra(await run(without))).toEqual([`--add-dir=${without}`]); // nothing beyond the directory itself
+
+    const inside = tmp('cli-ws-inlink-');
+    writeFileSync(join(inside, 'RULES.md'), '# rules');
+    symlinkSync(join(inside, 'RULES.md'), join(inside, 'CLAUDE.md'));
+    expect(extra(await run(inside))).toEqual([`--add-dir=${inside}`]);
+
+    const outsideWs = tmp('cli-ws-outlink-');
+    const outside = join(tmp('cli-outside-'), 'secret.md');
+    writeFileSync(outside, 'outside the worktree');
+    symlinkSync(outside, join(outsideWs, 'CLAUDE.md'));
+    const argv = await run(outsideWs);
+    expect(extra(argv)).toEqual([]);
+    expect(argv.some((a) => a.includes('secret.md') || a.includes('cli-outside-'))).toBe(false);
+    expect(argv).toContain('--bare');
+
+    const dangling = tmp('cli-ws-dangling-');
+    symlinkSync(join(tmpdir(), 'no-such-claude-md-target'), join(dangling, 'CLAUDE.md'));
+    expect(extra(await run(dangling))).toEqual([]);
+  });
+
+  it('bare mode passes only allow-listed environment variables', async () => {
+    const realHome = process.env.HOME ?? '/home/real';
+    await withParentEnv(
+      {
+        GH_TOKEN: 'gh-secret', GITHUB_TOKEN: 'github-secret', SSH_AUTH_SOCK: '/tmp/agent.sock',
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus', XDG_RUNTIME_DIR: '/run/user/1000',
+        GIT_ASKPASS: '/bin/askpass', AWS_SECRET_ACCESS_KEY: 'aws-secret', GNOME_KEYRING_CONTROL: '/run/user/1000/keyring',
+        KRB5CCNAME: 'FILE:/tmp/krb', GOOGLE_APPLICATION_CREDENTIALS: '/x.json', AZURE_CLIENT_SECRET: 'az',
+        FACTORY_RANDOM: 'not-allowed', HOME: '/home/real', ANTHROPIC_API_KEY: 'sk-parent', HTTPS_PROXY: 'http://proxy:3128',
+        LC_ALL: 'C.UTF-8', GH_CONFIG_DIR: '/home/real/.config/gh', XDG_CONFIG_HOME: '/home/real/.config',
+      },
+      async () => {
+        const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'echo', STUB_LIST_HOME: '1' } });
+        const res = (await r.run(input({ config: config({ resultFormat: 'json' }) }), signal())) as {
+          env: Record<string, string>;
+          homeEntries: Record<string, string[] | null>;
+        };
+        const env = res.env;
+        const unexpected = Object.keys(env).filter((k) => !ALLOWED.has(k) && !k.startsWith('LC_'));
+        expect(unexpected).toEqual([]);
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-parent');
+        expect(env.HTTPS_PROXY).toBe('http://proxy:3128');
+        expect(env.LC_ALL).toBe('C.UTF-8');
+        for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'GIT_ASKPASS',
+          'AWS_SECRET_ACCESS_KEY', 'GNOME_KEYRING_CONTROL', 'KRB5CCNAME', 'GOOGLE_APPLICATION_CREDENTIALS', 'AZURE_CLIENT_SECRET', 'FACTORY_RANDOM']) {
+          expect(env[k], k).toBeUndefined();
+        }
+        expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+        expect(env.GIT_CONFIG_NOSYSTEM).toBe('1');
+        expect(env.HOME).not.toBe('/home/real');
+        expect(env.HOME).not.toBe(realHome);
+        expect(env.HOME).toMatch(/factory-run-/);
+        const scratch = join(env.HOME!, '..');
+        for (const k of ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) {
+          expect(env[k]!.startsWith(scratch), k).toBe(true);
+        }
+        expect(env.GH_CONFIG_DIR!.startsWith(scratch)).toBe(true);
+        // HOME and the XDG directories are empty when the agent starts
+        for (const [k, entries] of Object.entries(res.homeEntries)) expect(entries, k).toEqual([]);
+        // and the whole scratch directory is gone once the run settled
+        expect(existsSync(scratch)).toBe(false);
+      },
+    );
+  });
+
+  it('bare mode removes the scratch HOME after normal exit, abort, timeout and spawn failure', async () => {
+    const scratchRoot = tmp('cli-tmpdir-');
+    await withParentEnv({ TMPDIR: scratchRoot }, async () => {
+      const leftovers = () => readdirSync(scratchRoot).filter((e) => e.startsWith('factory-'));
+      // normal exit
+      const ok = (await runner('echo').run(input({ config: config({ resultFormat: 'json' }) }), signal())) as { env: Record<string, string> };
+      expect(ok.env.HOME!.startsWith(scratchRoot)).toBe(true);
+      expect(existsSync(ok.env.HOME!)).toBe(false);
+      expect(leftovers()).toEqual([]);
+
+      // timeout
+      const pidFile = join(tmp('cli-pids-'), 'pids.json');
+      const err = await runner('silent', { STUB_PID_FILE: pidFile })
+        .run(input({ config: config({ inactivityTimeoutMs: 300, timeoutMs: 10_000 }) }), signal(), trackingHooks())
+        .then(() => null, (e: unknown) => e);
+      expect((err as { reason?: string }).reason).toBe('timeout');
+      const timedOut = JSON.parse(readFileSync(pidFile, 'utf8')) as { home: string };
+      readPids(pidFile);
+      expect(timedOut.home.startsWith(scratchRoot)).toBe(true);
+      expect(existsSync(timedOut.home)).toBe(false);
+      expect(leftovers()).toEqual([]);
+
+      // abort
+      const pidFile2 = join(tmp('cli-pids-'), 'pids.json');
+      const ac = new AbortController();
+      const p = runner('silent', { STUB_PID_FILE: pidFile2 })
+        .run(input({ config: config({ inactivityTimeoutMs: 10_000, timeoutMs: 10_000 }) }), ac.signal, trackingHooks())
+        .then(() => null, (e: unknown) => e);
+      expect(await waitFor(() => existsSync(pidFile2), 3000)).toBe(true);
+      const aborted = JSON.parse(readFileSync(pidFile2, 'utf8')) as { home: string };
+      readPids(pidFile2);
+      expect(existsSync(aborted.home)).toBe(true); // present while the agent runs
+      ac.abort();
+      expect(await p).toMatchObject({ name: 'AbortError' });
+      expect(existsSync(aborted.home)).toBe(false);
+      expect(leftovers()).toEqual([]);
+
+      // spawn failure
+      const bad = new ClaudeCliRunner({ bin: join(scratchRoot, 'no-such-claude'), env: { ANTHROPIC_API_KEY: 'k' } });
+      await expect(bad.run(input(), signal())).rejects.toThrow();
+      expect(leftovers()).toEqual([]);
+    });
+  });
+
+  it('passEnv forwards named variables and rejects forbidden names', async () => {
+    const schema = new ClaudeCliRunner().configSchema;
+    expect(schema.safeParse(config({ passEnv: ['AWS_REGION', 'CLAUDE_CODE_USE_BEDROCK'] })).success).toBe(true);
+    for (const bad of ['GH_TOKEN', 'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'GIT_ASKPASS', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
+      'lower_case', '1ABC', 'A-B', '']) {
+      expect(schema.safeParse(config({ passEnv: [bad] })).success, bad).toBe(false);
+    }
+    await withParentEnv({ AWS_REGION: 'eu-west-1', AWS_SECRET_ACCESS_KEY: 'aws-secret', MY_PROVIDER_VAR: 'v' }, async () => {
+      const { env } = (await runner('echo').run(
+        input({ config: config({ resultFormat: 'json', passEnv: ['AWS_REGION', 'MY_PROVIDER_VAR', 'NOT_SET_ANYWHERE'] }) }),
+        signal(),
+      )) as { env: Record<string, string> };
+      expect(env.AWS_REGION).toBe('eu-west-1');
+      expect(env.MY_PROVIDER_VAR).toBe('v');
+      expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined(); // not named
+      expect('NOT_SET_ANYWHERE' in env).toBe(false);
+    });
+    // runtime: a config that skipped startup validation is still refused before anything is spawned
+    const hooks = trackingHooks();
+    await expect(runner('echo').run(input({ config: config({ passEnv: ['GH_TOKEN'] }) }), signal(), hooks)).rejects.toThrow(/passEnv/);
+    expect(hooks.spawned).toEqual([]);
+  });
+
+  it('bare mode fails fast with a clear message without ANTHROPIC_API_KEY', async () => {
+    const scratchRoot = tmp('cli-tmpdir-');
+    await withParentEnv({ ANTHROPIC_API_KEY: undefined, TMPDIR: scratchRoot }, async () => {
+      const hooks = trackingHooks();
+      const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'echo' } });
+      const err = await r.run(input(), signal(), hooks).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toMatch(/ANTHROPIC_API_KEY/);
+      expect((err as Error).message).toMatch(/passEnv/);
+      expect((err as Error).message).toMatch(/bare/);
+      expect(hooks.spawned).toEqual([]);
+      expect(readdirSync(scratchRoot).filter((e) => e.startsWith('factory-'))).toEqual([]); // no scratch HOME was created
+      // an empty key is not a key
+      process.env.ANTHROPIC_API_KEY = '';
+      await expect(r.run(input(), signal())).rejects.toThrow(/ANTHROPIC_API_KEY/);
+    });
+    await withParentEnv({ ANTHROPIC_API_KEY: undefined, MY_PROVIDER_SWITCH: '1' }, async () => {
+      const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'echo' } });
+      // a provider credential forwarded through passEnv satisfies the check
+      const res = (await r.run(input({ config: config({ resultFormat: 'json', passEnv: ['MY_PROVIDER_SWITCH'] }) }), signal())) as {
+        env: Record<string, string>;
+      };
+      expect(res.env.MY_PROVIDER_SWITCH).toBe('1');
+      // bare false does not check: the claude CLI uses its own login there
+      const deny = (await r.run(input({ config: config({ resultFormat: 'json', bare: false }) }), signal())) as { argv: string[] };
+      expect(deny.argv).not.toContain('--bare');
+    });
+  });
+
+  it('bare false keeps the previous deny-list behavior and no --bare', async () => {
+    await withParentEnv({ GH_TOKEN: 'gh-secret', SSH_AUTH_SOCK: '/tmp/a.sock', FACTORY_KEEP_ME: 'kept', HOME: '/home/real' }, async () => {
+      const res = (await runner('echo').run(input({ config: config({ resultFormat: 'json', bare: false }) }), signal())) as {
+        argv: string[];
+        env: Record<string, string>;
+      };
+      expect(res.argv).not.toContain('--bare');
+      expect(res.argv.filter((a) => a.startsWith('--add-dir'))).toEqual([]);
+      expect(res.env).toEqual(childEnv({ STUB_MODE: 'echo', ANTHROPIC_API_KEY: 'test-key' }, res.env.GH_CONFIG_DIR));
+      expect(res.env.HOME).toBe('/home/real');
+      expect(res.env.FACTORY_KEEP_ME).toBe('kept');
+      expect(res.env.GH_TOKEN).toBeUndefined();
+      expect(res.env.SSH_AUTH_SOCK).toBeUndefined();
+      expect(res.env.GH_CONFIG_DIR).toMatch(/factory-gh-/);
+    });
+  });
+
+  it('the shipped policies set bare true and validate', () => {
+    const schema = new ClaudeCliRunner().configSchema;
+    const policies = loadPolicies(join(import.meta.dirname, '../../policies'));
+    expect(policies).toHaveLength(2);
+    for (const p of policies) {
+      expect((p.config as { bare?: unknown }).bare, p.id).toBe(true);
+      expect(schema.safeParse(p.config).success, p.id).toBe(true);
+    }
   });
 });
 
