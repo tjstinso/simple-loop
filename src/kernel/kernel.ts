@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { validatePolicies } from '../policy/validate.js';
 import { migrate, openDb } from './db.js';
 import { cancelChain, discardDeadLetter, retryDeadLetter } from './dlq.js';
 import { report } from './process-delivery.js';
@@ -36,6 +37,8 @@ export function createKernel(
   opts: Omit<KernelDeps, 'db'> &
     ({ dbPath: string; migrations?: string[] } | { db: Database.Database }),
 ): Kernel {
+  // Fail fast at startup on a policy no engine or runner can serve (before anything is opened).
+  validatePolicies(opts.policies.all(), opts.engines, opts.runners);
   let db: Database.Database;
   let owned: boolean;
   let rest: Omit<KernelDeps, 'db'>;

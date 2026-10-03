@@ -5,13 +5,15 @@ import { AmbiguousMatchError, NoPolicyError, PolicyStore } from '../../../src/po
 import { FakeGitHost } from '../../support/fake-github.js';
 
 const BODY = '## Goal\nDo it\n\n## Acceptance criteria\n- works\n';
-const policy = (id: string, labels: string[] = [], def = false) =>
-  ({ id, kind: 'execute', match: { labels }, runner: 'fake', config: {}, default: def }) as any;
+const policy = (id: string, labels: string[] = [], def = false, kind = 'execute') =>
+  ({ id, kind, match: { labels }, runner: 'fake', config: {}, default: def }) as any;
+// Every software submit also resolves the review policy (R40), so the stores carry a review default.
+const reviewDefault = policy('r-default', [], true, 'review');
 
 function setup(over: { body?: string; labels?: string[]; state?: 'open' | 'closed'; policies?: PolicyStore } = {}) {
   const host = new FakeGitHost();
   const n = host.addIssue({ title: 't', body: over.body ?? BODY, labels: over.labels ?? [], state: over.state });
-  const policies = over.policies ?? new PolicyStore([policy('p-default', [], true)]);
+  const policies = over.policies ?? new PolicyStore([policy('p-default', [], true), reviewDefault]);
   const deps = {
     host,
     policies,
@@ -104,13 +106,27 @@ describe('softwareSubmit', () => {
     await expect(softwareSubmit({ issueUrl: none.url }, none.deps)).rejects.toBeInstanceOf(NoPolicyError);
     const amb = setup({
       labels: ['a', 'b'],
-      policies: new PolicyStore([policy('pa', ['a']), policy('pb', ['b'])]),
+      policies: new PolicyStore([policy('pa', ['a']), policy('pb', ['b']), reviewDefault]),
     });
     await expect(softwareSubmit({ issueUrl: amb.url }, amb.deps)).rejects.toBeInstanceOf(AmbiguousMatchError);
     const h = setup();
     const e = new GitHostError('boom', 500);
     h.host.failNext('getIssue', e);
     await expect(softwareSubmit({ issueUrl: h.url }, h.deps)).rejects.toBe(e);
+  });
+
+  it('fails at submit, before any job exists, when no review policy or an ambiguous one matches', async () => {
+    const none = setup({ policies: new PolicyStore([policy('p-default', [], true)]) });
+    await expect(softwareSubmit({ issueUrl: none.url }, none.deps)).rejects.toBeInstanceOf(NoPolicyError);
+    const amb = setup({
+      labels: ['a', 'b'],
+      policies: new PolicyStore([
+        policy('p-default', [], true), reviewDefault, policy('ra', ['a'], false, 'review'), policy('rb', ['b'], false, 'review'),
+      ]),
+    });
+    const err = await softwareSubmit({ issueUrl: amb.url }, amb.deps).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AmbiguousMatchError);
+    expect((err as Error).message).toMatch(/review.*ra, rb/);
   });
 
   it('matches required section headings by line, not by substring in prose', async () => {

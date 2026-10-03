@@ -63,6 +63,11 @@ export class PolicyStore {
     }
   }
 
+  /** Every policy, in load order. */
+  all(): Policy[] {
+    return [...this.policies];
+  }
+
   byId(id: string): Policy {
     const p = this.ids.get(id);
     if (!p) throw new Error(`unknown policy id '${id}'`);

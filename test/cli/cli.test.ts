@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run, type CliDeps } from '../../src/cli/index.js';
 import type { Runtime } from '../../src/cli/runtime.js';
@@ -229,5 +232,25 @@ describe('factory cli', () => {
     const { deps, closed } = setup();
     await run(['status'], deps);
     expect(closed()).toBe(0);
+  });
+
+  it('rejects an invalid policy before running any command, naming the policy (exit 1)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'factory-cli-policies-'));
+    try {
+      mkdirSync(join(dir, 'policies'));
+      writeFileSync(
+        join(dir, 'policies', 'bad.yaml'),
+        'id: broken-review\nkind: review\ndefault: true\nmatch:\n  labels: []\nrunner: claude-cli\nconfig:\n  prompt: x\n',
+      );
+      writeFileSync(join(dir, 'factory.config.json'), JSON.stringify({ dbPath: join(dir, 'f.db'), workspaceRoot: join(dir, 'ws') }));
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await run(['status'], { cwd: dir, stdout: (l) => out.push(l), stderr: (l) => err.push(l) });
+      expect(code).toBe(1);
+      expect(out).toEqual([]);
+      expect(err.join('\n')).toMatch(/^error: .*policy 'broken-review'.*invalid config for runner 'claude-cli'/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

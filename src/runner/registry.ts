@@ -8,6 +8,10 @@ export class RunnerRegistry {
     this.runners.set(r.name, r);
   }
 
+  has(name: string): boolean {
+    return this.runners.has(name);
+  }
+
   get(name: string): Runner {
     const r = this.runners.get(name);
     if (!r) throw new Error(`unknown runner: ${name}`);

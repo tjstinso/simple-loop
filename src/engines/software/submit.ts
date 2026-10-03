@@ -61,6 +61,9 @@ export async function softwareSubmit(
   }
   const profile = issue.labels.includes(PROFILE_AUTOMATIC_LABEL) ? 'automatic' : deps.config.defaultProfile;
   deps.policies.match('execute', issue.labels);
+  // The review job is matched with the same labels later; an ambiguous or missing review policy must
+  // fail here, not after the agent ran.
+  deps.policies.match('review', issue.labels);
   const state = SoftwareStateSchema.parse({
     repo,
     issueNumber: number,

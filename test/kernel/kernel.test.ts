@@ -7,11 +7,18 @@ import type { ChainView, Job } from '../../src/kernel/types.js';
 import { makeEchoEngine } from '../support/echo-engine.js';
 import { createKernel } from '../../src/kernel/kernel.js';
 import { PolicyStore } from '../../src/policy/store.js';
+import { FakeRunner } from '../../src/runner/fake.js';
 import { RunnerRegistry } from '../../src/runner/registry.js';
+
+function fakeRunners(): RunnerRegistry {
+  const r = new RunnerRegistry();
+  r.register(new FakeRunner()); // the echo policies name runner 'fake' (validated by createKernel)
+  return r;
+}
 
 const base = () => ({
   engines: new EngineRegistry(),
-  runners: new RunnerRegistry(),
+  runners: fakeRunners(),
   policies: new PolicyStore([]),
   clock: () => 1,
   config: { leaseMs: 1, heartbeatMs: 1, maxDeliveries: 1 },
