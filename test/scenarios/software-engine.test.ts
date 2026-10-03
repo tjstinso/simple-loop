@@ -312,7 +312,8 @@ describe('software engine scenarios', () => {
     expect(h.reap()).toEqual({ requeued: [], deadLettered: [], killed: [], errors: [] });
     h.advance(1);
     const deadAt = h.clock();
-    expect(h.reap()).toEqual({ requeued: [], deadLettered: [job.id], killed: [], errors: [] });
+    // Kernel maintenance reaps the third expiry and surfaces the dead letter through the engine.
+    expect(await h.maintain()).toEqual([]);
 
     expect(h.deadLetters()).toEqual([
       {
@@ -329,6 +330,11 @@ describe('software engine scenarios', () => {
     expect(h.chain(chain.id).status).toBe('dead_lettered');
     expect(h.claim()).toBeNull();
     expect(h.runner.calls).toHaveLength(0);
+    expect(h.issueLabels(N)).toEqual([LABEL_DEAD_LETTER]);
+    const comments = h.comments(N);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain(`<!-- factory:chain=${chain.id} job=${job.id} event=dead-letter -->`);
+    expect(comments[0]).toContain('max_deliveries');
   });
 
   it('followups are filed as issues and not queued', async () => {

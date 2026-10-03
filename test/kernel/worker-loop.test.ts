@@ -319,6 +319,33 @@ describe('worker loop', () => {
     expect(swept).toEqual([NOW + 2_000]);
   });
 
+  it('maintenance surfaces a reaper dead letter through the engine and survives a surfacing error', async () => {
+    const s = track(setup());
+    const surfaced: Array<{ chainId: number; state: unknown; jobId: number; reason: string }> = [];
+    const boom = new Error('surface failed');
+    const first = await s.kernel.enqueue('echo', { key: 'a' });
+    const second = await s.kernel.enqueue('echo', { key: 'b' });
+    s.echo.surfaceDeadLetter = async (chain, dl) => {
+      if (chain.id === first.chain.id) throw boom;
+      surfaced.push({ chainId: chain.id, state: chain.state, jobId: dl.jobId, reason: dl.reason });
+    };
+    claimNext(s.db, 'ghost', NOW, 1_000);
+    claimNext(s.db, 'ghost', NOW, 1_000);
+    s.db.prepare('UPDATE jobs SET delivery = 3').run(); // the third delivery of each job
+    vi.setSystemTime(NOW + 2_000);
+    const errors: Array<{ err: unknown; job?: Job }> = [];
+
+    await runMaintenance(s.kernel.deps, { onError: (err, job) => errors.push({ err, job }) });
+
+    expect(getJob(s.db, first.job.id).status).toBe('failed');
+    expect(getJob(s.db, second.job.id).status).toBe('failed');
+    // The first job's surfacing error is reported and does not stop the second.
+    expect(errors).toHaveLength(1);
+    expect((errors[0]!.err as Error).message).toContain('surface failed');
+    expect(errors[0]!.job).toMatchObject({ id: first.job.id });
+    expect(surfaced).toEqual([{ chainId: second.chain.id, state: { count: 0 }, jobId: second.job.id, reason: 'max_deliveries' }]);
+  });
+
   it('registers itself and records children through RunHooks', async () => {
     let childRows: unknown[] = [];
     const s = track(

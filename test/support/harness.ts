@@ -17,6 +17,7 @@ import { processDelivery, type DeliveryOutcome } from '../../src/kernel/process-
 import { claimNext, getChain, rowToJob, type JobRow } from '../../src/kernel/queue.js';
 import { reapExpired, type ReapReport } from '../../src/kernel/reaper.js';
 import type { Chain, ChainView, DeadLetter, Effect, Job, RunEffectContext } from '../../src/kernel/types.js';
+import { runMaintenance } from '../../src/kernel/worker-loop.js';
 import { PolicyStore } from '../../src/policy/store.js';
 import { FakeRunner } from '../../src/runner/fake.js';
 import { RunnerRegistry } from '../../src/runner/registry.js';
@@ -94,6 +95,8 @@ export interface Harness {
   runUntilIdle(maxSteps?: number): Promise<DeliveryRecord[]>;
   /** Kernel reaper with injected no-op kills (nothing real is ever signalled). */
   reap(): ReapReport;
+  /** Kernel maintenance (reap with no-op kills, surface reaper dead letters, sweep); returns reported errors. */
+  maintain(): Promise<unknown[]>;
 
   /** Scripts execute runs. `fn` usually writes a file with `write` and returns `ok(...)`. */
   scriptExecute(fn: (input: RunInput, call: number) => unknown): void;
@@ -246,6 +249,15 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
           killGroup: () => {},
           killPid: () => {},
         }),
+
+      async maintain() {
+        const errors: unknown[] = [];
+        await runMaintenance(kernel.deps, {
+          onError: (err) => errors.push(err),
+          reap: { isAlive: () => false, groupProbe: () => false, killGroup: () => {}, killPid: () => {} },
+        });
+        return errors;
+      },
 
       scriptExecute(fn) {
         let call = 0;
