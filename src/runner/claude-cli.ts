@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import { readProcessStartTime } from '../util/proc.js';
 import { LineSplitter, StreamCollector, lastJsonBlock, parseStreamLine, truncate } from './stream.js';
@@ -250,29 +250,26 @@ function hasProviderCredential(env: Record<string, string>, passEnv: readonly st
   return passEnv.some((n) => (env[n] ?? '') !== '');
 }
 
+/** True when `target` lies strictly inside `root` (path-component aware: `/a/tree-evil` is not in `/a/tree`). */
+export function isInsideDir(root: string, target: string): boolean {
+  const rel = relative(resolve(root), resolve(target));
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
 /**
- * Whether `--add-dir <workspace>` may be passed so the claude CLI loads the worktree's CLAUDE.md
- * (bare mode skips CLAUDE.md auto-discovery). Refused when `<workspace>/CLAUDE.md` is a symlink
- * that resolves outside the worktree or does not resolve, so a branch cannot point the agent's
- * instructions at an arbitrary file of the operator. It does not inspect `@` imports inside the
- * file, nor other instruction files the CLI may read from that directory.
+ * The worktree's own `<workspace>/CLAUDE.md` to pass with `--append-system-prompt-file` in bare
+ * mode (where the CLI skips CLAUDE.md auto-discovery), or undefined. Only a regular file (by
+ * `lstat`: a symlink is never passed, wherever it points) whose real path lies inside the
+ * worktree's real path. `.claude/CLAUDE.md`, `CLAUDE.local.md` and `@` imports inside the file are
+ * not passed or resolved.
  */
-export function worktreeClaudeMdIsSafe(workspace: string): boolean {
+export function worktreeClaudeMd(workspace: string): string | undefined {
   const file = join(workspace, 'CLAUDE.md');
-  let st;
   try {
-    st = lstatSync(file);
+    if (!lstatSync(file).isFile()) return undefined;
+    return isInsideDir(realpathSync(workspace), realpathSync(file)) ? file : undefined;
   } catch {
-    return true; // no CLAUDE.md: --add-dir adds nothing beyond the working directory
-  }
-  if (!st.isSymbolicLink()) return true;
-  try {
-    const root = realpathSync(workspace);
-    const target = realpathSync(file);
-    const rel = relative(root, target);
-    return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
-  } catch {
-    return false;
+    return undefined; // no CLAUDE.md
   }
 }
 
@@ -285,10 +282,11 @@ export function buildPrompt(cfg: ClaudeCliConfig, input: RunInput): string {
 
 /**
  * The claude CLI arguments. In bare mode, `--bare` skips hooks, plugins, auto-memory, keychain
- * reads and CLAUDE.md auto-discovery (per `claude --help`), and `--add-dir=<claudeMdDir>` hands the
- * worktree back as a CLAUDE.md directory when `claudeMdDir` is given.
+ * reads and CLAUDE.md auto-discovery (per `claude --help`); `claudeMdFile`, when given, is passed
+ * as `--append-system-prompt-file=<file>`, one of the options the help lists for supplying context
+ * in bare mode. No `--add-dir`: the worktree is already the child's working directory.
  */
-export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdDir?: string): string[] {
+export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdFile?: string): string[] {
   const args = [
     '-p',
     '--output-format',
@@ -306,8 +304,8 @@ export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdDir?: st
   ];
   if (cfg.bare) {
     args.push('--bare');
-    // `--add-dir` is variadic too; the `=` form keeps it to exactly one directory.
-    if (claudeMdDir !== undefined) args.push(`--add-dir=${claudeMdDir}`);
+    // One argv element (`=` form), so a path can never be read as a separate option or argument.
+    if (claudeMdFile !== undefined) args.push(`--append-system-prompt-file=${claudeMdFile}`);
   }
   // `--allowedTools` is variadic; the `=` form stops it from swallowing the
   // positional prompt. Entries may contain spaces (e.g. `Bash(git *)`).
@@ -398,8 +396,8 @@ export class ClaudeCliRunner implements Runner {
       const probe = bareChildEnv({ parent: process.env, overrides: this.env, passEnv, home: '', ghConfigDir: '' });
       if (!hasProviderCredential(probe, passEnv)) throw new Error(missingCredentialMessage());
     }
-    const claudeMdDir = cfg.bare && worktreeClaudeMdIsSafe(input.workspace.path) ? input.workspace.path : undefined;
-    const args = buildArgs(cfg, buildPrompt(cfg, input), claudeMdDir);
+    const claudeMdFile = cfg.bare ? worktreeClaudeMd(input.workspace.path) : undefined;
+    const args = buildArgs(cfg, buildPrompt(cfg, input), claudeMdFile);
 
     return new Promise<unknown>((resolve, reject) => {
       const collector = new StreamCollector();

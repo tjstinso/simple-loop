@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ClaudeCliRunner, childEnv, removeScratchDir } from '../../src/runner/claude-cli.js';
+import { ClaudeCliRunner, childEnv, isInsideDir, removeScratchDir, worktreeClaudeMd } from '../../src/runner/claude-cli.js';
 import { loadPolicies } from '../../src/policy/store.js';
 import { parseStreamLine } from '../../src/runner/stream.js';
 import type { RunHooks, RunInput } from '../../src/runner/types.js';
@@ -408,11 +408,12 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
     expect(parsed.bare).toBe(true);
   });
 
-  it('bare mode adds --bare and --add-dir for the worktree', async () => {
+  it('bare mode adds --bare and no --add-dir', async () => {
     const inp = input({ config: config({ resultFormat: 'json', settingSources: 'user' }) });
     const { argv } = (await runner('echo').run(inp, signal())) as { argv: string[] };
     expect(argv).toContain('--bare');
-    expect(argv).toContain(`--add-dir=${inp.workspace.path}`);
+    // the worktree is already the child's cwd; --add-dir would add nothing the agent needs
+    expect(argv.filter((a) => a.startsWith('--add-dir'))).toEqual([]);
     // still headless stream-json with the allow-list, the budget and the setting sources
     expect(argv).toContain('-p');
     expect(argv.join(' ')).toMatch(/--output-format stream-json/);
@@ -422,40 +423,67 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
     expect(argv.join(' ')).toMatch(/--max-budget-usd 1\.5/);
     expect(argv.join(' ')).toMatch(/--setting-sources user/);
     // every option comes before the `--` that precedes the prompt
-    const dashdash = argv.indexOf('--');
-    expect(argv.indexOf('--bare')).toBeLessThan(dashdash);
-    expect(argv.indexOf(`--add-dir=${inp.workspace.path}`)).toBeLessThan(dashdash);
+    expect(argv.indexOf('--bare')).toBeLessThan(argv.indexOf('--'));
   });
 
-  it('bare mode loads the worktree CLAUDE.md through --add-dir, but not one symlinked outside the worktree', async () => {
-    const run = async (ws: string) =>
-      ((await runner('echo').run(input({ workspace: { path: ws }, config: config({ resultFormat: 'json' }) }), signal())) as { argv: string[] }).argv;
+  it('bare mode passes the worktree CLAUDE.md as --append-system-prompt-file, only a regular file inside the worktree', async () => {
+    const run = async (ws: string, over: Record<string, unknown> = {}) =>
+      ((await runner('echo').run(input({ workspace: { path: ws }, config: config({ resultFormat: 'json', ...over }) }), signal())) as { argv: string[] }).argv;
     const extra = (argv: string[]) => argv.filter((a) => a.startsWith('--add-dir') || a.includes('system-prompt'));
 
     const withFile = tmp('cli-ws-md-');
     writeFileSync(join(withFile, 'CLAUDE.md'), '# rules');
-    expect(extra(await run(withFile))).toEqual([`--add-dir=${withFile}`]);
+    const argv = await run(withFile);
+    const flag = `--append-system-prompt-file=${join(withFile, 'CLAUDE.md')}`;
+    expect(extra(argv)).toEqual([flag]); // a single argv element
+    expect(argv.indexOf(flag)).toBeLessThan(argv.indexOf('--'));
 
     const without = tmp('cli-ws-nomd-');
-    expect(extra(await run(without))).toEqual([`--add-dir=${without}`]); // nothing beyond the directory itself
+    expect(extra(await run(without))).toEqual([]); // nothing extra
+
+    const dirNamed = tmp('cli-ws-mddir-');
+    mkdirSync(join(dirNamed, 'CLAUDE.md'));
+    expect(extra(await run(dirNamed))).toEqual([]); // not a regular file
 
     const inside = tmp('cli-ws-inlink-');
     writeFileSync(join(inside, 'RULES.md'), '# rules');
     symlinkSync(join(inside, 'RULES.md'), join(inside, 'CLAUDE.md'));
-    expect(extra(await run(inside))).toEqual([`--add-dir=${inside}`]);
+    expect(extra(await run(inside))).toEqual([]); // any symlink is skipped
 
     const outsideWs = tmp('cli-ws-outlink-');
     const outside = join(tmp('cli-outside-'), 'secret.md');
     writeFileSync(outside, 'outside the worktree');
     symlinkSync(outside, join(outsideWs, 'CLAUDE.md'));
-    const argv = await run(outsideWs);
-    expect(extra(argv)).toEqual([]);
-    expect(argv.some((a) => a.includes('secret.md') || a.includes('cli-outside-'))).toBe(false);
-    expect(argv).toContain('--bare');
+    const out = await run(outsideWs);
+    expect(extra(out)).toEqual([]);
+    expect(out.some((a) => a.includes('secret.md') || a.includes('cli-outside-'))).toBe(false);
+    expect(out).toContain('--bare');
 
     const dangling = tmp('cli-ws-dangling-');
     symlinkSync(join(tmpdir(), 'no-such-claude-md-target'), join(dangling, 'CLAUDE.md'));
     expect(extra(await run(dangling))).toEqual([]);
+
+    // bare false: no CLAUDE.md flag (the CLI discovers CLAUDE.md itself there)
+    expect(extra(await run(withFile, { bare: false }))).toEqual([]);
+  });
+
+  it('the worktree containment check is not fooled by a sibling with the same prefix', () => {
+    const parent = tmp('cli-prefix-');
+    const tree = join(parent, 'tree');
+    const evil = join(parent, 'tree-evil');
+    mkdirSync(tree);
+    mkdirSync(evil);
+    writeFileSync(join(evil, 'CLAUDE.md'), 'evil');
+    expect(isInsideDir(tree, join(evil, 'CLAUDE.md'))).toBe(false);
+    expect(isInsideDir(tree, join(tree, 'CLAUDE.md'))).toBe(true);
+    expect(isInsideDir(tree, tree)).toBe(false);
+    expect(isInsideDir(tree, join(tree, '..', 'tree-evil', 'CLAUDE.md'))).toBe(false);
+    // a worktree reached through a symlinked path still contains its own regular CLAUDE.md
+    writeFileSync(join(tree, 'CLAUDE.md'), '# rules');
+    const linkToTree = join(parent, 'link-to-tree');
+    symlinkSync(tree, linkToTree);
+    expect(worktreeClaudeMd(linkToTree)).toBe(join(linkToTree, 'CLAUDE.md'));
+    expect(worktreeClaudeMd(join(parent, 'tree-nothing'))).toBeUndefined();
   });
 
   it('bare mode passes only allow-listed environment variables', async () => {
@@ -606,7 +634,7 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
         env: Record<string, string>;
       };
       expect(res.argv).not.toContain('--bare');
-      expect(res.argv.filter((a) => a.startsWith('--add-dir'))).toEqual([]);
+      expect(res.argv.filter((a) => a.startsWith('--add-dir') || a.includes('system-prompt'))).toEqual([]);
       expect(res.env).toEqual(childEnv({ STUB_MODE: 'echo', ANTHROPIC_API_KEY: 'test-key' }, res.env.GH_CONFIG_DIR));
       expect(res.env.HOME).toBe('/home/real');
       expect(res.env.FACTORY_KEEP_ME).toBe('kept');
