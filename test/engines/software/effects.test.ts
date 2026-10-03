@@ -215,6 +215,55 @@ describe('runSoftwareEffect', () => {
     expect(order).toEqual(['prepareForPush', 'commitAll', 'headSha', 'push']);
   });
 
+  it("an execute job's commit_push git or host failure is a runner_error (a retry reruns the agent)", async () => {
+    const pushFails: GitPorts = {
+      commitAll: async () => true,
+      headSha: async () => 'new',
+      push: async () => {
+        throw new Error('git push failed: Could not resolve host: github.com');
+      },
+    };
+    const cases: Array<[string, () => unknown]> = [
+      ['git push failed: Could not resolve host: github.com', () => ctx({ git: pushFails })],
+      ['Not Found', () => { host.failNext('getIssue', new GitHostError('Not Found', 404)); return ctx(); }],
+    ];
+    for (const [message, mk] of cases) {
+      const err = await runSoftwareEffect({ kind: 'commit_push' }, mk() as EffectContext, fence()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EffectError);
+      expect((err as EffectError).reason).toBe('runner_error');
+      expect((err as Error).message).toBe(message);
+    }
+    // A transient host failure is still retried first.
+    delays = [];
+    host.getIssue = async () => {
+      throw new GitHostError('bad gateway', 502);
+    };
+    const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx(), fence()).catch((e: unknown) => e);
+    expect((err as EffectError).reason).toBe('runner_error');
+    expect(delays).toEqual([100, 200]);
+  });
+
+  it("an execute job's open_pr host failure is a runner_error", async () => {
+    host.failNext('openPr', new GitHostError('Validation Failed', 422));
+    const err = await runSoftwareEffect({ kind: 'open_pr' }, ctx(), fence()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EffectError);
+    expect((err as EffectError).reason).toBe('runner_error');
+    expect((err as Error).message).toBe('Validation Failed');
+  });
+
+  it("a review job's effect failures stay effect_error (its retry keeps the verdict)", async () => {
+    const review = job({ type: 'review' });
+    const err = await runSoftwareEffect({ kind: 'set_labels', target: 'pr', add: ['x'], remove: [] }, ctx({ job: review }), fence()).catch(
+      (e: unknown) => e,
+    );
+    expect((err as EffectError).reason).toBe('effect_error');
+    host.failNext('setLabels', new GitHostError('Validation Failed', 422));
+    const err2 = await runSoftwareEffect({ kind: 'set_labels', target: 'issue', add: ['x'], remove: [] }, ctx({ job: review }), fence()).catch(
+      (e: unknown) => e,
+    );
+    expect((err2 as EffectError).reason).toBe('effect_error');
+  });
+
   it('commit_push with a missing workspace throws EffectError runner_error', async () => {
     const err = await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: null }), fence()).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(EffectError);

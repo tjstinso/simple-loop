@@ -1,10 +1,9 @@
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { GitHostError } from '../../src/engines/software/github.js';
 import { LABEL_DEAD_LETTER } from '../../src/engines/software/index.js';
 import type { SoftwareWorkspace } from '../../src/engines/software/workspace.js';
-import { retryDeadLetter } from '../../src/kernel/dlq.js';
 import { DuplicateChainError } from '../../src/kernel/queue.js';
 import type { RunInput } from '../../src/runner/types.js';
 import { LEASE_MS, makeHarness, ok, type Harness, type HarnessOptions } from '../support/harness.js';
@@ -444,7 +443,8 @@ describe('software engine scenarios', () => {
 
     expect(outcomes.map((o) => [o.type, o.outcome])).toEqual([['execute', 'dead_lettered']]);
     expect(h2.deadLetters()).toEqual([
-      expect.objectContaining({ chainId: second.chain.id, reason: 'effect_error', error: "effect 'open_pr' failed: Validation Failed" }),
+      // R33: an execute job's open_pr failure is a runner_error, so one retry reruns the agent.
+      expect.objectContaining({ chainId: second.chain.id, reason: 'runner_error', error: "effect 'open_pr' failed: Validation Failed" }),
     ]);
     expect(h2.jobs()).toEqual([expect.objectContaining({ type: 'execute', status: 'failed' })]);
     expect(h2.chain(second.chain.id).status).toBe('dead_lettered');
@@ -474,8 +474,11 @@ describe('software engine scenarios', () => {
     ]);
     expect(h.pr(BRANCH)!.labels).toEqual([]);
 
-    const retried = retryDeadLetter(h.db, review.id, h.clock());
+    expect(h.issueLabels(N)).toEqual([LABEL_DEAD_LETTER]);
+    // Through the kernel, as `factory dlq retry` does: the engine's afterRetry hook runs too.
+    const retried = await h.kernel.retryDeadLetter(review.id);
     expect(retried).toMatchObject({ status: 'queued', result: { verdict: 'approve', feedback: 'lgtm' } });
+    expect(h.issueLabels(N)).toEqual([IN_PROGRESS]);
 
     const second = await h.runUntilIdle();
 
@@ -491,5 +494,45 @@ describe('software engine scenarios', () => {
     expect(c.status).toBe('waiting');
     expect(c.state.phase).toBe('awaiting_merge');
     expect(h.pr(BRANCH)!.labels).toEqual([READY]);
+    expect(h.issueLabels(N)).toEqual([]);
+  });
+
+  it('dlq retry after a push failure on an execute job reruns the agent and completes', async () => {
+    const h = harness();
+    const { chain } = await h.submit(N);
+    writesPerAttempt(h);
+    h.scriptReview([{ verdict: 'approve', feedback: 'lgtm' }]);
+    // The remote is unreachable while the first delivery pushes.
+    const away = `${h.remote.path}.away`;
+    let failed = false;
+    h.beforeEffect = (effect) => {
+      if (effect.kind === 'commit_push' && !failed) {
+        failed = true;
+        renameSync(h.remote.path, away);
+      }
+    };
+
+    const first = await h.runUntilIdle();
+    renameSync(away, h.remote.path);
+    expect(first.map((o) => [o.type, o.delivery, o.outcome])).toEqual([['execute', 1, 'dead_lettered']]);
+    const [execute] = h.jobs(chain.id);
+    expect(h.deadLetters()).toEqual([
+      expect.objectContaining({ jobId: execute!.id, reason: 'runner_error', error: expect.stringMatching(/^effect 'commit_push' failed: git push failed/) }),
+    ]);
+    // A runner_error retry clears the result: the agent reruns in a fresh workspace.
+    const retried = await h.kernel.retryDeadLetter(execute!.id);
+    expect(retried).toMatchObject({ status: 'queued', result: null });
+
+    const second = await h.runUntilIdle();
+
+    expect(second.map((o) => [o.type, o.delivery, o.outcome])).toEqual([
+      ['execute', 2, 'succeeded'],
+      ['review', 1, 'succeeded'],
+    ]);
+    expect(h.callsOf('execute')).toHaveLength(2);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
+    expect(h.remoteFile(BRANCH, 'attempt-1.txt')).toBe('attempt 1');
+    expect(h.pr(BRANCH)!.labels).toEqual([READY]);
+    expect(h.issueLabels(N)).toEqual([]);
   });
 });

@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { fileFollowups, storeFollowups } from './followups.js';
-import { EffectError, type ChainView, type Effect, type EffectFence, type Job } from '../../kernel/types.js';
+import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type Job } from '../../kernel/types.js';
 import { GitHostError, type GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import type { SoftwareEffect } from './schemas.js';
@@ -187,14 +187,42 @@ async function fileFollowupsEffect(effect: Effect, ctx: EffectContext, fence: Ef
 }
 
 /**
+ * The effects that publish from the delivery's workspace. When one of them fails for an execute job,
+ * its retry must rerun the agent: a retry that kept the result would skip `prepare`, find no
+ * workspace and fail again. So their git and host failures are `runner_error` (retry clears the
+ * result), not `effect_error` (retry keeps it). StaleDeliveryError still propagates unchanged.
+ */
+const WORKSPACE_EFFECTS = new Set(['commit_push', 'open_pr']);
+
+async function asRunnerError(body: () => Promise<void>): Promise<void> {
+  try {
+    await body();
+  } catch (e) {
+    if (e instanceof StaleDeliveryError) throw e;
+    if (e instanceof EffectError) {
+      if (e.reason === 'runner_error') throw e;
+      throw new EffectError(e.message, 'runner_error');
+    }
+    throw new EffectError(e instanceof Error ? e.message : String(e), 'runner_error');
+  }
+}
+
+/**
  * Runs one software effect: idempotent (looks before acting), fenced (the fence is checked
  * at the start and again immediately before each externally visible mutation), with host
- * failures classified into EffectError reasons. StaleDeliveryError always propagates.
+ * failures classified into EffectError reasons (`commit_push` and `open_pr` of an execute job fail
+ * as `runner_error`, see WORKSPACE_EFFECTS). StaleDeliveryError always propagates.
  */
 export async function runSoftwareEffect(effect: Effect, ctx: EffectContext, fence: EffectFence): Promise<void> {
   if (effect?.kind === 'file_followups') return fileFollowupsEffect(effect, ctx, fence);
   const e = parse(effect);
   fence.assertCurrent();
+  const run = () => runClassified(e, ctx, fence);
+  if (ctx.job.type === 'execute' && WORKSPACE_EFFECTS.has(e.kind)) return asRunnerError(run);
+  return run();
+}
+
+async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFence): Promise<void> {
   await classified(ctx, () => {
     switch (e.kind) {
       case 'commit_push':

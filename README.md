@@ -133,7 +133,7 @@ $ factory dlq discard 1
 discarded job 1
 ```
 
-`retry` re-queues the same job (its delivery counter is kept, so the next claim is delivery + 1), puts the chain back to active, and keeps the recorded result only for `effect_error` (then the agent is not rerun, only the post-processing). It also moves the issue label from `factory:dead-letter` back to `factory:in-progress`. `discard` cancels the chain, which frees the subject for a new `submit`; it does not touch labels on GitHub, so remove `factory:dead-letter` from the issue yourself.
+`retry` re-queues the same job (its delivery counter is kept, so the next claim is delivery + 1), puts the chain back to active, and keeps the recorded result only for `effect_error` (then the agent is not rerun, only the post-processing). Only a review job's effects (labels, merge, comments) dead-letter as `effect_error`. When an execute job's push or pull-request creation fails, the job is dead-lettered as `runner_error`, so one `retry` reruns the agent in a fresh worktree (its earlier, unpublished work is redone); resuming would be impossible because the earlier delivery's worktree is not reused. It also moves the issue label from `factory:dead-letter` back to `factory:in-progress`. `discard` cancels the chain, which frees the subject for a new `submit`; it does not touch labels on GitHub, so remove `factory:dead-letter` from the issue yourself.
 
 ## Labels
 
