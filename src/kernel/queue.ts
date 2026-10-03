@@ -230,18 +230,20 @@ export function failJob(db: Db, fence: Fence, error: string): void {
 }
 
 /**
- * Put a job back on the queue and clear its lease. Not fenced: this is the
- * kernel's recovery path (expired lease, worker crash). `result` and
- * `delivery` are kept, so the next claim gets delivery + 1 and any write from
- * the previous holder is rejected. `updated_at` is left unchanged because no
- * clock value is passed in.
+ * Put a running job back on the queue and clear its lease: the kernel's
+ * recovery path (expired lease, worker crash). Only a `running` job is
+ * requeued, and when `opts.delivery` is given only that delivery, so a reaper
+ * racing a worker's commit cannot resurrect a finished job. Returns false
+ * (a no-op) otherwise. `result` and `delivery` are kept, so the next claim gets
+ * delivery + 1 and any write from the previous holder is rejected.
+ * `updated_at` is left unchanged because no clock value is passed in.
  */
-export function requeueJob(db: Db, jobId: number): void {
-  const r = db
-    .prepare(
-      `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL
-        WHERE id = ?`,
-    )
-    .run(jobId);
-  if (r.changes !== 1) throw new Error(`job ${jobId} not found`);
+export function requeueJob(db: Db, jobId: number, opts: { delivery?: number } = {}): boolean {
+  const sql = `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL
+                WHERE id = ? AND status = 'running'`;
+  const r =
+    opts.delivery === undefined
+      ? db.prepare(sql).run(jobId)
+      : db.prepare(`${sql} AND delivery = ?`).run(jobId, opts.delivery);
+  return r.changes === 1;
 }

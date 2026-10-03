@@ -269,12 +269,12 @@ describe('fenced writes', () => {
     expect(getJob(db, j.id)).toMatchObject({ status: 'failed', error: 'kaboom', delivery: 1 });
   });
 
-  it('requeueJob keeps result and delivery and clears the lease', () => {
+  it('requeueJob requeues a running job, clears the lease, keeps result and delivery, and returns true', () => {
     const db = mk();
     seed(db, 'a', 1);
     const j = claimNext(db, 'w', 10, 1000)!;
     recordResult(db, fenceOf(j), { partial: true });
-    requeueJob(db, j.id);
+    expect(requeueJob(db, j.id)).toBe(true);
     expect(getJob(db, j.id)).toMatchObject({
       status: 'queued',
       claimedBy: null,
@@ -282,6 +282,51 @@ describe('fenced writes', () => {
       delivery: 1,
       result: { partial: true },
     });
+    // Matching delivery fence also works.
+    const k = claimNext(db, 'w2', 20, 1000)!;
+    expect(requeueJob(db, k.id, { delivery: k.delivery })).toBe(true);
+    expect(getJob(db, k.id)).toMatchObject({ status: 'queued', delivery: 2, claimedBy: null });
+  });
+
+  it('requeueJob leaves a succeeded job succeeded and returns false', () => {
+    const db = mk();
+    const { chain } = seed(db, 'a', 1);
+    const j = claimNext(db, 'w', 10, 1000)!;
+    // Reaper observed the running job; the worker commits before the requeue lands.
+    commitTransition(
+      db,
+      fenceOf(j),
+      { chainId: chain.id, engineState: { step: 1 }, chainStatus: 'completed', newJobs: [] },
+      20,
+    );
+    const before = rawJobs(db);
+    expect(requeueJob(db, j.id)).toBe(false);
+    expect(requeueJob(db, j.id, { delivery: j.delivery })).toBe(false);
+    expect(rawJobs(db)).toEqual(before);
+    expect(getJob(db, j.id).status).toBe('succeeded');
+    expect(claimNext(db, 'w2', 30, 1000)).toBeNull();
+
+    // Same for failed and still-queued jobs, and for unknown ids.
+    const f = seed(db, 'b', 1).job;
+    const fj = claimNext(db, 'w', 40, 1000)!;
+    failJob(db, fenceOf(fj), 'x');
+    expect(requeueJob(db, f.id)).toBe(false);
+    expect(getJob(db, f.id).status).toBe('failed');
+    const q = seed(db, 'c', 1).job;
+    expect(requeueJob(db, q.id)).toBe(false);
+    expect(requeueJob(db, 9999)).toBe(false);
+  });
+
+  it('requeueJob returns false and changes nothing when the supplied delivery is stale', () => {
+    const db = mk();
+    const { job } = seed(db, 'a', 1);
+    const first = claimNext(db, 'w1', 10, 1000)!;
+    expect(requeueJob(db, job.id, { delivery: first.delivery })).toBe(true);
+    const second = claimNext(db, 'w2', 20, 1000)!;
+    const before = rawJobs(db);
+    expect(requeueJob(db, job.id, { delivery: first.delivery })).toBe(false);
+    expect(rawJobs(db)).toEqual(before);
+    expect(getJob(db, job.id)).toMatchObject({ status: 'running', claimedBy: 'w2', delivery: second.delivery });
   });
 });
 
