@@ -185,7 +185,8 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     } catch {
       return false; // holder may be between mkdir and writing its pid; age decides
     }
-    if (!Number.isInteger(pid) || pid <= 0) return true;
+    // Empty or half-written (the holder is between mkdir and writing its pid): the age above decides.
+    if (!Number.isInteger(pid) || pid <= 0) return false;
     try {
       process.kill(pid, 0);
       return false;

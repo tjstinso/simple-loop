@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -224,6 +224,30 @@ describe('GitWorkspaceProvider', () => {
     const p = new GitWorkspaceProvider({ cloneUrlFor: () => remote.url, root, keepOnFailure: true, lockWaitMs: 200, lockPollMs: 10 });
     await expect(p.prepare(chain(1), job(1, 1))).rejects.toThrow(/acme__widgets\.git\.lock/);
     expect(existsSync(lock)).toBe(true);
+  });
+
+  it('an empty or unreadable lock pid file defers to the lock age instead of being stale at once', async () => {
+    const lock = join(root, '.cache', 'acme__widgets.git.lock');
+    const make = () =>
+      new GitWorkspaceProvider({ cloneUrlFor: () => remote.url, root, keepOnFailure: true, lockWaitMs: 100, lockPollMs: 10, lockStaleMs: 60_000 });
+    for (const setup of [
+      () => writeFileSync(join(lock, 'pid'), ''), // the holder is between mkdir and writing its pid
+      () => writeFileSync(join(lock, 'pid'), 'garbage'),
+      () => undefined, // no pid file yet
+    ]) {
+      rmSync(lock, { recursive: true, force: true });
+      mkdirSync(lock, { recursive: true });
+      setup();
+      // Young lock: respected (the wait times out, the lock stays).
+      await expect(make().prepare(chain(1), job(1, 1))).rejects.toThrow(/timed out waiting for cache lock/);
+      expect(existsSync(lock)).toBe(true);
+    }
+    // Old lock: broken by age.
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lock, old, old);
+    const ws = await make().prepare(chain(1), job(1, 1));
+    expect(existsSync(ws.path)).toBe(true);
+    expect(existsSync(lock)).toBe(false);
   });
 
   it('picks up a commit pushed to the remote between two prepares', async () => {
