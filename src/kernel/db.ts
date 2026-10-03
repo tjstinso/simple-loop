@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS dead_letters (
   created_at INTEGER NOT NULL,
   resolved_at INTEGER
 );
+CREATE INDEX IF NOT EXISTS dead_letters_job ON dead_letters(job_id);
 `;
 
 export function migrate(db: Database.Database, extra: string[] = []): void {
