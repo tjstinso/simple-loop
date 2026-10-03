@@ -154,7 +154,7 @@ export function killProcessGroup(pgid: number, graceMs = 2000): void {
   setTimeout(() => signal('SIGKILL'), graceMs).unref();
 }
 
-function groupHasMembers(pgid: number): boolean {
+export function groupHasMembers(pgid: number): boolean {
   if (!isSignalablePgid(pgid)) return false;
   try {
     process.kill(-pgid, 0);
