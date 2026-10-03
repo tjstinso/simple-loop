@@ -9,6 +9,7 @@ import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
 import {
   ExecutionResultSchema,
+  LABEL_DEAD_LETTER,
   LABEL_IN_PROGRESS,
   LABEL_NEEDS_HUMAN,
   LABEL_READY_FOR_MERGE,
@@ -38,7 +39,7 @@ export interface SoftwareEngineDeps {
   now: () => number;
 }
 
-export const LABEL_DEAD_LETTER = 'factory:dead-letter';
+export { LABEL_DEAD_LETTER };
 
 export type SoftwareEngine = Engine<SoftwareState> & {
   /** Evicts the cached workspace of one delivery of one job (used by cleanup). */

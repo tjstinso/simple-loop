@@ -4,6 +4,7 @@ import { PROFILES } from './profiles.js';
 import {
   ExecutionResultSchema,
   ReviewVerdictSchema,
+  LABEL_DEAD_LETTER,
   LABEL_IN_PROGRESS,
   LABEL_NEEDS_HUMAN,
   LABEL_READY_FOR_MERGE,
@@ -37,7 +38,8 @@ export function softwareTransition(
       effects: [
         { kind: 'commit_push' },
         { kind: 'open_pr' },
-        { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [] },
+        // Also clears a dead-letter label a resubmit after `dlq discard` may have left behind.
+        { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [LABEL_DEAD_LETTER] },
         ...followupEffects(r.followups),
       ],
     };

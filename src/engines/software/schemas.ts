@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const LABEL_IN_PROGRESS = 'factory:in-progress';
 export const LABEL_READY_FOR_MERGE = 'factory:ready-for-merge';
 export const LABEL_NEEDS_HUMAN = 'factory:needs-human';
+export const LABEL_DEAD_LETTER = 'factory:dead-letter';
 
 export const FollowupSchema = z.object({ title: z.string(), body: z.string() });
 export type Followup = z.infer<typeof FollowupSchema>;

@@ -9,6 +9,7 @@ import {
   LABEL_IN_PROGRESS,
   LABEL_READY_FOR_MERGE,
   LABEL_NEEDS_HUMAN,
+  LABEL_DEAD_LETTER,
 } from '../../../src/engines/software/schemas.js';
 import { PROFILES } from '../../../src/engines/software/profiles.js';
 
@@ -55,10 +56,12 @@ describe('softwareTransition', () => {
       effects: [
         { kind: 'commit_push' },
         { kind: 'open_pr' },
-        { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [] },
+        { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [LABEL_DEAD_LETTER] },
       ],
       newJobs: [{ type: 'review', attempt: 2, policyKind: 'review', labels, payload: undefined }],
     });
+    // A resubmit after `dlq discard` must not leave a stale dead-letter label next to in-progress.
+    expect(t.effects[2]).toEqual({ kind: 'set_labels', target: 'issue', add: ['factory:in-progress'], remove: ['factory:dead-letter'] });
   });
 
   it('supervised approve labels the PR ready-for-merge and waits', () => {
@@ -124,7 +127,7 @@ describe('softwareTransition', () => {
     expect(exec.effects).toEqual([
       { kind: 'commit_push' },
       { kind: 'open_pr' },
-      { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [] },
+      { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [LABEL_DEAD_LETTER] },
       fx,
     ]);
     const sup = softwareTransition(chainOf(baseState({ phase: 'reviewing' })), jobOf('review'), {
