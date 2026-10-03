@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { runSoftwareEffect, type EffectContext } from '../../../src/engines/software/effects.js';
 import {
   FOLLOWUPS_DDL,
+  FOLLOWUP_CLAIM_TTL_MS,
   fileFollowups,
   pruneFiledFollowups,
   storeFollowups,
@@ -67,8 +68,8 @@ describe('followups', () => {
 
   it('files each followup once with the followup label, a reference to the issue and the marker', async () => {
     storeFollowups(db, args, [{ title: 'first', body: 'do a' }, { title: 'second', body: 'do b' }], 1000);
-    await fileFollowups(db, host, 42);
-    await fileFollowups(db, host, 42);
+    await fileFollowups(db, host, 42, 2000);
+    await fileFollowups(db, host, 42, 2000);
     const filed = rows().map((r) => r.filed_issue_number);
     expect(filed.every((n) => n !== null)).toBe(true);
     expect(host.issues.size).toBe(2);
@@ -83,7 +84,7 @@ describe('followups', () => {
     storeFollowups(db, args, [{ title: 'first', body: 'do a' }], 1000);
     const existing = host.addIssue({ title: 'first', body: `do a\n\n${marker(0)}`, labels: ['factory:followup'] });
     const before = host.issues.size;
-    await fileFollowups(db, host, 42);
+    await fileFollowups(db, host, 42, 2000);
     expect(host.issues.size).toBe(before);
     expect(rows()[0]!.filed_issue_number).toBe(existing);
   });
@@ -91,7 +92,7 @@ describe('followups', () => {
   it('a GitHostError while filing leaves filed_issue_number null, continues with the next item and does not throw', async () => {
     storeFollowups(db, args, [{ title: 'first', body: 'a' }, { title: 'second', body: 'b' }], 1000);
     host.failNext('createIssue', new GitHostError('boom', 500));
-    await expect(fileFollowups(db, host, 42)).resolves.toBeUndefined();
+    await expect(fileFollowups(db, host, 42, 2000)).resolves.toBeUndefined();
     const r = rows();
     expect(r[0]!.filed_issue_number).toBeNull();
     expect(r[1]!.filed_issue_number).not.toBeNull();
@@ -100,7 +101,7 @@ describe('followups', () => {
   it('a non-GitHostError propagates', async () => {
     storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
     host.failNext('createIssue', new TypeError('bug'));
-    await expect(fileFollowups(db, host, 42)).rejects.toThrow('bug');
+    await expect(fileFollowups(db, host, 42, 2000)).rejects.toThrow('bug');
     expect(rows()[0]!.filed_issue_number).toBeNull();
   });
 
@@ -108,7 +109,7 @@ describe('followups', () => {
     storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
     storeFollowups(db, { ...args, jobId: 50 }, [{ title: 'other', body: 'b' }], 1000);
     host.failNext('createIssue', new GitHostError('down', 503));
-    await fileFollowups(db, host, 42);
+    await fileFollowups(db, host, 42, 2000);
     expect(rows().filter((r) => r.filed_issue_number === null)).toHaveLength(2);
     const filed = await sweepUnfiledFollowups(db, host, 5000);
     expect(filed).toBe(2);
@@ -122,6 +123,79 @@ describe('followups', () => {
     const deleted = pruneFiledFollowups(db, 31 * DAY, 30);
     expect(deleted).toBe(1);
     expect(rows().map((r) => r.title)).toEqual(['old unfiled', 'recent filed']);
+  });
+
+  describe('claims', () => {
+    class GatedHost extends FakeGitHost {
+      creates = 0;
+      private release!: () => void;
+      private gate = new Promise<void>((r) => { this.release = r; });
+      reached: Promise<void>;
+      private markReached!: () => void;
+      constructor() {
+        super();
+        this.reached = new Promise<void>((r) => { this.markReached = r; });
+      }
+      open(): void { this.release(); }
+      override async createIssue(repo: string, a: { title: string; body: string; labels: string[] }): Promise<number> {
+        this.creates++;
+        this.markReached();
+        await this.gate;
+        return super.createIssue(repo, a);
+      }
+    }
+    const flush = () => new Promise<void>((r) => setTimeout(r, 10));
+
+    it('two concurrent sweeps over one unfiled row create exactly one issue', async () => {
+      const g = new GatedHost();
+      storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
+      const both = Promise.all([sweepUnfiledFollowups(db, g, 5000), sweepUnfiledFollowups(db, g, 5000)]);
+      await g.reached;
+      await flush();
+      g.open();
+      await both;
+      expect(g.creates).toBe(1);
+      expect(g.issues.size).toBe(1);
+      expect(rows()[0]!.filed_issue_number).not.toBeNull();
+    });
+
+    it('the effect and a concurrent sweep create exactly one issue for the same row', async () => {
+      const g = new GatedHost();
+      storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
+      const effect = fileFollowups(db, g, 42, 5000);
+      await g.reached;
+      const sweep = sweepUnfiledFollowups(db, g, 5000);
+      await flush();
+      g.open();
+      await Promise.all([effect, sweep]);
+      expect(g.creates).toBe(1);
+      expect(g.issues.size).toBe(1);
+      expect(rows()[0]!.filed_issue_number).not.toBeNull();
+    });
+
+    it('an expired claim can be taken over by another filer', async () => {
+      storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
+      db.prepare('UPDATE followups SET claimed_until = 4000').run();
+      expect(await sweepUnfiledFollowups(db, host, 5000)).toBe(1);
+      expect(rows()[0]!.filed_issue_number).not.toBeNull();
+    });
+
+    it('a row claimed by someone else and not yet expired is skipped', async () => {
+      storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
+      db.prepare('UPDATE followups SET claimed_until = ?').run(5000 + FOLLOWUP_CLAIM_TTL_MS - 1);
+      expect(await sweepUnfiledFollowups(db, host, 5000)).toBe(0);
+      await fileFollowups(db, host, 42, 5000);
+      expect(host.issues.size).toBe(0);
+      expect(rows()[0]!.filed_issue_number).toBeNull();
+    });
+
+    it('a GitHostError releases the claim so a later sweep can retry', async () => {
+      storeFollowups(db, args, [{ title: 'first', body: 'a' }], 1000);
+      host.failNext('createIssue', new GitHostError('down', 503));
+      expect(await sweepUnfiledFollowups(db, host, 5000)).toBe(0);
+      expect((db.prepare('SELECT claimed_until AS c FROM followups').get() as { c: number | null }).c).toBeNull();
+      expect(await sweepUnfiledFollowups(db, host, 5001)).toBe(1);
+    });
   });
 
   describe('file_followups effect', () => {

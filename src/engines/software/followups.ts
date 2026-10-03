@@ -5,6 +5,8 @@ import type { Followup } from './schemas.js';
 type Db = Database.Database;
 
 export const FOLLOWUP_LABEL = 'factory:followup';
+/** How long a filer owns a row before another may take it over. */
+export const FOLLOWUP_CLAIM_TTL_MS = 5 * 60_000;
 const DAY_MS = 86_400_000;
 
 export const FOLLOWUPS_DDL = `
@@ -19,6 +21,7 @@ CREATE TABLE IF NOT EXISTS followups (
   body TEXT NOT NULL,
   filed_issue_number INTEGER,
   created_at INTEGER NOT NULL,
+  claimed_until INTEGER,
   UNIQUE (job_id, position)
 );
 CREATE INDEX IF NOT EXISTS followups_unfiled ON followups(job_id) WHERE filed_issue_number IS NULL;
@@ -35,6 +38,7 @@ interface FollowupRow {
   body: string;
   filed_issue_number: number | null;
   created_at: number;
+  claimed_until: number | null;
 }
 
 /**
@@ -68,13 +72,22 @@ export function storeFollowups(
 const markerOf = (r: FollowupRow) => `<!-- factory:chain=${r.chain_id} job=${r.job_id} followup=${r.position} -->`;
 
 /**
- * Files one row. Looks for an existing labelled issue carrying the marker first (the crash
- * window between create and record), creates only if none exists, then records the number.
- * Only GitHostError is swallowed (row stays unfiled for the sweep); anything else propagates.
- * Returns true when the row ended up filed.
+ * Files one row. First takes a time-limited claim (an atomic conditional UPDATE) so concurrent
+ * filers (the effect, or sweeps on other workers) never act on the same row; a row that is
+ * already filed or freshly claimed by someone else is skipped silently. The owner then looks for
+ * an existing labelled issue carrying the marker (the crash window between create and record),
+ * creates only if none exists, and records the number. Any failure releases the claim; only
+ * GitHostError is swallowed (row stays unfiled for the sweep), anything else propagates.
+ * Returns true when this call filed the row.
  */
-async function fileRow(db: Db, host: GitHost, r: FollowupRow, beforeCreate?: () => void): Promise<boolean> {
-  const record = db.prepare('UPDATE followups SET filed_issue_number = ? WHERE id = ? AND filed_issue_number IS NULL');
+async function fileRow(db: Db, host: GitHost, r: FollowupRow, now: number, beforeCreate?: () => void): Promise<boolean> {
+  const claimed = db
+    .prepare(
+      `UPDATE followups SET claimed_until = ?
+       WHERE id = ? AND filed_issue_number IS NULL AND (claimed_until IS NULL OR claimed_until < ?)`,
+    )
+    .run(now + FOLLOWUP_CLAIM_TTL_MS, r.id, now).changes;
+  if (claimed !== 1) return false;
   try {
     const marker = markerOf(r);
     let n = await host.findIssueByMarker(r.repo, marker, FOLLOWUP_LABEL);
@@ -83,9 +96,10 @@ async function fileRow(db: Db, host: GitHost, r: FollowupRow, beforeCreate?: () 
       const body = [r.body, '', `Discovered while working on #${r.issue_number}.`, marker].join('\n');
       n = await host.createIssue(r.repo, { title: r.title, body, labels: [FOLLOWUP_LABEL] });
     }
-    record.run(n, r.id);
+    db.prepare('UPDATE followups SET filed_issue_number = ?, claimed_until = NULL WHERE id = ?').run(n, r.id);
     return true;
   } catch (e) {
+    db.prepare('UPDATE followups SET claimed_until = NULL WHERE id = ? AND filed_issue_number IS NULL').run(r.id);
     if (e instanceof GitHostError) return false;
     throw e;
   }
@@ -96,22 +110,22 @@ export async function fileFollowups(
   db: Db,
   host: GitHost,
   jobId: number,
-  _now?: number,
+  now: number,
   beforeCreate?: () => void,
 ): Promise<void> {
   const rows = db
     .prepare('SELECT * FROM followups WHERE job_id = ? AND filed_issue_number IS NULL ORDER BY position')
     .all(jobId) as FollowupRow[];
-  for (const r of rows) await fileRow(db, host, r, beforeCreate);
+  for (const r of rows) await fileRow(db, host, r, now, beforeCreate);
 }
 
-/** Files every unfiled row of any job; returns how many were filed. */
-export async function sweepUnfiledFollowups(db: Db, host: GitHost, _now: number): Promise<number> {
+/** Files every unfiled row of any job; returns how many this call filed. */
+export async function sweepUnfiledFollowups(db: Db, host: GitHost, now: number): Promise<number> {
   const rows = db
     .prepare('SELECT * FROM followups WHERE filed_issue_number IS NULL ORDER BY id')
     .all() as FollowupRow[];
   let filed = 0;
-  for (const r of rows) if (await fileRow(db, host, r)) filed++;
+  for (const r of rows) if (await fileRow(db, host, r, now)) filed++;
   return filed;
 }
 

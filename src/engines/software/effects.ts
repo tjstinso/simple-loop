@@ -167,7 +167,11 @@ const FollowupsEffect = z.object({
 /**
  * Stores, then files. Deliberately outside `classified`: GitHostErrors are absorbed per item
  * (rows stay unfiled for the sweep), so this effect never fails the job; StaleDeliveryError and
- * bugs propagate. Replaying after a crash at any point never duplicates rows or issues.
+ * bugs propagate. Rows are stored with INSERT OR IGNORE (replays never duplicate rows). Each row is
+ * claimed (time-limited, atomic) before filing so a concurrent sweep or another worker skips it, and
+ * the marker lookup before createIssue covers a crash after create but before record. A claim that
+ * outlives its TTL (crashed filer) can be taken over, so duplicates are prevented, not merely unlikely,
+ * except when a filer stalls past the TTL.
  */
 async function fileFollowupsEffect(effect: Effect, ctx: EffectContext, fence: EffectFence): Promise<void> {
   const r = FollowupsEffect.safeParse(effect);
