@@ -36,7 +36,8 @@ The profile is `supervised` unless the issue carries the label `factory:profile:
 
 ## Prerequisites
 
-- Node.js 22 or newer. `package.json` has no `engines` field; the floor comes from the dependency `better-sqlite3` (`engines.node` is `>=22` in `node_modules/better-sqlite3/package.json`). The code itself needs `node:util` `parseArgs`, `Object.hasOwn` and `String.replaceAll`, and compiles to ES2022 with NodeNext modules. The build was verified here with Node 25.2.1.
+- Linux. Process identity (kill-before-reclaim, orphan reaping, the guard that never signals the worker's own process group) reads `/proc`. On another OS the start-time check that guards against pid reuse degrades to a bare existence check, and the own-process-group guard fails open, so a recycled pid or the worker's own group could be signalled. Run workers on Linux only.
+- Node.js 22 or newer (`"engines": { "node": ">=22" }` in `package.json`; the floor comes from `better-sqlite3`). The build was verified here with Node 25.2.1.
 - `git`, able to fetch and push over HTTPS to the repositories you submit (see the note on credentials below).
 - `gh`, the GitHub CLI, authenticated (`gh auth status`). Every GitHub call the engine makes goes through it.
 - `claude`, the Claude Code CLI, logged in.
@@ -81,7 +82,7 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | `keptWorktreeMaxAgeMs` | `604800000` (7 days) | Non-negative. A kept worktree whose dead letter is older than this, or resolved, is removed by the periodic sweep. |
 | `cloneUrlTemplate` | `https://github.com/{repo}.git` | Fetch and push URL; `{repo}` is replaced by `owner/name`. |
 
-Not configurable (set in `src/cli/runtime.ts`): lease 300000 ms, heartbeat 30000 ms, `maxDeliveries` 3 (a job whose lease expires on its third delivery is dead-lettered instead of requeued). The squash merge method is the default of `GhCliHost`.
+Not configurable (set in `src/cli/runtime.ts`): lease 300000 ms, heartbeat 30000 ms, `maxDeliveries` 3 (a job whose lease expires on its third delivery is dead-lettered instead of requeued). `delivery` counts every claim of the job, including claims after a worker's own stop handed the job back (SIGINT/SIGTERM), and `dlq retry` keeps the counter, so a job that was stopped twice, or retried after two deliveries, is dead-lettered the next time its lease expires. The squash merge method is the default of `GhCliHost`.
 
 ## Usage
 
@@ -104,7 +105,7 @@ $ factory submit https://github.com/acme/sandbox/issues/12
 chain 1 job 1 engine software
 ```
 
-**worker.** Runs until SIGINT or SIGTERM, one job at a time. `--poll-ms` (non-negative integer, default 1000) is the delay between empty polls; `--id` names the worker (default `<host>:<pid>:<random>`). Maintenance (reaping expired leases, pruning, follow-up and worktree sweeps) runs every 60 seconds. On a signal the worker aborts the current delivery, kills its agent processes and hands the job back to the queue.
+**worker.** Runs until SIGINT or SIGTERM, one job at a time. `--poll-ms` (non-negative integer, default 1000) is the delay between empty polls; `--id` names the worker (default `<host>:<pid>:<random>`). Give each worker a stable `--id` (for example `--id w1` in its service definition): at startup a worker kills the agent processes that a previous incarnation with the same id left behind (after a crash or `kill -9`). With the random default id nothing matches, and leftover agents are only killed when the reaper reclaims their expired lease. Maintenance (reaping expired leases, surfacing dead letters, pruning, follow-up and worktree sweeps) runs every 60 seconds. On a signal the worker aborts the current delivery, kills its agent processes and hands the job back to the queue.
 
 ```
 $ factory worker --id w1
