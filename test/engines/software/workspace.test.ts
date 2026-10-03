@@ -327,13 +327,13 @@ describe('GitWorkspaceProvider', () => {
       git(cacheOf(), ['config', `url.${decoy}.pushInsteadOf`, remote.url]);
 
       // Without sanitizing, the poisoned config redirects the engine's push to the decoy.
-      await plain.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null });
+      await plain.push(ws, { sha: await plain.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null });
       expect(git(decoy, ['branch', '--list', 'factory/issue-7'])).toContain('factory/issue-7');
       expect(git(remote.path, ['branch', '--list', 'factory/issue-7'])).toBe('');
 
       const safe = new ExecGitPorts({ prepareForPush: (w) => provider.sanitizeForPush(w) });
       await safe.prepareForPush(ws);
-      await safe.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null });
+      await safe.push(ws, { sha: await safe.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null });
       expect(git(remote.path, ['rev-parse', 'refs/heads/factory/issue-7'])).toBe(git(ws.path, ['rev-parse', 'HEAD']));
     });
 

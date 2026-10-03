@@ -8,17 +8,18 @@ export interface GitPorts {
   commitAll(ws: SoftwareWorkspace, message: string): Promise<boolean>;
   headSha(ws: SoftwareWorkspace): Promise<string>;
   /**
-   * Push HEAD to `refs/heads/<remoteBranch>` with `--force-with-lease` against `expectSha`
-   * (`null`: the branch must not exist). A failed lease throws StaleDeliveryError.
+   * Push the commit `sha` (the one `commit_push` scanned, not whatever HEAD is by then) to
+   * `refs/heads/<remoteBranch>` with `--force-with-lease` against `expectSha` (`null`: the branch
+   * must not exist). A failed lease throws StaleDeliveryError.
    */
-  push(ws: SoftwareWorkspace, args: { remoteBranch: string; expectSha: string | null }): Promise<void>;
+  push(ws: SoftwareWorkspace, args: { sha: string; remoteBranch: string; expectSha: string | null }): Promise<void>;
   /**
-   * What a push of HEAD would publish beyond `ws.seedSha` (the range `seedSha..HEAD`, every commit
+   * What a push of `sha` would publish beyond `ws.seedSha` (the range `seedSha..sha`, every commit
    * of it, so commits the agent made itself and files added then deleted again are included): the
    * added or modified paths, and the added lines plus each commit's author, committer and message.
    * Binary files contribute their paths only. `truncated` is true when the text hit the scan cap.
    */
-  addedChanges(ws: SoftwareWorkspace): Promise<AddedChanges>;
+  addedChanges(ws: SoftwareWorkspace, sha: string): Promise<AddedChanges>;
   /**
    * Optional: called by `commit_push` before it commits and pushes, to make the engine's own git
    * commands independent of repository config the agent could have written (see
@@ -241,7 +242,8 @@ export class ExecGitPorts implements GitPorts {
     return must(ws.path, ['rev-parse', '--verify', 'HEAD^{commit}'], this.local);
   }
 
-  async push(ws: SoftwareWorkspace, a: { remoteBranch: string; expectSha: string | null }): Promise<void> {
+  async push(ws: SoftwareWorkspace, a: { sha: string; remoteBranch: string; expectSha: string | null }): Promise<void> {
+    if (!SHA_RE.test(a.sha)) throw new Error(`invalid sha to push: ${JSON.stringify(a.sha)}`);
     if (!BRANCH_RE.test(a.remoteBranch) || a.remoteBranch.includes('..') || a.remoteBranch.endsWith('.lock')) {
       throw new Error(`invalid remote branch: ${JSON.stringify(a.remoteBranch)}`);
     }
@@ -256,7 +258,7 @@ export class ExecGitPorts implements GitPorts {
       `--force-with-lease=${ref}:${a.expectSha ?? ''}`,
       '--',
       ws.remoteUrl,
-      `HEAD:${ref}`,
+      `${a.sha}:${ref}`,
     ], this.network);
     if (r.code === 0) return;
     if (r.code === -1) throw new Error(`git push failed: ${r.stderr}`);
@@ -267,9 +269,10 @@ export class ExecGitPorts implements GitPorts {
     throw new Error(`git push failed: ${r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`}`);
   }
 
-  async addedChanges(ws: SoftwareWorkspace): Promise<AddedChanges> {
+  async addedChanges(ws: SoftwareWorkspace, sha: string): Promise<AddedChanges> {
     if (!SHA_RE.test(ws.seedSha)) throw new Error(`invalid seed sha: ${JSON.stringify(ws.seedSha)}`);
-    const range = `${ws.seedSha}..HEAD`;
+    if (!SHA_RE.test(sha)) throw new Error(`invalid sha to scan: ${JSON.stringify(sha)}`);
+    const range = `${ws.seedSha}..${sha}`;
     // Every commit in the range against its first parent: a merge shows what it brings in.
     const perCommit = ['--no-color', '--diff-merges=first-parent', range];
 

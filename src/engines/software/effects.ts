@@ -166,8 +166,8 @@ const secretValuesOf = (ctx: EffectContext): readonly string[] => ctx.secretValu
  * beyond the seed has a secret-looking file name, a line matching a known token pattern or an exact
  * secret value, or was too large to scan whole. The message names only the kinds, never the text.
  */
-async function assertNoSecrets(ctx: EffectContext, ws: SoftwareWorkspace): Promise<void> {
-  const changes = await ctx.git.addedChanges(ws);
+async function assertNoSecrets(ctx: EffectContext, ws: SoftwareWorkspace, sha: string): Promise<void> {
+  const changes = await ctx.git.addedChanges(ws, sha);
   const values = secretValuesOf(ctx);
   const kinds = [
     ...scanPaths(changes.paths),
@@ -193,16 +193,18 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
   // The agent could have written the shared repository config: sanitize before any engine git command.
   await ctx.git.prepareForPush?.(ws);
   await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
-  if ((await ctx.git.headSha(ws)) === ws.seedSha) {
+  // Pinned: the push sends exactly the commit that was scanned, even if HEAD moves meanwhile.
+  const head = await ctx.git.headSha(ws);
+  if (head === ws.seedSha) {
     // Nothing new in this delivery. If the branch was already published (e.g. a rerun after a
     // crash that followed the push), the work is on the remote: succeed so open_pr can proceed.
     if (ws.remoteHeadSha !== null) return;
     throw new EffectError('no changes produced', 'runner_error');
   }
-  await assertNoSecrets(ctx, ws);
+  await assertNoSecrets(ctx, ws, head);
   fence.assertCurrent();
   try {
-    await ctx.git.push(ws, { remoteBranch: branch, expectSha: ws.remoteHeadSha });
+    await ctx.git.push(ws, { sha: head, remoteBranch: branch, expectSha: ws.remoteHeadSha });
   } catch (e) {
     if (!(e instanceof StaleDeliveryError)) throw e;
     // The lease was rejected: the branch moved since this delivery was seeded. If a newer delivery

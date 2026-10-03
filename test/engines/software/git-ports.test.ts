@@ -62,12 +62,12 @@ describe('ExecGitPorts', () => {
     writeFileSync(join(ws.path, 'a.txt'), 'a\n');
     await ports.commitAll(ws, 'a');
     const first = await ports.headSha(ws);
-    await ports.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null });
+    await ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null });
     expect(remoteHead('factory/issue-7')).toBe(first);
 
     writeFileSync(join(ws.path, 'b.txt'), 'b\n');
     await ports.commitAll(ws, 'b');
-    await expect(ports.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toBeInstanceOf(StaleDeliveryError);
+    await expect(ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toBeInstanceOf(StaleDeliveryError);
     expect(remoteHead('factory/issue-7')).toBe(first);
   });
 
@@ -75,11 +75,11 @@ describe('ExecGitPorts', () => {
     writeFileSync(join(ws.path, 'a.txt'), 'a\n');
     await ports.commitAll(ws, 'a');
     const first = await ports.headSha(ws);
-    await ports.push(ws, { remoteBranch: 'factory/issue-7', expectSha: null });
+    await ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null });
     writeFileSync(join(ws.path, 'b.txt'), 'b\n');
     await ports.commitAll(ws, 'b');
     const second = await ports.headSha(ws);
-    await ports.push(ws, { remoteBranch: 'factory/issue-7', expectSha: first });
+    await ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: first });
     expect(remoteHead('factory/issue-7')).toBe(second);
   });
 
@@ -90,7 +90,7 @@ describe('ExecGitPorts', () => {
     const moved = remote.commit('factory/issue-7', 'other.txt', 'o\n');
     writeFileSync(join(ws2.path, 'mine.txt'), 'm\n');
     await ports.commitAll(ws2, 'mine');
-    await expect(ports.push(ws2, { remoteBranch: 'factory/issue-7', expectSha: ws2.remoteHeadSha })).rejects.toBeInstanceOf(
+    await expect(ports.push(ws2, { sha: await ports.headSha(ws2), remoteBranch: 'factory/issue-7', expectSha: ws2.remoteHeadSha })).rejects.toBeInstanceOf(
       StaleDeliveryError,
     );
     expect(remoteHead('factory/issue-7')).toBe(moved);
@@ -98,15 +98,15 @@ describe('ExecGitPorts', () => {
 
   it('other push failures throw a plain Error with git stderr', async () => {
     const broken = { ...ws, remoteUrl: join(root, 'does-not-exist.git') };
-    const err = await ports.push(broken, { remoteBranch: 'factory/issue-7', expectSha: null }).catch((e: unknown) => e);
+    const err = await ports.push(broken, { sha: ws.seedSha, remoteBranch: 'factory/issue-7', expectSha: null }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toBeInstanceOf(StaleDeliveryError);
     expect((err as Error).message).toMatch(/does-not-exist/);
   });
 
   it('rejects a remote branch name that could be read as an option or a bad ref', async () => {
-    await expect(ports.push(ws, { remoteBranch: '--delete', expectSha: null })).rejects.toThrow(/invalid remote branch/);
-    await expect(ports.push(ws, { remoteBranch: 'a b', expectSha: null })).rejects.toThrow(/invalid remote branch/);
+    await expect(ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: '--delete', expectSha: null })).rejects.toThrow(/invalid remote branch/);
+    await expect(ports.push(ws, { sha: await ports.headSha(ws), remoteBranch: 'a b', expectSha: null })).rejects.toThrow(/invalid remote branch/);
   });
 
   it('a git network command that hangs is killed at networkTimeoutMs, with ssh in batch mode', async () => {
@@ -122,7 +122,7 @@ describe('ExecGitPorts', () => {
       const p = new ExecGitPorts({ networkTimeoutMs: 100 });
       await p.commitAll(ws, 'n');
       const started = process.hrtime.bigint();
-      await expect(p.push({ ...ws, remoteUrl: 'git://factory-test.invalid/r.git' }, { remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toThrow(
+      await expect(p.push({ ...ws, remoteUrl: 'git://factory-test.invalid/r.git' }, { sha: await p.headSha(ws), remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toThrow(
         /git push timed out after 100 ms/,
       );
       expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(5_000);
@@ -141,7 +141,7 @@ describe('ExecGitPorts', () => {
       writeFileSync(join(ws.path, 'dir', 'b.txt'), 'bee\n');
       writeFileSync(join(ws.path, 'odd\nname.txt'), 'odd\n');
       await ports.commitAll(ws, 'work');
-      const c = await ports.addedChanges(ws);
+      const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect([...c.paths].sort()).toEqual(['dir/b.txt', 'new.txt', 'odd\nname.txt']);
       const lines = c.text.split('\n');
       expect(lines).toEqual(expect.arrayContaining(['first line', 'second line', 'bee', 'odd']));
@@ -153,7 +153,7 @@ describe('ExecGitPorts', () => {
     it('keeps only the added lines of a modified file', async () => {
       writeFileSync(join(ws.path, 'README.md'), 'hello\nadded below\n');
       await ports.commitAll(ws, 'edit');
-      const c = await ports.addedChanges(ws);
+      const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect(c.paths).toEqual(['README.md']);
       expect(c.text.split('\n')).toContain('added below');
       expect(c.text.split('\n')).not.toContain('hello');
@@ -167,7 +167,7 @@ describe('ExecGitPorts', () => {
       git(ws.path, ['commit', '-q', '-m', 'remove it again']);
       writeFileSync(join(ws.path, 'later.txt'), '++starts with two pluses\n');
       await ports.commitAll(ws, 'leftover');
-      const c = await ports.addedChanges(ws);
+      const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect([...c.paths].sort()).toEqual(['.env', 'later.txt']);
       const lines = c.text.split('\n');
       expect(lines).toContain('PLANTED=agent-commit-value');
@@ -180,14 +180,14 @@ describe('ExecGitPorts', () => {
       writeFileSync(join(ws.path, '.gitattributes'), 'hidden.txt -diff\n');
       writeFileSync(join(ws.path, 'hidden.txt'), 'hidden content\n');
       await ports.commitAll(ws, 'attrs');
-      const c = await ports.addedChanges(ws);
+      const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect(c.text.split('\n')).toContain('hidden content');
     });
 
     it('scans a binary file by its path only', async () => {
       writeFileSync(join(ws.path, 'blob.bin'), Buffer.from([0, 1, 2, 0, 0x41, 0x42, 0x43, 0x0a]));
       await ports.commitAll(ws, 'bin');
-      const c = await ports.addedChanges(ws);
+      const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect(c.paths).toEqual(['blob.bin']);
       expect(c.text).not.toContain('ABC');
     });
@@ -196,14 +196,32 @@ describe('ExecGitPorts', () => {
       writeFileSync(join(ws.path, 'big.txt'), 'y'.repeat(200) + '\n');
       const small = new ExecGitPorts({ scanCapBytes: 64 });
       await small.commitAll(ws, 'big');
-      const c = await small.addedChanges(ws);
+      const c = await small.addedChanges(ws, await ports.headSha(ws));
       expect(c.truncated).toBe(true);
       expect(Buffer.byteLength(c.text)).toBeLessThanOrEqual(64);
-      expect((await new ExecGitPorts({ scanCapBytes: 4096 }).addedChanges(ws)).truncated).toBe(false);
+      expect((await new ExecGitPorts({ scanCapBytes: 4096 }).addedChanges(ws, await ports.headSha(ws))).truncated).toBe(false);
+    });
+
+    it('scans up to the given sha only, and push sends that sha, not a later HEAD', async () => {
+      writeFileSync(join(ws.path, 'first.txt'), 'first\n');
+      await ports.commitAll(ws, 'first');
+      const pinned = await ports.headSha(ws);
+      writeFileSync(join(ws.path, 'second.txt'), 'second\n');
+      await ports.commitAll(ws, 'second');
+      const c = await ports.addedChanges(ws, pinned);
+      expect(c.paths).toEqual(['first.txt']);
+      expect(c.text.split('\n')).not.toContain('second');
+      await ports.push(ws, { sha: pinned, remoteBranch: 'factory/issue-7', expectSha: null });
+      expect(remoteHead('factory/issue-7')).toBe(pinned);
+    });
+
+    it('rejects a sha that is not a full object id', async () => {
+      await expect(ports.addedChanges(ws, 'HEAD')).rejects.toThrow(/invalid/);
+      await expect(ports.push(ws, { sha: '--all', remoteBranch: 'factory/issue-7', expectSha: null })).rejects.toThrow(/invalid/);
     });
 
     it('is empty when HEAD is the seed', async () => {
-      expect(await ports.addedChanges(ws)).toEqual({ paths: [], text: '', truncated: false });
+      expect(await ports.addedChanges(ws, await ports.headSha(ws))).toEqual({ paths: [], text: '', truncated: false });
     });
   });
 

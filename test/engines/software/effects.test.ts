@@ -138,8 +138,8 @@ describe('runSoftwareEffect', () => {
       pushes = 0;
       commitAll(ws: SoftwareWorkspace, m: string) { return ports.commitAll(ws, m); }
       headSha(ws: SoftwareWorkspace) { return ports.headSha(ws); }
-      addedChanges(ws: SoftwareWorkspace) { return ports.addedChanges(ws); }
-      push(ws: SoftwareWorkspace, a: { remoteBranch: string; expectSha: string | null }) { this.pushes++; return ports.push(ws, a); }
+      addedChanges(ws: SoftwareWorkspace, sha: string) { return ports.addedChanges(ws, sha); }
+      push(ws: SoftwareWorkspace, a: { sha: string; remoteBranch: string; expectSha: string | null }) { this.pushes++; return ports.push(ws, a); }
     }
 
     it('commit_push on an already-published branch with no new changes succeeds without pushing', async () => {
@@ -282,6 +282,31 @@ describe('runSoftwareEffect', () => {
         git(ws.path, ['rm', '-q', 'leak.txt']);
         git(ws.path, ['commit', '-q', '-m', 'agent removes it again']);
         expect((await refuse(ws)).message).toMatch(/known-secret-value/);
+      });
+
+      it('commit_push pushes the sha it scanned even when HEAD moves after the scan', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'clean.txt'), 'clean\n');
+        let scanned = '';
+        const racing: GitPorts = {
+          commitAll: (w, m) => ports.commitAll(w, m),
+          headSha: (w) => ports.headSha(w),
+          addedChanges: async (w, sha) => {
+            scanned = sha;
+            const c = await ports.addedChanges(w, sha);
+            // A leftover background process commits a secret right after the scan.
+            writeFileSync(join(w.path, 'late.txt'), `${API_KEY}\n`);
+            git(w.path, ['add', '.']);
+            git(w.path, ['commit', '-q', '-m', 'late']);
+            return c;
+          },
+          push: (w, a) => ports.push(w, a),
+        };
+        await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: racing, secretValues: secrets }), fence());
+        expect(scanned).toMatch(/^[0-9a-f]{40}$/);
+        expect(remoteHead()).toBe(scanned);
+        expect(git(ws.path, ['rev-parse', 'HEAD'])).not.toBe(scanned);
+        expect(git(remote.path, ['ls-tree', '-r', '--name-only', remoteHead()])).not.toContain('late.txt');
       });
 
       it('a scan that hit its cap refuses the push as scan-truncated', async () => {
