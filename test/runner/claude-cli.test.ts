@@ -255,12 +255,13 @@ describe('ClaudeCliRunner', () => {
 
   it('enforces the hard timeoutMs even when events keep arriving', async () => {
     const pidFile = join(tmp('cli-pids-'), 'pids.json');
-    const started = Date.now();
     const err = await runner('forever', { STUB_PID_FILE: pidFile })
-      .run(input({ config: config({ inactivityTimeoutMs: 400, timeoutMs: 700 }) }), signal(), trackingHooks())
+      .run(input({ config: config({ inactivityTimeoutMs: 5000, timeoutMs: 700 }) }), signal(), trackingHooks())
       .then(() => null, (e: unknown) => e);
     expect((err as { reason?: string }).reason).toBe('timeout');
-    expect(Date.now() - started).toBeGreaterThanOrEqual(650);
+    // The message tells the two timers apart without measuring wall-clock time: only the hard
+    // timer says "time limit", and the inactivity timer cannot fire while the stub keeps emitting.
+    expect((err as Error).message).toContain('700 ms time limit');
     const { pid, grandchild } = readPids(pidFile);
     await expectDead(pid);
     await expectDead(grandchild!);
