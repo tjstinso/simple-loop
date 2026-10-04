@@ -52,7 +52,7 @@ class RecordingGit implements GitPorts {
 
 const ws: SoftwareWorkspace = {
   repo: 'acme/widgets', path: '/ws', localBranch: 'l', remoteBranch: 'factory/issue-7', remoteUrl: '/r.git',
-  remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
+  remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main', cacheDir: '/cache/o__r.git',
 };
 
 function make(opts: { sleep?: (ms: number) => Promise<void>; secretValues?: () => readonly string[] } = {}) {

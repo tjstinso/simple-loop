@@ -9,6 +9,7 @@ import { parseStreamLine } from '../../src/runner/stream.js';
 import type { RunHooks, RunInput } from '../../src/runner/types.js';
 import type { Job } from '../../src/kernel/types.js';
 import { readProcessStartTime } from '../../src/util/proc.js';
+import { makePluginRepo } from '../support/plugin-repo.js';
 import { runnerContract } from './contract.js';
 
 const STUB = resolve(import.meta.dirname, '../support/stub-claude.mjs');
@@ -438,12 +439,12 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
   });
 
   it('pluginDirs adds one --plugin-dir per entry in both bare modes, before the prompt', async () => {
-    const ws = tmp('cli-ws-plug-');
-    mkdirSync(join(ws, 'tools'));
-    mkdirSync(join(ws, 'tools', 'a'));
+    const pr = makePluginRepo({ 'tools/a/plugin.json': '{}\n' });
+    tmpDirs.push(pr.path);
+    const ws = pr.path;
     const other = tmp('cli-plug-abs-');
     for (const bare of [true, false]) {
-      const inp = input({ workspace: { path: ws }, config: config({ resultFormat: 'json', bare, pluginDirs: ['tools/a', other] }) });
+      const inp = input({ workspace: { path: ws }, pluginBase: pr.base, config: config({ resultFormat: 'json', bare, pluginDirs: ['tools/a', other] }) });
       const { argv } = (await runner('echo').run(inp, signal())) as { argv: string[] };
       const flags = argv.filter((a) => a.startsWith('--plugin-dir'));
       expect(flags).toEqual([`--plugin-dir=${join(ws, 'tools', 'a')}`, `--plugin-dir=${other}`]);
@@ -451,6 +452,20 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
       expect(argv.includes('--bare')).toBe(bare);
       expect(argv[argv.indexOf('--') + 1]).toContain('Do the thing.');
     }
+  });
+
+  it('run fails before spawning when a relative plugin directory differs from the base branch', async () => {
+    const pr = makePluginRepo({ 'tools/a/plugin.json': '{}\n' });
+    tmpDirs.push(pr.path);
+    writeFileSync(join(pr.path, 'tools/a/plugin.json'), '{"changed":true}\n');
+    const spawnSpy = vi.fn();
+    const r = new ClaudeCliRunner({ bin: STUB, env: { ANTHROPIC_API_KEY: 'k' }, spawn: spawnSpy as unknown as typeof realSpawn });
+    for (const pluginBase of [pr.base, undefined]) {
+      await expect(
+        r.run(input({ workspace: { path: pr.path }, pluginBase, config: config({ pluginDirs: ['tools/a'] }) }), signal()),
+      ).rejects.toThrow(/'tools\/a'.*only after a person merges them/);
+    }
+    expect(spawnSpy).not.toHaveBeenCalled();
   });
 
   it('buildArgs adds nothing for an empty pluginDirs and keeps the prompt last after `--`', () => {

@@ -287,6 +287,8 @@ Two default policies ship:
 
 Example: a policy that gives the agent the TypeScript language server from `tools/ts-lsp/` (needs `npm install` in the worktree; whether it works with `bare: true` is unconfirmed, see `docs/smoke-test.md`). The shipped policies leave `pluginDirs` empty.
 
+A relative plugin directory must match the base branch; changes to plugins need a human merge first. A plugin's `command` (for example a language server) is started by the CLI as a separate process, outside the agent's tool permissions, so a directory the execute agent could edit would let it run code later, including in the review run. Before the agent is spawned the runner compares the directory with `refs/remotes/origin/<baseBranch>` in the shared cache (`git ls-tree`, hardened like the other scan commands): every file must be present with the same content and executable bit, and no other file may exist under it (untracked, ignored or generated, such as an installed `node_modules/`), and a symlink anywhere inside it is refused. A failing check fails the run before spawning, with an error that names the entry and says plugin changes take effect only after a person merges them (it contains no file contents). So a plugin that needs installed dependencies belongs in an absolute `pluginDirs` entry. Absolute entries are operator configuration and are not checked. This does not cover the branch's own `CLAUDE.md` and `.claude/settings.json`, which the agent can also write and the next run reads: that is a known, documented limit.
+
 ```yaml
 config:
   # ...the other fields of software-execute.yaml...

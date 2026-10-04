@@ -20,7 +20,7 @@ const job = (type: string, payload: unknown = {}): Job => ({
 });
 const ws: SoftwareWorkspace = {
   repo: 'acme/widgets', path: '/ws', localBranch: 'l', remoteBranch: 'factory/issue-7', remoteUrl: '/r.git',
-  remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
+  remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main', cacheDir: '/cache/o__r.git',
 };
 const issue = { number: 7, title: 'Add thing', body: '## Goal\nx', labels: ['bug'], state: 'open', author: 'eve', url: 'http://x' } as Issue;
 const pr = { number: 12, baseBranch: 'main' };
@@ -36,6 +36,12 @@ describe('buildSoftwareRunInput', () => {
     });
     expect(out.workspace).toBe(ws);
     expect(out.job.id).toBe(42);
+  });
+
+  it('supplies the cache and base branch for the plugin directory check, on execute and review', () => {
+    for (const out of [buildSoftwareRunInput(chain, job('execute'), ws, issue, null), buildSoftwareRunInput(chain, job('review'), ws, issue, pr)]) {
+      expect(out.pluginBase).toEqual({ cacheDir: ws.cacheDir, baseBranch: 'main' });
+    }
   });
 
   it('passes review feedback from the job payload on a revise attempt', () => {

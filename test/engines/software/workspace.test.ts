@@ -47,6 +47,7 @@ describe('GitWorkspaceProvider', () => {
     expect(ws.remoteHeadSha).toBeNull();
     expect(ws.seedSha).toBe(mainHead);
     expect(ws.baseBranch).toBe('main');
+    expect(ws.cacheDir).toBe(join(root, '.cache', 'acme__widgets.git'));
     expect(ws.path).toBe(join(root, '1', 'j1-d1'));
     expect(ws.remoteBranch).toBe('factory/issue-7');
     expect(ws.remoteUrl).toBe(remote.url);

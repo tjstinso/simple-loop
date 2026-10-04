@@ -33,7 +33,13 @@ export function buildSoftwareRunInput(
   } else {
     subject = { kind: 'execute', ...base };
   }
-  const out: Omit<RunInput, 'config'> = { job, workspace, subject };
+  // A relative plugin directory is compared against the base branch in the shared cache.
+  const out: Omit<RunInput, 'config'> = {
+    job,
+    workspace,
+    subject,
+    pluginBase: { cacheDir: workspace.cacheDir, baseBranch: workspace.baseBranch },
+  };
   const payload = job.payload as { feedback?: unknown } | null | undefined;
   const feedback = payload?.feedback;
   if (typeof feedback === 'string' && feedback !== '') out.feedback = feedback;
