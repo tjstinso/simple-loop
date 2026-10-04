@@ -169,9 +169,9 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | Field | Default | Meaning |
 |---|---|---|
 | `dbPath` | `./factory.db` | SQLite database file. |
-| `policiesDir` | absent | Directory scanned for `*.yaml` policy files, applied on top of the shipped policies. When the key is absent, `./policies` next to the config file is still read if it exists (the old default). Required when `shippedPolicies` is `false`. |
+| `policiesDir` | `./policies` next to the config file, used only if that directory exists | Directory scanned for `*.yaml` policy files, applied on top of the shipped policies. Required (it must be set explicitly or `./policies` must exist) when `shippedPolicies` is `false`. |
 | `shippedPolicies` | `true` | Load the policies that ship with the package (found from the installed package location, not the current directory) before `policiesDir`. |
-| `policyOverrides` | absent | Object keyed by policy name; see "Overriding policy settings". |
+| `policyOverrides` | `{}` (no overrides) | Object keyed by policy name; see "Overriding policy settings". |
 | `workspaceRoot` | `./.factory/workspaces` | Root for the bare repository cache (`.cache/`) and the per-delivery worktrees (`<chainId>/j<jobId>-d<delivery>`). |
 | `defaultEngine` | `software` | Engine used when a submission names none. |
 | `defaultProfile` | `supervised` | `supervised` or `automatic`; used when the issue has no `factory:profile:automatic` label. |

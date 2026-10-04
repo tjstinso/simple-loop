@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { REDACTED, redactSecrets, SECRET_ENV_NAME } from '../engines/software/secret-scan.js';
@@ -32,15 +32,11 @@ export function forbiddenOverrideKey(override: Record<string, unknown>): string 
   return Object.keys(override).find((k) => !(OVERRIDABLE_KEYS as readonly string[]).includes(k));
 }
 
-/** The package's `policies/` directory, found from this module's location (not the current directory). */
+/** The `policies/` directory next to the nearest package.json above this module (not the current directory). */
 export function shippedPoliciesDir(): string {
   let dir = dirname(fileURLToPath(import.meta.url));
   for (;;) {
-    const pkg = join(dir, 'package.json');
-    if (existsSync(pkg)) {
-      const name = (JSON.parse(readFileSync(pkg, 'utf8')) as { name?: unknown }).name;
-      if (name === 'software-factory') return join(dir, 'policies');
-    }
+    if (existsSync(join(dir, 'package.json'))) return join(dir, 'policies');
     const parent = dirname(dir);
     if (parent === dir) throw new Error('cannot locate the shipped policies directory');
     dir = parent;
