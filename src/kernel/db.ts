@@ -74,13 +74,26 @@ CREATE TABLE IF NOT EXISTS dead_letters (
   chain_id INTEGER NOT NULL REFERENCES chains(id),
   reason TEXT NOT NULL CHECK (reason IN ('runner_error','timeout','max_deliveries','effect_error')),
   error TEXT NOT NULL,
-  step_log_path TEXT,
   created_at INTEGER NOT NULL,
   resolved_at INTEGER,
   -- Set once the chain's engine surfaced the dead letter; NULL rows are retried by maintenance.
   surfaced_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS dead_letters_job ON dead_letters(job_id);
+
+-- Append-only log of lifecycle transitions; written only through recordEvent (events.ts).
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  chain_id INTEGER NOT NULL,
+  job_id INTEGER,
+  delivery INTEGER,
+  kind TEXT NOT NULL,
+  engine TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS events_chain ON events(chain_id, id);
+CREATE INDEX IF NOT EXISTS events_at ON events(at);
 `;
 
 export function migrate(db: Database.Database, extra: string[] = []): void {

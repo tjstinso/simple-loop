@@ -237,6 +237,20 @@ describe('runSoftwareEffect', () => {
         expect(host.prs.size).toBe(0);
       });
 
+      it('records secret_guard.refused with the kinds only', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'config.txt'), `key = ${API_KEY}\n`);
+        const events: { kind: string; detail?: Record<string, unknown> }[] = [];
+        const events_ = (kind: string, detail?: Record<string, unknown>) => void events.push({ kind, detail });
+        await runSoftwareEffect(
+          { kind: 'commit_push' },
+          ctx({ workspace: ws, git: ports, secretValues: secrets, events: events_ }),
+          fence(),
+        ).catch(() => undefined);
+        expect(events).toEqual([{ kind: 'secret_guard.refused', detail: { kinds: ['anthropic-key', 'known-secret-value'] } }]);
+        expect(JSON.stringify(events)).not.toContain(API_KEY);
+      });
+
       it('commit_push refuses a file with a github token pattern', async () => {
         const ws = await provider.prepare(chain(), job());
         writeFileSync(join(ws.path, 'src.ts'), `export const t = '${GH_TOKEN}';\n`);

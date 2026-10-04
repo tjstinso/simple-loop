@@ -25,6 +25,8 @@ export interface EffectContext {
    * the commit message and the PR title and body (default: none, so only the patterns apply).
    */
   secretValues?: () => readonly string[];
+  /** Records a lifecycle event for this chain and delivery (detail: structured, never agent text). */
+  events?: (kind: string, detail?: Record<string, unknown>) => void;
 }
 
 const MAX_ATTEMPTS = 3;
@@ -186,6 +188,7 @@ async function assertNoSecrets(ctx: EffectContext, ws: SoftwareWorkspace, sha: s
   ].map((f) => f.kind);
   if (kinds.length === 0) return;
   const list = findingsOf(kinds).map((f) => f.kind).join(', ');
+  ctx.events?.('secret_guard.refused', { kinds: findingsOf(kinds).map((f) => f.kind) });
   throw new EffectError(`refusing to push: the change contains a secret (${list}); the matched text is not shown`, 'runner_error');
 }
 
@@ -238,12 +241,14 @@ async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   const body = [`Closes #${issueNumber}`, ...(safeSummary ? [safeSummary] : []), marker].join('\n\n');
   fence.assertCurrent();
   await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: titleOf(ctx, issue), body });
+  ctx.events?.('pr.opened', { branch, base: ws.baseBranch });
 }
 
 async function setLabels(ctx: EffectContext, fence: EffectFence, e: Extract<Supported, { kind: 'set_labels' }>): Promise<void> {
   const n = await targetNumber(ctx, e.target, 'no PR found for label target');
   fence.assertCurrent();
   await ctx.host.setLabels(ctx.chain.state.repo, n, e.add, e.remove);
+  ctx.events?.('labels.changed', { target: e.target, add: e.add, remove: e.remove });
 }
 
 async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
@@ -259,6 +264,7 @@ async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   // runner_error dead letter clears the verdict on retry, so the review reruns on the current head.
   if (!ctx.workspace) throw new EffectError('cannot verify the reviewed head; the review will be redone', 'runner_error');
   fence.assertCurrent();
+  ctx.events?.('merge.requested', { pr: pr.number });
   try {
     await ctx.host.mergePr(repo, pr.number, { expectHeadSha: ctx.workspace.seedSha });
   } catch (err) {
@@ -275,6 +281,11 @@ async function comment(ctx: EffectContext, fence: EffectFence, e: Extract<Suppor
   if (await ctx.host.findComment(repo, n, e.marker)) return;
   fence.assertCurrent();
   await ctx.host.comment(repo, n, `${e.body}\n\n${e.marker}`);
+}
+
+function unfiledCount(db: Database.Database, jobId: number): number {
+  const r = db.prepare('SELECT COUNT(*) AS n FROM followups WHERE job_id = ? AND filed_issue_number IS NULL').get(jobId) as { n: number };
+  return r.n;
 }
 
 const FollowupsEffect = z.object({
@@ -300,7 +311,10 @@ async function fileFollowupsEffect(effect: Effect, ctx: EffectContext, fence: Ef
   const { repo, issueNumber } = ctx.chain.state;
   storeFollowups(db, { jobId: ctx.job.id, chainId: ctx.chain.id, repo, issueNumber }, r.data.followups, now());
   const values = secretValuesOf(ctx);
+  const before = unfiledCount(db, ctx.job.id);
   await fileFollowups(db, ctx.host, ctx.job.id, now(), () => fence.assertCurrent(), (t) => redactSecrets(t, values));
+  const filed = before - unfiledCount(db, ctx.job.id);
+  if (filed > 0) ctx.events?.('followup.filed', { count: filed });
 }
 
 /**

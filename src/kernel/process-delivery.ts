@@ -134,6 +134,13 @@ export async function processDelivery(
     if (!parsed.success) {
       return await fail('runner_error', `invalid engine state for chain ${chain.id}: ${parsed.error.message}`);
     }
+    if (engine.onJobStart) {
+      try {
+        await engine.onJobStart(view, job);
+      } catch (e) {
+        report(deps, e, `onJobStart for job ${job.id}`);
+      }
+    }
     return await deliver(deps, engine, view, job, fence, workerId, signal, fail);
   } finally {
     try {

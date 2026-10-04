@@ -134,7 +134,7 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
       } catch (e) {
         if (!(e instanceof DeadLetterStateError)) throw e;
       }
-    } else if (requeueJob(db, job.id, { delivery: job.delivery })) {
+    } else if (requeueJob(db, job.id, { delivery: job.delivery, now: deps.now, why: 'lease expired' })) {
       report.requeued.push(job.id);
     }
   };

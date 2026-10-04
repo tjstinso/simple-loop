@@ -354,7 +354,14 @@ function buildResult(cfg: ClaudeCliConfig, o: Outcome): unknown {
 
   if (cfg.resultFormat === 'json') {
     if (failure !== null) return { status: 'error', summary: failure };
-    return block.ok ? block.value : { status: 'error', summary: block.reason };
+    if (!block.ok) return { status: 'error', summary: block.reason };
+    // The model's own cost is not part of its answer: record it with the result.
+    const cost = o.collector.costUsd();
+    const v = block.value;
+    if (cost !== undefined && v !== null && typeof v === 'object' && !Array.isArray(v) && !('costUsd' in v)) {
+      return { ...v, costUsd: cost };
+    }
+    return v;
   }
 
   const parsed = block.ok ? blockSchema.safeParse(block.value) : null;
