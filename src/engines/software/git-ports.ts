@@ -380,7 +380,6 @@ export class ExecGitPorts implements GitPorts {
   private readonly network: number;
   private readonly scanCap: number;
   private readonly commitEnv: Record<string, string>;
-  private readonly pushEnv: Record<string, string>;
   private readonly pushConfig: string[];
 
   constructor(private readonly opts: ExecGitPortsOptions = {}) {
@@ -394,7 +393,6 @@ export class ExecGitPorts implements GitPorts {
       GIT_COMMITTER_NAME: id.name,
       GIT_COMMITTER_EMAIL: id.email,
     };
-    this.pushEnv = opts.auth === undefined ? {} : gitAuthEnv(opts.auth);
     this.pushConfig = opts.auth === undefined ? [] : NO_CREDENTIAL_HELPER_ARGS;
   }
 
@@ -438,7 +436,7 @@ export class ExecGitPorts implements GitPorts {
       '--',
       ws.remoteUrl,
       `${a.sha}:${ref}`,
-    ], this.network, undefined, false, this.pushEnv);
+    ], this.network, undefined, false, this.opts.auth === undefined ? {} : gitAuthEnv(this.opts.auth));
     if (r.code === 0) return;
     if (r.code === -1) throw new Error(`git push failed: ${r.stderr}`);
     const out = `${r.stdout}\n${r.stderr}`;
