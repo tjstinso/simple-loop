@@ -271,6 +271,10 @@ npm run build     # tsc
 
 Tests use fakes for GitHub (`test/support/fake-github.ts`) and the model (a stub `claude` script, `test/support/stub-claude.mjs`, and `src/runner/fake.ts`), plus real temporary git repositories. `test/support/harness.ts` wires a software engine, kernel and fake host together for the end-to-end scenario tests in `test/scenarios` (`software-engine.test.ts`, `zombie.test.ts`). Nothing in the automated suite talks to GitHub or a real model; see [docs/smoke-test.md](docs/smoke-test.md) for the manual run that does.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`, on Node 22 and 24. After checking that `git` is 2.32 or newer, it runs `npm ci`, `npx tsc --noEmit`, `npm run build` and `npm test` as separate steps. Wait for it to pass before merging, including pull requests the factory opens.
+
 ## Known limitations
 
 - Single machine only: the queue is a SQLite file and the kernel kills worker and agent PIDs locally. Workers on separate hosts are not supported.
