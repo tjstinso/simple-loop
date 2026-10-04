@@ -37,9 +37,34 @@ waiting (awaiting_merge / needs_human), checked by every worker's maintenance pa
    +-- PR still open ------> nothing
 ```
 
-**Reconciling waiting chains.** A chain waiting on a person (`awaiting_merge` or `needs_human`) finishes by itself when the pull request is settled. Every maintenance pass (every 60 seconds in every worker, so the latency is up to a minute plus the time of the pass) looks up the pull request of each `waiting` chain once, by its branch `factory/issue-<n>`. A merged pull request completes the chain (phase `merged`); one closed without merging cancels it, which frees the issue for a new `submit`. Either way the factory removes `factory:ready-for-merge`, `factory:needs-human`, `factory:in-progress` and `factory:dead-letter` from the issue and posts one comment (`Pull request #<n> was merged` or `Pull request #<n> was closed without merging; this chain was cancelled`, hidden marker so it is never posted twice). An open pull request, a missing one and a transient GitHub failure (no HTTP status, 429, 5xx) leave the chain as it is; the next pass retries. A failure to label or comment is printed as an error and does not undo the transition. The change only applies to a chain that is still `waiting`, so a concurrent `factory cancel` or a second worker never conflicts. `dead_lettered` and `active` chains are not reconciled. `factory cancel` keeps working for manual use.
+**Reconciling waiting chains.** A chain waiting on a person (`awaiting_merge` or `needs_human`) or on CI (`awaiting_ci`) finishes by itself when the pull request is settled. Every maintenance pass (every 60 seconds in every worker, so the latency is up to a minute plus the time of the pass) looks up the pull request of each `waiting` chain once, by its branch `factory/issue-<n>`. A merged pull request completes the chain (phase `merged`); one closed without merging cancels it, which frees the issue for a new `submit`. Either way the factory removes `factory:ready-for-merge`, `factory:needs-human`, `factory:in-progress` and `factory:dead-letter` from the issue and posts one comment (`Pull request #<n> was merged` or `Pull request #<n> was closed without merging; this chain was cancelled`, hidden marker so it is never posted twice). An open pull request, a missing one and a transient GitHub failure (no HTTP status, 429, 5xx) leave the chain as it is; the next pass retries. A failure to label or comment is printed as an error and does not undo the transition. The change only applies to a chain that is still `waiting`, so a concurrent `factory cancel` or a second worker never conflicts. `dead_lettered` and `active` chains are not reconciled. `factory cancel` keeps working for manual use.
 
 The profile is `supervised` unless the issue carries the label `factory:profile:automatic` at submit time (or `defaultProfile` in the config says otherwise). Both profiles allow 3 attempts. Follow-up items that the agent or reviewer report are filed as new issues labeled `factory:followup`.
+
+### CI gate
+
+The reviewer cannot run tests or the build, so CI is the only real verification. A `ci` object in the **review** policy's `config` makes the factory check the pull request's CI before it merges. The shipped review policy sets `ci: { required: all }`. Without a `ci` object nothing changes: the `automatic` profile merges as soon as the reviewer approves.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `required` | `all` | `all` (every check of the commit must pass) or a list of check names, for example `["check (node 22)", "check (node 24)"]`. Other checks are ignored; a listed check that has not been reported yet counts as pending. |
+| `waitMinutes` | `20` (minimum 1) | How long to wait for pending checks, counted from the approval. |
+| `onFailure` | `revise` | `revise`: the failure goes to the agent as feedback and it revises, like a request for changes. `hold`: the chain goes to `needs_human` at once. |
+| `onNone` | `hold` | What to do when the commit has no checks at all: `hold` (`needs_human`) or `merge`. |
+
+A check is read from both the check-runs and the legacy commit-status endpoints. It passes when it completed with `success`, `neutral` or `skipped`; a check that completed with anything else (`failure`, `timed_out`, `cancelled`, `action_required`, ...) failed; one that has not completed is pending. The checks are always read for the exact head the reviewer saw (never for the branch's current head), and the merge stays pinned to that head.
+
+`automatic` profile: after the approval the chain waits in phase `awaiting_ci` (status `waiting`) and every maintenance pass (60 seconds) re-checks.
+- All required checks pass: the pull request is merged and the chain completes.
+- A required check failed with `onFailure: revise`: the next `execute` attempt is queued with feedback naming the failing checks, their conclusions and details URLs and, when GitHub still has it, the last 200 lines of the failing job's log (redacted, at most 20,000 characters). It counts against the 3 attempts. The revision is pushed, reviewed again and gated again on its own new head. When the attempts are used up, the chain goes to `needs_human` with the label `factory:needs-human` and one comment naming the failing checks.
+- Checks still pending after `waitMinutes`: `needs_human` and one comment (`CI did not finish within N minutes`).
+- If the pull request head moved after the review, the merge is refused and the chain goes to `needs_human`.
+
+`supervised` profile: nothing is merged. When a `ci` policy is set, the factory posts the CI result of the reviewed head once as a comment on the pull request (hidden marker) as soon as it is passing or failing, so you see it without opening the checks tab; while checks are pending the label `factory:ready-for-merge` is set and the comment follows when the state changes.
+
+Events: `ci.checked` (state and failing check names, recorded when they change), `ci.waiting`, `ci.failed` and `ci.timeout`; `factory show <chain>` lists them.
+
+This gate is polled, not webhook-driven, and it is the factory's own check. A repository-side rule that requires the checks (GitHub branch protection or a ruleset with required status checks) is a stronger and separate guard: it also stops merges by anyone else, and the factory does not configure it.
 
 ## Prerequisites
 
@@ -218,8 +243,8 @@ The kernel table `events` is an append-only log of lifecycle transitions: `id`, 
 
 | Recorded by | Kinds |
 | --- | --- |
-| kernel | `chain.created`, `job.queued`, `job.claimed`, `job.lease_lost`, `job.succeeded` (with `costUsd` when the result has one), `job.requeued`, `job.dead_lettered` (with the reason), `dead_letter.retried`, `dead_letter.discarded`, `chain.cancelled`, `chain.completed`, `chain.waiting` |
-| software engine | `pr.opened`, `labels.changed`, `review.verdict` (verdict and attempt), `merge.requested`, `followup.filed`, `secret_guard.refused` (kinds only) |
+| kernel | `chain.created`, `job.queued`, `job.claimed`, `job.lease_lost`, `job.succeeded` (with `costUsd` when the result has one), `job.requeued`, `job.dead_lettered` (with the reason), `dead_letter.retried`, `dead_letter.discarded`, `chain.cancelled`, `chain.completed`, `chain.waiting`, `chain.resumed` and `chain.updated` (a reconcile pass that queued a revision or changed a waiting chain's state) |
+| software engine | `pr.opened`, `labels.changed`, `review.verdict` (verdict and attempt), `merge.requested`, `followup.filed`, `secret_guard.refused` (kinds only), `ci.checked`, `ci.waiting`, `ci.failed`, `ci.timeout` (see the CI gate) |
 
 Lease renewals are deliberately not recorded (too noisy).
 
@@ -267,7 +292,7 @@ Matching: among the non-default policies of the kind, those whose `match.labels`
 Two default policies ship:
 
 - `policies/software-execute.yaml` (`software-execute`): tools `Read, Edit, Write, Bash, Glob, Grep`, budget `maxBudgetUsd: 5`, `timeoutMs: 1800000`, `inactivityTimeoutMs: 600000`, `resultFormat: execution`, `bare: true`.
-- `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `bare: true`, `settingSources: user`.
+- `policies/software-review.yaml` (`software-review`): `ci: { required: all }` (see CI gate above), tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `bare: true`, `settingSources: user`.
 
 `claude-cli` config fields (`src/runner/claude-cli.ts`):
 

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { combineChecks } from './ci.js';
 
 export interface Issue {
   number: number;
@@ -13,6 +14,18 @@ export interface Pr {
   state: 'open' | 'closed' | 'merged';
   headSha: string;
   baseBranch: string;
+}
+
+export interface Check {
+  name: string;
+  status: 'queued' | 'in_progress' | 'completed';
+  conclusion: string | null;
+  detailsUrl?: string;
+}
+
+export interface ChecksStatus {
+  state: 'passing' | 'pending' | 'failing' | 'none';
+  checks: Check[];
 }
 
 export interface GitHost {
@@ -30,6 +43,14 @@ export interface GitHost {
    * commit, so code nobody reviewed is never merged.
    */
   mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void>;
+  /**
+   * The checks of exactly this commit: check runs and legacy commit statuses, combined. `state` is
+   * `failing` when a check completed without passing, else `pending` when one is not completed, else
+   * `passing`; `none` when the commit has no checks.
+   */
+  getChecks(repo: string, sha: string): Promise<ChecksStatus>;
+  /** The log of one GitHub Actions job (null when it is not available). */
+  getJobLog(repo: string, jobId: number): Promise<string | null>;
 }
 
 export class GitHostError extends Error {
@@ -134,6 +155,20 @@ export const buildCreateIssueArgs = (repo: string): string[] => [
   'api', '-X', 'POST', `repos/${repo}/issues`, '--input', '-',
 ];
 
+export const buildListCheckRunsArgs = (repo: string, sha: string, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/commits/${encodeURIComponent(sha)}/check-runs`,
+  '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
+export const buildListStatusesArgs = (repo: string, sha: string, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/commits/${encodeURIComponent(sha)}/status`,
+  '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
+export const buildJobLogArgs = (repo: string, jobId: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/actions/jobs/${jobId}/logs`,
+];
+
 // `gh pr merge` handles merge-method flags and auto-detects the repo/branch rules.
 // --delete-branch removes factory/issue-<n> after the merge, so a later resubmit of the issue does not
 // seed from a stale merged branch; --match-head-commit refuses the merge if the head moved.
@@ -166,6 +201,23 @@ interface RestPr {
   head?: { sha?: string };
   base?: { ref?: string };
 }
+
+interface RestCheckRun {
+  name?: string;
+  status?: string;
+  conclusion?: string | null;
+  details_url?: string | null;
+  html_url?: string | null;
+}
+
+interface RestStatus {
+  context?: string;
+  state?: string;
+  target_url?: string | null;
+}
+
+const toCheckStatus = (s: string | undefined): Check['status'] =>
+  s === 'completed' ? 'completed' : s === 'in_progress' ? 'in_progress' : 'queued';
 
 export class GhCliHost implements GitHost {
   private readonly exec: ExecFn;
@@ -294,5 +346,49 @@ export class GhCliHost implements GitHost {
         ...(opts?.expectHeadSha !== undefined ? { matchHeadCommit: opts.expectHeadSha } : {}),
       }),
     );
+  }
+
+  async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
+    const checks: Check[] = [];
+    for (let page = 1; ; page++) {
+      const r = await this.json<{ check_runs?: RestCheckRun[] }>(buildListCheckRunsArgs(repo, sha, page));
+      const runs = r.check_runs ?? [];
+      for (const c of runs) {
+        const url = c.details_url ?? c.html_url;
+        checks.push({
+          name: c.name ?? '',
+          status: toCheckStatus(c.status),
+          conclusion: c.conclusion ?? null,
+          ...(url ? { detailsUrl: url } : {}),
+        });
+      }
+      if (runs.length < 100) break;
+    }
+    for (let page = 1; ; page++) {
+      const r = await this.json<{ statuses?: RestStatus[] }>(buildListStatusesArgs(repo, sha, page));
+      const statuses = r.statuses ?? [];
+      for (const s of statuses) {
+        // Legacy statuses: pending is not finished; failure and error are failures.
+        const done = s.state === 'success' || s.state === 'failure' || s.state === 'error';
+        checks.push({
+          name: s.context ?? '',
+          status: done ? 'completed' : 'in_progress',
+          conclusion: done ? (s.state === 'success' ? 'success' : 'failure') : null,
+          ...(s.target_url ? { detailsUrl: s.target_url } : {}),
+        });
+      }
+      if (statuses.length < 100) break;
+    }
+    return { state: combineChecks(checks), checks };
+  }
+
+  async getJobLog(repo: string, jobId: number): Promise<string | null> {
+    try {
+      return await this.run(buildJobLogArgs(repo, jobId));
+    } catch (e) {
+      // Logs expire or need permissions: the feedback then simply has no excerpt.
+      if (e instanceof GitHostError && e.status !== undefined && e.status >= 400 && e.status < 500 && e.status !== 429) return null;
+      throw e;
+    }
   }
 }

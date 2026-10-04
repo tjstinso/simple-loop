@@ -1,4 +1,5 @@
-import { GitHostError, type GitHost, type Issue, type Pr } from '../../src/engines/software/github.js';
+import { combineChecks } from '../../src/engines/software/ci.js';
+import { GitHostError, type Check, type ChecksStatus, type GitHost, type Issue, type Pr } from '../../src/engines/software/github.js';
 
 interface StoredIssue {
   number: number;
@@ -19,6 +20,8 @@ export class FakeGitHost implements GitHost {
   readonly calls: { method: string; args: unknown[] }[] = [];
   private labels = new Map<number, Set<string>>();
   private comments = new Map<number, string[]>();
+  private checks = new Map<string, Check[]>();
+  private jobLogs = new Map<number, string>();
   private nextNumber = 1;
   private failures = new Map<string, Error>();
   /**
@@ -46,6 +49,15 @@ export class FakeGitHost implements GitHost {
 
   setPrHead(n: number, sha: string): void {
     this.prOrThrow(n).headSha = sha;
+  }
+
+  /** Sets the checks of one commit (what `getChecks(repo, sha)` returns for exactly that sha). */
+  setChecks(sha: string, checks: Check[]): void {
+    this.checks.set(sha, checks);
+  }
+
+  setJobLog(jobId: number, log: string): void {
+    this.jobLogs.set(jobId, log);
   }
 
   failNext(method: keyof GitHost, error: Error): void {
@@ -162,5 +174,16 @@ export class FakeGitHost implements GitHost {
       throw new GitHostError('head commit changed', 409);
     }
     pr.state = 'merged';
+  }
+
+  async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
+    this.enter('getChecks', [repo, sha]);
+    const checks = (this.checks.get(sha) ?? []).map((c) => ({ ...c }));
+    return { state: combineChecks(checks), checks };
+  }
+
+  async getJobLog(repo: string, jobId: number): Promise<string | null> {
+    this.enter('getJobLog', [repo, jobId]);
+    return this.jobLogs.get(jobId) ?? null;
   }
 }
