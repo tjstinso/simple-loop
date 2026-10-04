@@ -113,6 +113,12 @@ describe('buildOverview', () => {
     return { queued, running, stuck, expired, person, human, dead, review };
   }
 
+  it('reports the concurrency limit, null when there is none', () => {
+    t = makeDb();
+    expect(buildOverview(t.db, NOW).limits).toEqual({ maxConcurrentJobs: null });
+    expect(buildOverview(t.db, NOW, { maxConcurrentJobs: 4 }).limits).toEqual({ maxConcurrentJobs: 4 });
+  });
+
   it('lists open chains, finished chains and workers with derived waitingOn', () => {
     t = makeDb();
     const ids = populate(t.db);

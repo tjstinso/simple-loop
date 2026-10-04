@@ -156,6 +156,7 @@ export interface WorkerOverview {
 
 export interface Overview {
   generatedAt: number;
+  limits: { maxConcurrentJobs: number | null };
   summary: { workers: number; aliveWorkers: number; runningJobs: number; waitingOnPerson: number };
   openChains: ChainOverview[];
   finishedChains: ChainOverview[];
@@ -208,7 +209,7 @@ function subjectOf(key: string, state: Record<string, unknown>): { repo: string;
 }
 
 /** Everything the dashboard shows, from one read-only pass over the database. */
-export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number } = {}): Overview {
+export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number; maxConcurrentJobs?: number | null } = {}): Overview {
   const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
 
   const workerRows = db.prepare('SELECT * FROM workers ORDER BY id').all() as {
@@ -321,6 +322,7 @@ export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number 
 
   return {
     generatedAt: now,
+    limits: { maxConcurrentJobs: opts.maxConcurrentJobs ?? null },
     summary: {
       workers: workers.length,
       aliveWorkers: workers.filter((w) => w.alive).length,

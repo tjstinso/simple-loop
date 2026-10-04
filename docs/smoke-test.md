@@ -203,7 +203,7 @@ Assumption: a 5-minute lease with a 30-second heartbeat survives the execute pol
 
 How to check: run an execute job that takes more than 5 minutes (give the agent a larger task or ask it to run a slow test) and confirm it is not requeued: `sqlite3 /tmp/factory-smoke/factory.db "select id, status, delivery, lease_expires_at from jobs"` shows `delivery` staying 1 and `lease_expires_at` advancing every 30 seconds.
 
-Where to fix: `leaseMs` and `heartbeatMs` in `src/cli/runtime.ts`.
+Where to fix: `leaseMs` and `heartbeatMs` in `factory.config.json`.
 
 ### 8. Plugin directories in bare mode (`pluginDirs`, `tools/ts-lsp/`)
 

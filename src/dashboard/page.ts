@@ -154,6 +154,7 @@ const SCRIPT = `
     var head = el('header', null, el('h1', null, 'Factory dashboard'),
       el('span', { class: 'stat' }, el('b', null, s.aliveWorkers), ' workers alive (' + s.workers + ' known)'),
       el('span', { class: 'stat' }, el('b', null, s.runningJobs), ' running'),
+      el('span', { class: 'stat' }, 'slots: ' + s.runningJobs + (data.limits && data.limits.maxConcurrentJobs !== null ? ' of ' + data.limits.maxConcurrentJobs : ' (no limit)')),
       el('span', { class: 'stat' }, el('b', null, s.waitingOnPerson), ' waiting on a person'),
       el('span', { class: 'muted' }, 'total cost ' + money(data.totalCostUsd)),
       el('span', { class: 'muted' }, 'last refresh ' + (lastOk ? clock(lastOk) : 'never')));

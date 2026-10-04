@@ -119,13 +119,24 @@ describe('factory cli', () => {
   it('status prints one engine-described line per open chain and no open chains when empty', async () => {
     const { h, out, deps } = setup();
     expect(await run(['status'], deps)).toBe(0);
-    expect(out).toEqual(['no open chains']);
+    expect(out).toEqual(['slots: 0 (no limit)', 'no open chains']);
     out.length = 0;
     const { chain } = await h.submit(5);
     expect(await run(['status'], deps)).toBe(0);
+    expect(out[0]).toBe('slots: 0 (no limit)');
+    out.shift();
     expect(out[0]).toBe(`${chain.id} software active ${h.engine.describe(h.chain(chain.id))}`);
     expect(out).toHaveLength(2);
     expect(out[1]).toMatch(/^ {2}job \d+ execute attempt=1 queued delivery=0 last-event=\d+s ago$/);
+  });
+
+  it('status reports the slots in use against the configured limit', async () => {
+    const { h, out, deps } = setup();
+    h.kernel.deps.config.maxConcurrentJobs = 3;
+    await h.submit(5);
+    h.claim();
+    expect(await run(['status'], deps)).toBe(0);
+    expect(out[0]).toBe('slots: 1 of 3');
   });
 
   it('status shows the worker and lease of a running job, and --json prints the same data', async () => {
@@ -133,8 +144,8 @@ describe('factory cli', () => {
     const { chain } = await h.submit(5);
     const job = h.claim()!;
     expect(await run(['status'], deps)).toBe(0);
-    expect(out[1]).toContain(`job ${job.id} execute attempt=1 running delivery=1 worker=w1`);
-    expect(out[1]).toContain(`lease-expires=${new Date(job.leaseExpiresAt!).toISOString()}`);
+    expect(out[2]).toContain(`job ${job.id} execute attempt=1 running delivery=1 worker=w1`);
+    expect(out[2]).toContain(`lease-expires=${new Date(job.leaseExpiresAt!).toISOString()}`);
     out.length = 0;
     expect(await run(['status', '--json'], deps)).toBe(0);
     const parsed = JSON.parse(out[0]!);
