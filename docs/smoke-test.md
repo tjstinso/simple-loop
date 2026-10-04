@@ -213,6 +213,8 @@ How to check: in the sandbox (or this repository, after `npm install`), use a co
 
 If it does not work in bare mode: run that policy with `bare: false`, and note the trade-off: non-bare mode uses your environment minus a deny-list and your real `HOME` and the `claude` login instead of the allow-listed environment and empty `HOME` (see "Credentials" in the README).
 
+Also check that a relative plugin directory cannot be changed by a PR: in the same setup, merge a change that is not to the plugin, then open a PR on a `factory/issue-<n>` branch that edits the plugin manifest (for example `tools/ts-lsp/.claude-plugin/plugin.json`) and let the factory run the next job for that issue. Expected: the run fails before `claude` is spawned (dead-lettered as `runner_error`) with an error naming `tools/ts-lsp` and saying plugin changes take effect only after a person merges them. After you merge the PR, the next run accepts the directory. (Note that `npm install` inside `tools/ts-lsp` in the worktree adds untracked files, which this check also refuses; use an absolute entry for an installed plugin.)
+
 Where to fix: `pluginDirs` handling in `buildArgs` and `resolvePluginDirs` in `src/runner/claude-cli.ts`; the plugin in `tools/ts-lsp/`.
 
 ## Cleanup

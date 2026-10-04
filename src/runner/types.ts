@@ -12,6 +12,11 @@ export interface RunInput {
   subject: unknown;
   workspace: Workspace;
   feedback?: string;
+  /**
+   * The shared cache repository and base branch a relative plugin directory is compared against
+   * (see `assertPluginDirsUnchanged`). Supplied by the engine; without it a relative entry is refused.
+   */
+  pluginBase?: { cacheDir: string; baseBranch: string };
 }
 
 export interface RunHooks {

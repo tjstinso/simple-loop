@@ -19,6 +19,8 @@ export interface SoftwareWorkspace extends Workspace {
   /** The commit the worktree was created at. */
   seedSha: string;
   baseBranch: string;
+  /** The shared cache repository (bare) holding `refs/remotes/origin/<baseBranch>`. */
+  cacheDir: string;
 }
 
 export interface GitWorkspaceOptions {
@@ -379,7 +381,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       await mkdir(join(this.opts.root, String(chainId)), { recursive: true });
       await this.git(cache, ['worktree', 'add', '-b', localBranch, path, seedSha]);
 
-      return { repo, path, localBranch, remoteBranch, remoteUrl, remoteHeadSha, seedSha, baseBranch };
+      return { repo, path, localBranch, remoteBranch, remoteUrl, remoteHeadSha, seedSha, baseBranch, cacheDir: cache };
     });
   }
 

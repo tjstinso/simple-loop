@@ -3,6 +3,7 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
+import { assertPluginDirsUnchanged } from './plugin-check.js';
 import { readProcessStartTime } from '../util/proc.js';
 import { LineSplitter, StreamCollector, lastJsonBlock, parseStreamLine, truncate } from './stream.js';
 import type { RunHooks, Runner, RunInput } from './types.js';
@@ -50,7 +51,9 @@ const configSchema = z.object({
   /**
    * Plugin directories, each passed as one `--plugin-dir=<absolute path>` (for example a language
    * server plugin). Relative entries are resolved against the worktree and must stay inside it;
-   * absolute entries are operator-controlled and taken as given. See `resolvePluginDirs`.
+   * absolute entries are operator-controlled and taken as given. A relative entry must also match the
+   * base branch (the agent could otherwise write code the CLI runs outside its tool permissions).
+   * See `resolvePluginDirs` and `assertPluginDirsUnchanged`.
    */
   pluginDirs: z.array(z.string().min(1)).default([]),
 });
@@ -444,6 +447,7 @@ export class ClaudeCliRunner implements Runner {
     }
     const claudeMdFile = cfg.bare ? worktreeClaudeMd(input.workspace.path) : undefined;
     const pluginDirs = resolvePluginDirs(cfg.pluginDirs, input.workspace.path);
+    await assertPluginDirsUnchanged(cfg.pluginDirs, pluginDirs, input.workspace.path, input.pluginBase);
     const args = buildArgs(cfg, buildPrompt(cfg, input), claudeMdFile, pluginDirs);
 
     return new Promise<unknown>((resolve, reject) => {

@@ -53,7 +53,7 @@ const CLEAN: AddedChanges = { paths: [], text: '', truncated: false };
 
 const fakeWs: SoftwareWorkspace = {
   repo: 'acme/widgets', path: '/nonexistent', localBranch: 'l', remoteBranch: BRANCH, remoteUrl: '/nonexistent.git',
-  remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main',
+  remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main', cacheDir: '/cache/o__r.git',
 };
 
 describe('runSoftwareEffect', () => {
