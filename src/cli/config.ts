@@ -29,6 +29,7 @@ const ConfigSchema = z.object({
   keptWorktreeMaxAgeMs: z.number().nonnegative().default(604_800_000),
   allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
   maxHumanRounds: z.number().int().min(1).default(5),
+  maxConflictRounds: z.number().int().min(1).default(2),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
 }).superRefine((c, ctx) => {

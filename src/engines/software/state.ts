@@ -17,6 +17,12 @@ export const SoftwareStateSchema = z.object({
   humanRounds: z.number().int().min(0).optional(),
   /** `attempt` when the current human round began (absent: 0): the automated retry budget counts from here. */
   attemptBase: z.number().int().min(0).optional(),
+  /** Conflict rounds started for this chain (absent: 0); counted apart from review attempts and human rounds. */
+  conflictRounds: z.number().int().min(0).optional(),
+  /** True while the round being worked (or reviewed) resolves a merge conflict with the base branch. */
+  conflictActive: z.boolean().optional(),
+  /** True once the factory handed the conflict to a person (limit reached or not resolvable by the agent). */
+  conflictGaveUp: z.boolean().optional(),
   /** The agent's summary of the latest execute (capped), for the human round's summary comment. */
   lastSummary: z.string().optional(),
 });

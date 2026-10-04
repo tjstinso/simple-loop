@@ -1,11 +1,16 @@
 import { execFile, spawn } from 'node:child_process';
 import { StaleDeliveryError } from '../../kernel/types.js';
+import { conflictingPaths, parseUnmerged } from './conflict.js';
 import { gitAuthEnv, NO_CREDENTIAL_HELPER_ARGS, type CommitIdentity, type GithubAuth } from './identity.js';
 import type { SoftwareWorkspace } from './workspace.js';
 
 /** The git side of the software engine's effects. */
 export interface GitPorts {
-  /** `git add -A`, then commit only when the index differs from HEAD. Returns whether it committed. */
+  /**
+   * `git add -A`, then commit only when the index differs from HEAD. Returns whether it committed.
+   * While a merge is in progress (a conflict round) the merge commit is made even when the index
+   * equals HEAD, and an unmerged path left in the index is an error naming the paths.
+   */
   commitAll(ws: SoftwareWorkspace, message: string): Promise<boolean>;
   headSha(ws: SoftwareWorkspace): Promise<string>;
   /**
@@ -402,9 +407,12 @@ export class ExecGitPorts implements GitPorts {
 
   async commitAll(ws: SoftwareWorkspace, message: string): Promise<boolean> {
     await must(ws.path, ['add', '-A'], this.local);
+    const unmerged = conflictingPaths(parseUnmerged(await must(ws.path, ['ls-files', '-u', '-z'], this.local)));
+    if (unmerged.length > 0) throw new Error(`unmerged paths remain in the index: ${unmerged.join(', ')}`);
+    const merging = (await run(ws.path, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], this.local)).code === 0;
     const diff = await run(ws.path, ['diff', '--cached', '--quiet'], this.local);
-    if (diff.code === 0) return false;
-    if (diff.code !== 1) throw new Error(`git diff failed: ${diff.stderr.trim()}`);
+    if (diff.code === 0 && !merging) return false;
+    if (diff.code !== 1 && diff.code !== 0) throw new Error(`git diff failed: ${diff.stderr.trim()}`);
     // Message on stdin: untrusted text never sits in argv.
     await must(ws.path, ['commit', '--quiet', '--no-verify', '--cleanup=whitespace', '-F', '-'], this.local, message, false, this.commitEnv);
     return true;

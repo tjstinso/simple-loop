@@ -155,10 +155,10 @@ describe('GhCliHost', () => {
   it('findPrByHead maps MERGED to merged and returns null for an empty list', async () => {
     const a = stub([{ stdout: JSON.stringify([{ number: 3, state: 'MERGED', headRefOid: 'abc', baseRefName: 'main' }]) }]);
     expect(await new GhCliHost({ exec: a.exec }).findPrByHead(R, 'feat')).toEqual({
-      number: 3, state: 'merged', headSha: 'abc', baseBranch: 'main',
+      number: 3, state: 'merged', headSha: 'abc', baseBranch: 'main', mergeable: 'unknown',
     });
     expect(a.calls).toEqual([
-      ['gh', ['pr', 'list', '--repo', R, '--head', 'feat', '--state', 'all', '--json', 'number,state,headRefOid,baseRefName', '--limit', '1']],
+      ['gh', ['pr', 'list', '--repo', R, '--head', 'feat', '--state', 'all', '--json', 'number,state,headRefOid,baseRefName,mergeable', '--limit', '1']],
     ]);
     const b = stub([{ stdout: '[]' }]);
     expect(await new GhCliHost({ exec: b.exec }).findPrByHead(R, 'feat')).toBeNull();
@@ -329,9 +329,31 @@ describe('GhCliHost', () => {
       { stdout: JSON.stringify({ number: 12, state: 'open', merged: false, head: { sha: 'h1' }, base: { ref: 'main' } }) },
     ]);
     const pr = await new GhCliHost({ exec }).openPr(R, { head: 'feat', base: 'main', title: 'T', body: 'B "q"\n' });
-    expect(pr).toEqual({ number: 12, state: 'open', headSha: 'h1', baseBranch: 'main' });
+    expect(pr).toEqual({ number: 12, state: 'open', headSha: 'h1', baseBranch: 'main', mergeable: 'unknown' });
     expect(calls).toEqual([['gh', ['api', '-X', 'POST', 'repos/o/r/pulls', '--input', '-']]]);
     expect(JSON.parse(inputs[0]!)).toEqual({ head: 'feat', base: 'main', title: 'T', body: 'B "q"\n' });
+  });
+
+  it('getPr maps mergeable and mergeable_state to mergeable, conflicting or unknown', async () => {
+    const mk = (extra: object) =>
+      JSON.stringify({ number: 3, state: 'open', merged_at: null, head: { sha: 's' }, base: { ref: 'dev' }, ...extra });
+    const read = async (extra: object) => (await new GhCliHost({ exec: stub([{ stdout: mk(extra) }]).exec }).getPr(R, 3)).mergeable;
+    expect(await read({ mergeable: true, mergeable_state: 'clean' })).toBe('mergeable');
+    expect(await read({ mergeable: true, mergeable_state: 'behind' })).toBe('mergeable');
+    expect(await read({ mergeable: false, mergeable_state: 'dirty' })).toBe('conflicting');
+    expect(await read({ mergeable: null, mergeable_state: 'unknown' })).toBe('unknown');
+    expect(await read({ mergeable: false, mergeable_state: 'blocked' })).toBe('unknown');
+    expect(await read({})).toBe('unknown');
+  });
+
+  it('findPrByHead maps MERGEABLE, CONFLICTING and UNKNOWN', async () => {
+    const read = async (m: string) => {
+      const a = stub([{ stdout: JSON.stringify([{ number: 3, state: 'OPEN', headRefOid: 'abc', baseRefName: 'main', mergeable: m }]) }]);
+      return (await new GhCliHost({ exec: a.exec }).findPrByHead(R, 'feat'))!.mergeable;
+    };
+    expect(await read('MERGEABLE')).toBe('mergeable');
+    expect(await read('CONFLICTING')).toBe('conflicting');
+    expect(await read('UNKNOWN')).toBe('unknown');
   });
 
   it('getPr maps open, closed and merged states', async () => {
@@ -341,7 +363,7 @@ describe('GhCliHost', () => {
     const merged = stub([{ stdout: mk({ state: 'closed', merged_at: '2026-01-01T00:00:00Z' }) }]);
     expect((await new GhCliHost({ exec: open.exec }).getPr(R, 3)).state).toBe('open');
     expect((await new GhCliHost({ exec: closed.exec }).getPr(R, 3)).state).toBe('closed');
-    expect(await new GhCliHost({ exec: merged.exec }).getPr(R, 3)).toEqual({ number: 3, state: 'merged', headSha: 's', baseBranch: 'dev' });
+    expect(await new GhCliHost({ exec: merged.exec }).getPr(R, 3)).toEqual({ number: 3, state: 'merged', headSha: 's', baseBranch: 'dev', mergeable: 'unknown' });
     expect(merged.calls).toEqual([['gh', ['api', '-X', 'GET', 'repos/o/r/pulls/3']]]);
   });
 

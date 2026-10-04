@@ -1,5 +1,8 @@
+import { lstat, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
+import { hasConflictMarkers } from './conflict.js';
 import { fileFollowups, storeFollowups } from './followups.js';
 import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type EffectOutcome, type Job } from '../../kernel/types.js';
 import { AutoMergeRefusedError, GitHostError, type GitHost, type Issue } from './github.js';
@@ -42,6 +45,7 @@ const EffectSchemas = {
   set_labels: z.object({ kind: z.literal('set_labels'), target: Target, add: z.array(z.string()), remove: z.array(z.string()) }),
   merge_pr: z.object({ kind: z.literal('merge_pr') }),
   round_summary: z.object({ kind: z.literal('round_summary') }),
+  conflict_summary: z.object({ kind: z.literal('conflict_summary') }),
   comment: z.object({ kind: z.literal('comment'), target: Target, body: z.string(), marker: z.string().min(1) }),
 } as const;
 type Supported = Exclude<SoftwareEffect, { kind: 'file_followups' }>;
@@ -207,6 +211,24 @@ function humanRoundOf(job: Job): number | null {
   return typeof n === 'number' ? n : null;
 }
 
+/** The number of the conflict round an execute job works on (absent otherwise). */
+function conflictRoundOf(job: Job): number | null {
+  const n = (job.payload as { conflictRound?: unknown } | null | undefined)?.conflictRound;
+  return typeof n === 'number' ? n : null;
+}
+
+/** The conflicted files of the round that still hold a conflict marker line. */
+async function filesWithMarkers(ws: SoftwareWorkspace): Promise<string[]> {
+  const left: string[] = [];
+  for (const p of ws.conflict?.paths ?? []) {
+    const file = join(ws.path, p);
+    const st = await lstat(file).catch(() => null);
+    if (!st?.isFile()) continue; // deleted by the agent, or a symlink: not read
+    if (hasConflictMarkers(await readFile(file, 'utf8'))) left.push(p);
+  }
+  return left;
+}
+
 /**
  * A human feedback round whose revision changed nothing: one comment says so (with the agent's
  * summary, redacted), the chain goes back to `awaiting_merge` and the review is skipped. The same
@@ -249,6 +271,23 @@ async function roundSummary(ctx: EffectContext, fence: EffectFence): Promise<voi
   );
 }
 
+/** After the factory's review approved a conflict resolution: one comment per round with the new commit. */
+async function conflictSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
+  const { repo, conflictRounds } = ctx.chain.state;
+  const round = conflictRounds ?? 0;
+  const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
+  if (!pr) throw new EffectError('no PR found for the conflict summary', 'effect_error');
+  const sha = pr.headSha.slice(0, 7);
+  await commentOnce(
+    ctx,
+    fence,
+    pr.number,
+    `conflict-round-${round}`,
+    `Resolved conflicts with \`${oneLine(pr.baseBranch, 100)}\` in ${sha === '' ? '(unknown)' : sha}`,
+  );
+  ctx.events?.('conflict.resolved', { sha, round });
+}
+
 async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
@@ -256,12 +295,18 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<Effec
   const title = titleOf(ctx, issue);
   // The agent could have written the shared repository config: sanitize before any engine git command.
   await ctx.git.prepareForPush?.(ws);
+  // The engine completes the merge of a conflict round; the agent only edited files.
+  const conflicted = await filesWithMarkers(ws);
+  if (conflicted.length > 0) {
+    throw new EffectError(`refusing to push: conflict markers remain in ${conflicted.join(', ')}`, 'runner_error');
+  }
   await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
   // Pinned: the push sends exactly the commit that was scanned, even if HEAD moves meanwhile.
   const head = await ctx.git.headSha(ws);
   if (head === ws.seedSha) {
     // Nothing new in this delivery. If the branch was already published (e.g. a rerun after a
     // crash that followed the push), the work is on the remote: succeed so open_pr can proceed.
+    if (conflictRoundOf(ctx.job) !== null) throw new EffectError('the conflict round produced no merge commit', 'runner_error');
     const round = humanRoundOf(ctx.job);
     if (round !== null) return handBackUnchanged(ctx, fence, round);
     if (ws.remoteHeadSha !== null) return;
@@ -470,6 +515,8 @@ async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFenc
         return mergePr(ctx, fence);
       case 'round_summary':
         return roundSummary(ctx, fence);
+      case 'conflict_summary':
+        return conflictSummary(ctx, fence);
       case 'comment':
         return comment(ctx, fence, e);
     }

@@ -3,6 +3,7 @@ import { recordEvent } from '../../kernel/events.js';
 import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
 import {
   EffectError,
+  HandBackError,
   type ChainView,
   type DeadLetter,
   type Engine,
@@ -14,7 +15,7 @@ import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
 import { defaultSleep, isTransient, runSoftwareEffect, withHostRetry } from './effects.js';
 import { planFeedbackRound, DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS } from './feedback.js';
-import { GitHostError, type GitHost } from './github.js';
+import { GitHostError, type GitHost, type Pr } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
 import {
@@ -25,6 +26,8 @@ import {
   LABEL_READY_FOR_MERGE,
   ReviewVerdictSchema,
 } from './schemas.js';
+import { MAX_CONFLICT_PATHS } from './conflict.js';
+import { PROFILES } from './profiles.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 import { softwareSubmit } from './submit.js';
 import { redactSecrets } from './secret-scan.js';
@@ -48,6 +51,8 @@ export interface SoftwareEngineDeps {
     allowedAuthorAssociations?: string[];
     /** Human feedback rounds one chain accepts (default 5). */
     maxHumanRounds?: number;
+    /** Conflict rounds (merging the base branch into the pull request) one chain gets (default 2). */
+    maxConflictRounds?: number;
   };
   sleep?: (ms: number) => Promise<void>;
   /** Clock for stored rows (epoch ms); injected by the composition root. */
@@ -61,6 +66,9 @@ export interface SoftwareEngineDeps {
 
 export { LABEL_DEAD_LETTER };
 
+/** Consecutive maintenance passes a pull request may stay `unknown` before the engine moves on. */
+const MAX_UNKNOWN_PASSES = 5;
+
 export type SoftwareEngine = Engine<SoftwareState> & {
   /** Evicts the cached workspace of one delivery of one job (used by cleanup). */
   forgetWorkspace(chainId: number, jobId: number, delivery: number): void;
@@ -73,6 +81,10 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const forget = (chainId: number, jobId: number, delivery: number) => void cache.delete(key(chainId, jobId, delivery));
   const allowedAuthorAssociations = deps.config.allowedAuthorAssociations ?? [...DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS];
   const maxHumanRounds = Math.max(1, deps.config.maxHumanRounds ?? 5);
+  const maxConflictRounds = Math.max(1, deps.config.maxConflictRounds ?? 2);
+  // Passes in a row a chain's pull request reported `unknown` mergeability (not persisted: a restart starts counting again).
+  const unknownPasses = new Map<number, number>();
+  const unknownLogged = new Set<number>();
   const historyRetentionDays = deps.config.historyRetentionDays ?? 30;
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
   /** Agent-written text on its way to GitHub (or a dead letter): named patterns and known values redacted. */
@@ -152,14 +164,127 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         attemptBase: s.attempt,
         humanRounds: round,
         feedbackHandledAt: plan.newestAt,
+        conflictActive: false,
       },
       job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: round } },
     };
   }
 
+  /**
+   * The waiting chain's pull request stopped being mergeable: starts a conflict round (the base branch
+   * is merged into the branch and the agent resolves the conflicts), or hands over when the chain used
+   * its conflict rounds. Null when there is nothing to do for conflicts (feedback is looked at next).
+   */
+  async function reconcileConflict(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
+    const event = (kind: string, detail: Record<string, unknown>) =>
+      recordEvent(deps.db, { at: deps.now(), chainId, kind, engine: 'software', detail });
+    if (pr.mergeable === 'mergeable') {
+      unknownPasses.delete(chainId);
+      unknownLogged.delete(chainId);
+      return null;
+    }
+    if (pr.mergeable === 'unknown') {
+      // GitHub is still computing it: look again next pass, a few times.
+      const n = (unknownPasses.get(chainId) ?? 0) + 1;
+      unknownPasses.set(chainId, n);
+      if (n <= MAX_UNKNOWN_PASSES) return { outcome: 'none' };
+      if (!unknownLogged.has(chainId)) {
+        unknownLogged.add(chainId);
+        event('conflict.gave_up', { reason: `mergeability still unknown after ${MAX_UNKNOWN_PASSES} checks` });
+      }
+      return null;
+    }
+    unknownPasses.delete(chainId);
+    unknownLogged.delete(chainId);
+    if (s.conflictGaveUp) return null;
+    const rounds = s.conflictRounds ?? 0;
+    if (rounds >= maxConflictRounds) {
+      await commentOnce(
+        s.repo,
+        pr.number,
+        `<!-- factory:chain=${chainId} event=conflict-round-limit -->`,
+        `This pull request conflicts with \`${pr.baseBranch}\` again, but the factory already resolved conflicts ${rounds} time(s), the most it does for one chain (\`maxConflictRounds\`). A person has to resolve the conflicts.`,
+      );
+      await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], []);
+      event('conflict.gave_up', { reason: `conflict rounds exhausted (${maxConflictRounds})` });
+      return {
+        outcome: 'update',
+        reason: `conflict rounds exhausted (${maxConflictRounds})`,
+        engineState: { ...s, phase: 'needs_human', conflictGaveUp: true },
+      };
+    }
+    const attempt = s.attempt + 1;
+    const round = rounds + 1;
+    return {
+      outcome: 'new_work',
+      reason: `conflict round ${round}`,
+      engineState: { ...s, phase: 'executing', attempt, attemptBase: s.attempt, conflictRounds: round, conflictActive: true },
+      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { conflictRound: round } },
+    };
+  }
+
+  /**
+   * Called when the workspace of a conflict round shows the agent has nothing to do: a person has to
+   * take over (a conflict the agent must not get), or nothing conflicts any more. Ends the job with
+   * the chain waiting again.
+   */
+  async function handBackConflict(chain: ChainView<SoftwareState>, job: Job, info: NonNullable<SoftwareWorkspace['conflict']>): Promise<never> {
+    const s = chain.state;
+    const event = (kind: string, detail: Record<string, unknown>) =>
+      recordEvent(deps.db, { at: deps.now(), chainId: chain.id, jobId: job.id, delivery: job.delivery, kind, engine: 'software', detail });
+    const pr = await withHostRetry(() => deps.host.findPrByHead(s.repo, s.branch), deps.sleep ?? defaultSleep);
+    if (info.refusal === undefined) {
+      // Merged by itself, or a person resolved it, before the round got going: nothing to do.
+      if (pr) {
+        const ready = PROFILES[s.profile].onApprove === 'merge' ? [] : [LABEL_READY_FOR_MERGE];
+        await deps.host.setLabels(s.repo, pr.number, ready, [LABEL_IN_PROGRESS]);
+      }
+      await deps.host.setLabels(s.repo, s.issueNumber, [], [LABEL_IN_PROGRESS]);
+      throw new HandBackError('nothing conflicts any more', { ...s, phase: 'awaiting_merge', conflictActive: false });
+    }
+    const why = {
+      binary: 'a conflicting file is binary',
+      deleted_modified: 'a file was deleted on one side and modified on the other',
+      too_many: `more than ${MAX_CONFLICT_PATHS} files conflict`,
+    }[info.refusal];
+    if (pr) {
+      await commentOnce(
+        s.repo,
+        pr.number,
+        `<!-- factory:chain=${chain.id} event=conflict-gave-up -->`,
+        `This pull request conflicts with \`${info.baseBranch}\`, and the factory does not resolve it itself: ${why}. A person has to resolve the conflicts.`,
+      );
+    }
+    await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], [LABEL_IN_PROGRESS]);
+    event('conflict.gave_up', { reason: why });
+    throw new HandBackError(`conflict not resolvable by the agent: ${why}`, {
+      ...s,
+      phase: 'needs_human',
+      conflictActive: false,
+      conflictGaveUp: true,
+    });
+  }
+
   const workspace: WorkspaceProvider = {
     async prepare(chain: ChainView<any>, job: Job): Promise<Workspace> {
       const ws = await deps.workspaces.prepare(chain, job);
+      const conflict = (ws as SoftwareWorkspace).conflict;
+      if (conflict && job.type === 'execute') {
+        recordEvent(deps.db, {
+          at: deps.now(),
+          chainId: chain.id,
+          jobId: job.id,
+          delivery: job.delivery,
+          kind: 'conflict.detected',
+          engine: 'software',
+          detail: {
+            baseBranch: conflict.baseBranch,
+            round: (job.payload as { conflictRound?: unknown }).conflictRound,
+            paths: conflict.paths.length,
+          },
+        });
+        if (conflict.refusal !== undefined || conflict.paths.length === 0) await handBackConflict(chain, job, conflict);
+      }
       cache.set(key(chain.id, job.id, job.delivery), ws as SoftwareWorkspace);
       return ws;
     },
@@ -279,9 +404,9 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       } catch (e) {
         errors.push(e);
       }
-      const humanRound = (job.payload as { humanRound?: unknown } | null | undefined)?.humanRound;
-      if (job.type === 'execute' && typeof humanRound === 'number') {
-        // A person's feedback is being worked: the pull request is no longer ready for merge.
+      const payload = job.payload as { humanRound?: unknown; conflictRound?: unknown } | null | undefined;
+      if (job.type === 'execute' && (typeof payload?.humanRound === 'number' || typeof payload?.conflictRound === 'number')) {
+        // A person's feedback or a conflict is being worked: the pull request is no longer ready for merge.
         try {
           const pr = await deps.host.findPrByHead(s.repo, s.branch);
           if (pr) await deps.host.setLabels(s.repo, pr.number, [], [LABEL_READY_FOR_MERGE, LABEL_NEEDS_HUMAN]);
@@ -356,7 +481,11 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         throw e;
       }
       if (!pr) return { outcome: 'none' };
-      if (pr.state === 'open') return reconcileFeedback(s, chain.id, pr.number);
+      if (pr.state === 'open') {
+        // A conflict comes first; feedback is looked at on a later pass or when there is no conflict.
+        const conflict = await reconcileConflict(s, chain.id, pr);
+        return conflict ?? reconcileFeedback(s, chain.id, pr.number);
+      }
       if (pr.state === 'merged') return { outcome: 'completed', reason: `Pull request #${pr.number} was merged` };
       return {
         outcome: 'cancelled',

@@ -37,6 +37,7 @@ export interface HarnessOptions {
   defaultProfile?: 'supervised' | 'automatic';
   keptWorktreeMaxAgeMs?: number;
   maxHumanRounds?: number;
+  maxConflictRounds?: number;
   allowedAuthorAssociations?: string[];
 }
 
@@ -190,6 +191,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
         requiredSections: ['## Goal', '## Acceptance criteria'],
         ...(opts.keptWorktreeMaxAgeMs === undefined ? {} : { keptWorktreeMaxAgeMs: opts.keptWorktreeMaxAgeMs }),
         ...(opts.maxHumanRounds === undefined ? {} : { maxHumanRounds: opts.maxHumanRounds }),
+        ...(opts.maxConflictRounds === undefined ? {} : { maxConflictRounds: opts.maxConflictRounds }),
         ...(opts.allowedAuthorAssociations === undefined ? {} : { allowedAuthorAssociations: opts.allowedAuthorAssociations }),
       },
       now: clock,

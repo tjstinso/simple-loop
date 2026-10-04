@@ -414,3 +414,103 @@ describe('GitWorkspaceProvider', () => {
     });
   });
 });
+
+describe('conflict rounds (merging the base branch)', () => {
+  let remote: TempRemote;
+  let root: string;
+  let provider: GitWorkspaceProvider;
+  const round = (): Job => ({ ...job(1, 1), payload: { conflictRound: 1 } });
+
+  beforeEach(() => {
+    remote = makeRemote();
+    root = mkdtempSync(join(tmpdir(), 'factory-ws-'));
+    provider = new GitWorkspaceProvider({ cloneUrlFor: () => remote.url, root, keepOnFailure: true });
+  });
+  afterEach(() => {
+    remote.cleanup();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not merge for an ordinary job', async () => {
+    remote.commit('factory/issue-7', 'README.md', 'branch\n');
+    remote.commit('main', 'README.md', 'main\n');
+    const ws = await provider.prepare(chain(1), job(1, 2));
+    expect(ws.conflict).toBeUndefined();
+    expect(readFileSync(join(ws.path, 'README.md'), 'utf8')).toBe('branch\n');
+  });
+
+  it('merges origin/main, leaves conflict markers and lists the conflicting path', async () => {
+    remote.commit('factory/issue-7', 'README.md', 'branch\n');
+    const branchHead2 = remote.commit('factory/issue-7', 'extra.txt', 'extra\n');
+    remote.commit('main', 'README.md', 'main\n');
+    remote.commit('main', 'other.txt', 'other\n');
+    const ws = await provider.prepare(chain(1), round());
+    expect(ws.conflict).toEqual({ baseBranch: 'main', paths: ['README.md'] });
+    const text = readFileSync(join(ws.path, 'README.md'), 'utf8');
+    expect(text).toContain('<<<<<<< ');
+    expect(text).toContain('branch');
+    expect(text).toContain('main');
+    // The non-conflicting change of the base is already merged; nothing is committed yet.
+    expect(readFileSync(join(ws.path, 'other.txt'), 'utf8')).toBe('other\n');
+    expect(git(ws.path, ['rev-parse', '--verify', 'MERGE_HEAD'])).toBe(git(remote.path, ['rev-parse', 'refs/heads/main']));
+    expect(ws.seedSha).toBe(branchHead2);
+  });
+
+  it('a branch that is merely behind merges cleanly: no paths, no refusal', async () => {
+    remote.commit('factory/issue-7', 'mine.txt', 'mine\n');
+    remote.commit('main', 'other.txt', 'other\n');
+    const ws = await provider.prepare(chain(1), round());
+    expect(ws.conflict).toEqual({ baseBranch: 'main', paths: [] });
+  });
+
+  it('a branch that already contains the base has nothing to merge', async () => {
+    remote.commit('factory/issue-7', 'mine.txt', 'mine\n');
+    const ws = await provider.prepare(chain(1), round());
+    expect(ws.conflict).toEqual({ baseBranch: 'main', paths: [] });
+  });
+
+  it('refuses a conflict in a binary file', async () => {
+    remote.commit('main', 'img.bin', Buffer.from([0, 1, 2, 3]));
+    remote.commit('factory/issue-7', 'img.bin', Buffer.from([0, 9, 9, 9]));
+    remote.commit('main', 'img.bin', Buffer.from([0, 5, 5, 5]));
+    const ws = await provider.prepare(chain(1), round());
+    expect(ws.conflict).toMatchObject({ paths: ['img.bin'], refusal: 'binary' });
+  });
+
+  it('refuses a conflict where one side deleted the file', async () => {
+    remote.commit('main', 'doomed.txt', 'one\n');
+    const clone = join(root, 'clone');
+    git(root, ['clone', remote.url, clone]);
+    git(clone, ['checkout', '-b', 'factory/issue-7', 'origin/main']);
+    writeFileSync(join(clone, 'doomed.txt'), 'branch edit\n');
+    git(clone, ['commit', '-am', 'edit']);
+    git(clone, ['push', 'origin', 'factory/issue-7']);
+    git(clone, ['checkout', 'main']);
+    git(clone, ['rm', 'doomed.txt']);
+    git(clone, ['commit', '-m', 'delete']);
+    git(clone, ['push', 'origin', 'main']);
+    const ws = await provider.prepare(chain(1), round());
+    expect(ws.conflict).toMatchObject({ paths: ['doomed.txt'], refusal: 'deleted_modified' });
+  });
+
+  it('refuses more than 50 conflicting paths', async () => {
+    const clone = join(root, 'clone');
+    git(root, ['clone', remote.url, clone]);
+    const fill = (text: string) => {
+      for (let i = 0; i < 51; i++) writeFileSync(join(clone, `f${i}.txt`), `${text}\n`);
+    };
+    git(clone, ['checkout', '-b', 'factory/issue-7', 'origin/main']);
+    fill('branch');
+    git(clone, ['add', '.']);
+    git(clone, ['commit', '-m', 'branch']);
+    git(clone, ['push', 'origin', 'factory/issue-7']);
+    git(clone, ['checkout', 'main']);
+    fill('main');
+    git(clone, ['add', '.']);
+    git(clone, ['commit', '-m', 'main']);
+    git(clone, ['push', 'origin', 'main']);
+    const ws = await provider.prepare(chain(1), round());
+    expect(ws.conflict?.refusal).toBe('too_many');
+    expect(ws.conflict?.paths).toHaveLength(50);
+  });
+});

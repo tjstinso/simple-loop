@@ -402,7 +402,7 @@ describe('software engine', () => {
   describe('reconcile', () => {
     const waiting = (over: Partial<SoftwareState> = {}) => chain(3, { phase: 'awaiting_merge', ...over });
     const open = (host: FakeGitHost, state: 'open' | 'closed' | 'merged') => {
-      host.prs.set(9, { number: 9, state, headSha: 's', baseBranch: 'main', head: 'factory/issue-7', title: 't', body: 'b' });
+      host.prs.set(9, { number: 9, state, headSha: 's', baseBranch: 'main', mergeable: 'mergeable', head: 'factory/issue-7', title: 't', body: 'b' });
     };
 
     it('maps a merged pull request to completed', async () => {

@@ -90,6 +90,19 @@ export class EffectError extends Error {
   }
 }
 
+/**
+ * Thrown by `workspace.prepare` (or `buildRunInput`) when the job needs no run: the job succeeds
+ * without a result and the chain goes back to `waiting` with `engineState` (no new jobs).
+ */
+export class HandBackError extends Error {
+  engineState: unknown;
+  constructor(message: string, engineState: unknown) {
+    super(message);
+    this.name = 'HandBackError';
+    this.engineState = engineState;
+  }
+}
+
 export interface Effect {
   kind: string;
   [k: string]: unknown;

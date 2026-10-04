@@ -55,14 +55,21 @@ export function softwareTransition(
     const v = parsed.data;
     const followups = followupEffects(v.followups);
     const profile = PROFILES[state.profile];
-    // After a person's feedback, the approved revision is reported on the pull request (once per round).
-    const roundSummary: SoftwareEffect[] = (state.humanRounds ?? 0) > 0 ? [{ kind: 'round_summary' }] : [];
+    // After a conflict resolution or a person's feedback, the approved revision is reported on the
+    // pull request (once per round).
+    const roundSummary: SoftwareEffect[] = state.conflictActive
+      ? [{ kind: 'conflict_summary' }]
+      : (state.humanRounds ?? 0) > 0
+        ? [{ kind: 'round_summary' }]
+        : [];
+    const settled = { ...state, labels, phase: 'awaiting_merge' as const };
+    delete settled.conflictActive;
 
     if (v.verdict === 'approve') {
       if (profile.onApprove === 'merge') {
         return {
           // Auto-merge only: GitHub merges once the required checks pass and reconcile completes the chain.
-          engineState: { ...state, labels, phase: 'awaiting_merge' },
+          engineState: settled,
           chainStatus: 'waiting',
           newJobs: [],
           effects: [
@@ -74,7 +81,7 @@ export function softwareTransition(
         };
       }
       return {
-        engineState: { ...state, labels, phase: 'awaiting_merge' },
+        engineState: settled,
         chainStatus: 'waiting',
         newJobs: [],
         effects: [
@@ -97,8 +104,10 @@ export function softwareTransition(
         effects: followups,
       };
     }
+    const stuck = { ...state, labels, phase: 'needs_human' as const };
+    delete stuck.conflictActive;
     return {
-      engineState: { ...state, labels, phase: 'needs_human' },
+      engineState: stuck,
       chainStatus: 'waiting',
       newJobs: [],
       effects: [

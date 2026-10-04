@@ -1,5 +1,6 @@
 import type { ChainView, Job } from '../../kernel/types.js';
 import type { RunInput } from '../../runner/types.js';
+import { conflictFeedback } from './conflict.js';
 import type { Issue } from './github.js';
 import type { SoftwareState } from './state.js';
 import type { SoftwareWorkspace } from './workspace.js';
@@ -43,5 +44,9 @@ export function buildSoftwareRunInput(
   const payload = job.payload as { feedback?: unknown } | null | undefined;
   const feedback = payload?.feedback;
   if (typeof feedback === 'string' && feedback !== '') out.feedback = feedback;
+  const conflict = workspace.conflict;
+  if (job.type === 'execute' && conflict && !conflict.refusal && conflict.paths.length > 0) {
+    out.feedback = conflictFeedback(conflict.baseBranch, conflict.paths);
+  }
   return out;
 }
