@@ -95,6 +95,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         maxConflictRounds: config.maxConflictRounds,
       },
       now: clock,
+      onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),
       // The secret guard's exact values, read at each push: the model API key, every variable whose
       // name looks secret, the claude-cli policies' passEnv variables and the factory's GitHub token.
       secretValues: () => secretEnvValues(process.env, tokenEnv === undefined ? forwarded : [...forwarded, tokenEnv]),

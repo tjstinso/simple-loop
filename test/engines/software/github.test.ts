@@ -105,6 +105,36 @@ describe('FakeGitHost', () => {
   });
 });
 
+const threadsPage = (nodes: object[], next: string | null = null) =>
+  JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes } } } } });
+const thread = (id: string, isResolved: boolean, ...ids: number[]) => ({ id, isResolved, comments: { nodes: ids.map((databaseId) => ({ databaseId })) } });
+
+describe('FakeGitHost review threads', () => {
+  it('replies in the thread of an inline comment, resolves the thread and reports it resolved', async () => {
+    const gh = new FakeGitHost();
+    const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
+    const id = gh.addReviewComment(pr.number, { createdAt: '2026-01-01T00:00:00Z', body: 'rename' });
+    await gh.replyToReviewComment(R, pr.number, id, 'done');
+    const threadId = gh.threadOf(pr.number, id)!;
+    let threads = await gh.listReviewThreads(R, pr.number);
+    expect(threads).toEqual([{ id: threadId, resolved: false, commentIds: [id, id + 1] }]);
+    await gh.resolveReviewThread(R, threadId);
+    await gh.resolveReviewThread(R, threadId); // resolving again is a no-op
+    threads = await gh.listReviewThreads(R, pr.number);
+    expect(threads[0]!.resolved).toBe(true);
+    const f = await gh.listPrFeedback(R, pr.number);
+    expect(f.reviewComments.map((c) => [c.author, c.threadId, c.threadResolved])).toEqual([['alice', threadId, true], ['factory', threadId, true]]);
+    await expect(gh.replyToReviewComment(R, pr.number, 999, 'x')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('failNext makes a thread call fail', async () => {
+    const gh = new FakeGitHost();
+    const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
+    gh.failNext('listReviewThreads', new GitHostError('boom', 502));
+    await expect(gh.listReviewThreads(R, pr.number)).rejects.toMatchObject({ status: 502 });
+  });
+});
+
 describe('FakeGitHost listPrFeedback', () => {
   it('returns the added reviews and comments, with the factory comments as conversation comments', async () => {
     const gh = new FakeGitHost();
@@ -254,6 +284,7 @@ describe('GhCliHost', () => {
         },
         { stdout: page(100, (i) => ({ id: 100 + i, user: { login: 'dan' }, author_association: 'NONE', body: 'x', created_at: '2026-01-03T00:00:00Z' })) },
         { stdout: JSON.stringify([{ id: 300, user: { login: 'erin' }, author_association: 'COLLABORATOR', body: 'last', created_at: '2026-01-04T00:00:00Z' }]) },
+        { stdout: threadsPage([thread('T1', true, 50)]) },
       ]);
       const f = await new GhCliHost({ exec }).listPrFeedback(R, 9);
       expect(calls.map((c) => c[1])).toEqual([
@@ -262,6 +293,7 @@ describe('GhCliHost', () => {
         ['api', '-X', 'GET', 'repos/o/r/pulls/9/comments', '-f', 'per_page=100', '-f', 'page=1'],
         ['api', '-X', 'GET', 'repos/o/r/issues/9/comments', '-f', 'per_page=100', '-f', 'page=1'],
         ['api', '-X', 'GET', 'repos/o/r/issues/9/comments', '-f', 'per_page=100', '-f', 'page=2'],
+        ['api', 'graphql', '--input', '-'],
       ]);
       expect(f.reviews).toHaveLength(101);
       expect(f.reviews[0]).toEqual({
@@ -271,11 +303,11 @@ describe('GhCliHost', () => {
       expect(f.reviewComments).toEqual([
         {
           id: 50, author: 'carol', authorAssociation: 'OWNER', path: 'src/a.ts', line: 12, diffHunk: '@@ -1 +1 @@', body: 'rename',
-          createdAt: '2026-01-02T00:00:00Z', reviewId: 7,
+          createdAt: '2026-01-02T00:00:00Z', reviewId: 7, threadId: 'T1', threadResolved: true,
         },
         {
           id: 51, author: '', authorAssociation: 'NONE', path: 'b.ts', line: 4, diffHunk: '', body: '',
-          createdAt: '2026-01-02T00:00:01Z', reviewId: null,
+          createdAt: '2026-01-02T00:00:01Z', reviewId: null, threadId: null, threadResolved: false,
         },
       ]);
       expect(f.comments).toHaveLength(101);
@@ -287,10 +319,56 @@ describe('GhCliHost', () => {
         { stdout: JSON.stringify([{ id: 1, user: { login: 'a' }, state: 'PENDING', body: 'x', submitted_at: 't' }]) },
         { stdout: '[]' },
         { stdout: '[]' },
+        { stdout: threadsPage([]) },
       ]);
       expect((await new GhCliHost({ exec: ok.exec }).listPrFeedback(R, 1)).reviews[0]!.state).toBe('COMMENTED');
       const bad = stub([{ stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 }]);
       await expect(new GhCliHost({ exec: bad.exec }).listPrFeedback(R, 1)).rejects.toMatchObject({ status: 404 });
+    });
+  });
+
+  describe('review threads', () => {
+    it('replies through the REST replies endpoint with the body on stdin', async () => {
+      const { exec, calls, inputs } = stub([{ stdout: '{}' }]);
+      await new GhCliHost({ exec }).replyToReviewComment(R, 9, 55, 'thanks <!-- m -->');
+      expect(calls[0]![1]).toEqual(['api', '-X', 'POST', 'repos/o/r/pulls/9/comments/55/replies', '--input', '-']);
+      expect(JSON.parse(inputs[0]!)).toEqual({ body: 'thanks <!-- m -->' });
+    });
+
+    it('pages the review threads of a pull request through GraphQL', async () => {
+      const { exec, inputs } = stub([
+        { stdout: threadsPage([thread('T1', false, 1, 2), thread('T2', true, 3)], 'CUR1') },
+        { stdout: threadsPage([thread('T3', false, 4)]) },
+      ]);
+      expect(await new GhCliHost({ exec }).listReviewThreads(R, 9)).toEqual([
+        { id: 'T1', resolved: false, commentIds: [1, 2] },
+        { id: 'T2', resolved: true, commentIds: [3] },
+        { id: 'T3', resolved: false, commentIds: [4] },
+      ]);
+      expect(inputs.map((i) => JSON.parse(i!).variables)).toEqual([
+        { owner: 'o', name: 'r', number: 9, after: null },
+        { owner: 'o', name: 'r', number: 9, after: 'CUR1' },
+      ]);
+    });
+
+    it('resolves a thread with the resolveReviewThread mutation', async () => {
+      const { exec, calls, inputs } = stub([{ stdout: '{"data":{"resolveReviewThread":{"thread":{"id":"T1","isResolved":true}}}}' }]);
+      await new GhCliHost({ exec }).resolveReviewThread(R, 'T1');
+      expect(calls[0]![1]).toEqual(['api', 'graphql', '--input', '-']);
+      const sent = JSON.parse(inputs[0]!);
+      expect(sent.query).toContain('resolveReviewThread');
+      expect(sent.variables).toEqual({ threadId: 'T1' });
+    });
+
+    it('reports GraphQL errors without a status (transient) and a missing pull request as 404', async () => {
+      const gql = stub([{ stdout: '{"errors":[{"message":"Something went wrong"}]}' }]);
+      const err = await new GhCliHost({ exec: gql.exec }).resolveReviewThread(R, 'T1').catch((e) => e);
+      expect(err).toBeInstanceOf(GitHostError);
+      expect(err.status).toBeUndefined();
+      const bad = stub([{ stderr: 'gh: Bad Gateway (HTTP 502)', exitCode: 1 }]);
+      await expect(new GhCliHost({ exec: bad.exec }).listReviewThreads(R, 9)).rejects.toMatchObject({ status: 502 });
+      const none = stub([{ stdout: '{"data":{"repository":{"pullRequest":null}}}' }]);
+      await expect(new GhCliHost({ exec: none.exec }).listReviewThreads(R, 9)).rejects.toMatchObject({ status: 404 });
     });
   });
 

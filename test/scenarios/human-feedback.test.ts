@@ -81,7 +81,7 @@ describe('revising the pull request for a person’s feedback', () => {
 
     const summaries = prComments(h, pr, 'human-round-1');
     expect(summaries).toHaveLength(1);
-    expect(summaries[0]).toContain('revision 1 done');
+    expect(summaries[0]).toContain('0 changed, 0 explained, 0 declined');
     expect(summaries[0]).toContain(`https://github.com/o/r/commit/${h.remoteHead(BRANCH)}`);
 
     // Neither the finished round nor its factory comment starts another one.

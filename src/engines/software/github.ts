@@ -56,6 +56,17 @@ export interface PrReviewComment {
   createdAt: string;
   /** The review the comment belongs to (null when unknown). */
   reviewId: number | null;
+  /** The review thread the comment belongs to (GraphQL node id; absent or null when unknown). */
+  threadId?: string | null;
+  /** Whether that thread is resolved (absent: not resolved). */
+  threadResolved?: boolean;
+}
+
+/** A review thread of a pull request: GraphQL node id, resolved flag and the REST ids of its comments. */
+export interface PrReviewThread {
+  id: string;
+  resolved: boolean;
+  commentIds: number[];
 }
 
 export interface PrConversationComment {
@@ -91,6 +102,12 @@ export interface GitHost {
   mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void>;
   /** The reviews, inline review comments and conversation comments of a pull request, all pages. */
   listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback>;
+  /** The review threads of a pull request with their comment ids (GraphQL, all pages). */
+  listReviewThreads(repo: string, prNumber: number): Promise<PrReviewThread[]>;
+  /** Replies in the thread of an inline review comment (REST). */
+  replyToReviewComment(repo: string, prNumber: number, commentId: number, body: string): Promise<void>;
+  /** Resolves a review thread by its node id (GraphQL); resolving a resolved thread is a no-op. */
+  resolveReviewThread(repo: string, threadId: string): Promise<void>;
 }
 
 export class GitHostError extends Error {
@@ -213,6 +230,20 @@ export const buildCommentArgs = (repo: string, n: number): string[] => [
   'api', '-X', 'POST', `repos/${repo}/issues/${n}/comments`, '--input', '-',
 ];
 
+export const buildReplyToReviewCommentArgs = (repo: string, n: number, commentId: number): string[] => [
+  'api', '-X', 'POST', `repos/${repo}/pulls/${n}/comments/${commentId}/replies`, '--input', '-',
+];
+
+/** GraphQL goes through `gh api graphql` with the query and its variables as JSON on stdin. */
+export const buildGraphqlArgs = (): string[] => ['api', 'graphql', '--input', '-'];
+
+export const REVIEW_THREADS_QUERY =
+  'query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){' +
+  'reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{id isResolved comments(first:100){nodes{databaseId}}}}}}}';
+
+export const RESOLVE_THREAD_MUTATION =
+  'mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}';
+
 export const buildSearchIssuesArgs = (repo: string, marker: string): string[] => [
   'api', '-X', 'GET', 'search/issues',
   '-f', `q=repo:${repo} is:issue in:body "${marker.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
@@ -290,6 +321,20 @@ interface RestReviewComment {
   body?: string | null;
   created_at?: string | null;
   pull_request_review_id?: number | null;
+}
+
+interface GraphqlThreads {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: Array<{ id: string; isResolved?: boolean; comments?: { nodes?: Array<{ databaseId?: number | null } | null> } } | null>;
+        };
+      } | null;
+    } | null;
+  };
+  errors?: Array<{ message?: string }>;
 }
 
 interface RestIssueComment {
@@ -429,10 +474,51 @@ export class GhCliHost implements GitHost {
     }
   }
 
+  async listReviewThreads(repo: string, prNumber: number): Promise<PrReviewThread[]> {
+    const [owner, name] = repo.split('/');
+    const threads: PrReviewThread[] = [];
+    let after: string | null = null;
+    for (;;) {
+      const r: GraphqlThreads = await this.json<GraphqlThreads>(buildGraphqlArgs(), {
+        query: REVIEW_THREADS_QUERY,
+        variables: { owner, name, number: prNumber, after },
+      });
+      // GraphQL reports failures with HTTP 200 and an `errors` list: no status, so they count as transient.
+      if (r.errors?.length) throw new GitHostError(`graphql: ${r.errors.map((e) => e.message ?? 'error').join('; ')}`);
+      const pr = r.data?.repository?.pullRequest;
+      if (!pr) throw new GitHostError('graphql: pull request not found', 404);
+      const page = pr.reviewThreads;
+      for (const t of page?.nodes ?? []) {
+        if (!t) continue;
+        threads.push({
+          id: t.id,
+          resolved: t.isResolved === true,
+          commentIds: (t.comments?.nodes ?? []).flatMap((c) => (typeof c?.databaseId === 'number' ? [c.databaseId] : [])),
+        });
+      }
+      if (page?.pageInfo?.hasNextPage !== true || !page.pageInfo.endCursor) return threads;
+      after = page.pageInfo.endCursor;
+    }
+  }
+
+  async replyToReviewComment(repo: string, prNumber: number, commentId: number, body: string): Promise<void> {
+    await this.run(buildReplyToReviewCommentArgs(repo, prNumber, commentId), { body });
+  }
+
+  async resolveReviewThread(_repo: string, threadId: string): Promise<void> {
+    const r = await this.json<{ errors?: Array<{ message?: string }> }>(buildGraphqlArgs(), {
+      query: RESOLVE_THREAD_MUTATION,
+      variables: { threadId },
+    });
+    if (r.errors?.length) throw new GitHostError(`graphql: ${r.errors.map((e) => e.message ?? 'error').join('; ')}`);
+  }
+
   async listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback> {
     const reviews = await this.pages<RestReview>((p) => buildListReviewsArgs(repo, prNumber, p));
     const reviewComments = await this.pages<RestReviewComment>((p) => buildListReviewCommentsArgs(repo, prNumber, p));
     const comments = await this.pages<RestIssueComment>((p) => buildListCommentsArgs(repo, prNumber, p));
+    const threadOf = new Map<number, PrReviewThread>();
+    for (const t of await this.listReviewThreads(repo, prNumber)) for (const id of t.commentIds) threadOf.set(id, t);
     return {
       reviews: reviews.map((r) => {
         const state = String(r.state ?? '').toUpperCase();
@@ -456,6 +542,8 @@ export class GhCliHost implements GitHost {
         body: c.body ?? '',
         createdAt: c.created_at ?? '',
         reviewId: c.pull_request_review_id ?? null,
+        threadId: threadOf.get(c.id)?.id ?? null,
+        threadResolved: threadOf.get(c.id)?.resolved === true,
       })),
       comments: comments.map((c) => ({
         id: c.id,

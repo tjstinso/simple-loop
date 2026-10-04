@@ -196,6 +196,13 @@ describe('ClaudeCliRunner', () => {
     expect(steps[3]).toContain('echo step 4');
   });
 
+  it('passes feedbackResponses of the final block through unchecked', async () => {
+    const responses = [{ id: 'comment 1', action: 'explained', reply: 'Because.' }];
+    const text = '```json\n' + JSON.stringify({ summary: 'ok', feedbackResponses: responses }) + '\n```';
+    const res = await runner('steps', { STUB_STEPS: '1', STUB_RESULT_TEXT: text }).run(input(), signal(), trackingHooks());
+    expect(res).toMatchObject({ status: 'ok', summary: 'ok', feedbackResponses: responses });
+  });
+
   it('adds the stream cost to a json-format result', async () => {
     const text = '```json\n{"verdict":"approve","feedback":"ok"}\n```';
     const res = await runner('steps', { STUB_STEPS: '0', STUB_RESULT_TEXT: text }).run(

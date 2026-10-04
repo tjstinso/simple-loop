@@ -28,12 +28,23 @@ export const LenientFollowupsSchema = z.array(
   ]),
 );
 
+export const REPLY_MAX = 2000;
+
+export const FeedbackResponseSchema = z.object({
+  id: z.string().min(1),
+  action: z.enum(['changed', 'explained', 'declined']),
+  reply: z.string().min(1).max(REPLY_MAX),
+});
+export type FeedbackResponse = z.infer<typeof FeedbackResponseSchema>;
+
 export const ExecutionResultSchema = z.object({
   status: z.enum(['ok', 'error']),
   summary: z.string(),
   costUsd: z.number().optional(),
   steps: z.array(z.string()).optional(),
   followups: LenientFollowupsSchema.optional(),
+  // A malformed list never fails the run: it counts as no responses.
+  feedbackResponses: z.array(FeedbackResponseSchema).optional().catch(undefined),
 });
 export type ExecutionResult = z.infer<typeof ExecutionResultSchema>;
 
@@ -51,6 +62,7 @@ export type SoftwareEffect =
   | { kind: 'set_labels'; target: 'issue' | 'pr'; add: string[]; remove: string[] }
   | { kind: 'merge_pr' }
   | { kind: 'round_summary' }
+  | { kind: 'post_feedback_replies' }
   | { kind: 'conflict_summary' }
   | { kind: 'comment'; target: 'issue' | 'pr'; body: string; marker: string }
   | { kind: 'file_followups'; followups: Followup[] };

@@ -3,12 +3,14 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { hasConflictMarkers } from './conflict.js';
+import { refsFromPayload, validateResponses } from './feedback.js';
+import { postFeedbackReplies } from './replies.js';
 import { fileFollowups, storeFollowups } from './followups.js';
 import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type EffectOutcome, type Job } from '../../kernel/types.js';
 import { AutoMergeRefusedError, GitHostError, type GitHost, type Issue } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { PROFILES } from './profiles.js';
-import { LABEL_IN_PROGRESS, LABEL_NEEDS_HUMAN, LABEL_READY_FOR_MERGE, type SoftwareEffect } from './schemas.js';
+import { ExecutionResultSchema, LABEL_IN_PROGRESS, LABEL_NEEDS_HUMAN, LABEL_READY_FOR_MERGE, type SoftwareEffect } from './schemas.js';
 import { findingsOf, redactSecrets, scanPaths, scanText, SCAN_TRUNCATED_KIND } from './secret-scan.js';
 import type { SoftwareState } from './state.js';
 import type { SoftwareWorkspace } from './workspace.js';
@@ -33,6 +35,8 @@ export interface EffectContext {
   now?: () => number;
   /** Records a lifecycle event for this chain and delivery (detail: structured, never agent text). */
   events?: (kind: string, detail?: Record<string, unknown>) => void;
+  /** Reports an error that does not fail the job (a feedback reply that could not be posted). */
+  onError?: (err: unknown, context: string) => void;
 }
 
 const MAX_ATTEMPTS = 3;
@@ -45,6 +49,7 @@ const EffectSchemas = {
   set_labels: z.object({ kind: z.literal('set_labels'), target: Target, add: z.array(z.string()), remove: z.array(z.string()) }),
   merge_pr: z.object({ kind: z.literal('merge_pr') }),
   round_summary: z.object({ kind: z.literal('round_summary') }),
+  post_feedback_replies: z.object({ kind: z.literal('post_feedback_replies') }),
   conflict_summary: z.object({ kind: z.literal('conflict_summary') }),
   comment: z.object({ kind: z.literal('comment'), target: Target, body: z.string(), marker: z.string().min(1) }),
 } as const;
@@ -230,44 +235,116 @@ async function filesWithMarkers(ws: SoftwareWorkspace): Promise<string[]> {
 }
 
 /**
- * A human feedback round whose revision changed nothing: one comment says so (with the agent's
- * summary, redacted), the chain goes back to `awaiting_merge` and the review is skipped. The same
- * feedback is not retried: `feedbackHandledAt` was set when the round started.
+ * Answers the feedback items of the round the job works on (a no-op for jobs without feedback items):
+ * validates the agent's responses against the round, posts the replies and resolves the threads (see
+ * `postFeedbackReplies`). Never fails the job: what could not be posted is returned as state for the
+ * next maintenance pass.
+ */
+async function answerFeedback(ctx: EffectContext, fence: EffectFence, n: number | null, headSha: string): Promise<Partial<SoftwareState> | null> {
+  const refs = refsFromPayload(ctx.job.payload);
+  if (refs.length === 0) return null;
+  const parsed = ExecutionResultSchema.safeParse(ctx.job.result);
+  const v = validateResponses(parsed.success ? parsed.data.feedbackResponses : undefined, refs);
+  const round = humanRoundOf(ctx.job) ?? 0;
+  const values = secretValuesOf(ctx);
+  const patch: Partial<SoftwareState> = { lastCounts: v.counts };
+  try {
+    const pr = n === null ? await ctx.host.findPrByHead(ctx.chain.state.repo, ctx.chain.state.branch) : null;
+    const number = n ?? pr?.number;
+    if (number === undefined) throw new GitHostError('no PR found for the feedback replies');
+    const sha = n === null ? (pr?.headSha ?? '') : headSha;
+    const posted = await postFeedbackReplies(
+      {
+        host: ctx.host,
+        repo: ctx.chain.state.repo,
+        chainId: ctx.chain.id,
+        pr: number,
+        headSha: sha,
+        redact: (t) => redactSecrets(t, values),
+        neutralize: neutralizeSummary,
+        retry: (fn) => withHostRetry(fn, ctx.sleep ?? defaultSleep),
+        assertCurrent: () => fence.assertCurrent(),
+        events: (kind, detail) => ctx.events?.(kind, detail),
+        onError: (err, context) => ctx.onError?.(err, context),
+      },
+      // Answers an earlier pass could not post go first (a newer round must not lose them).
+      [...(ctx.chain.state.pendingReplies ?? []).filter((o) => !v.replies.some((r) => r.id === o.id)), ...v.replies],
+      { round, ids: v.unanswered },
+    );
+    return { ...patch, ...posted };
+  } catch (e) {
+    if (e instanceof StaleDeliveryError) throw e;
+    ctx.onError?.(e, 'feedback replies');
+    ctx.events?.('feedback.reply_failed', { id: 'round', error: oneLine(redactSecrets(e instanceof Error ? e.message : String(e), values)) });
+    return {
+      ...patch,
+      pendingReplies: [...(ctx.chain.state.pendingReplies ?? []).filter((o) => !v.replies.some((r) => r.id === o.id)), ...v.replies],
+      pendingUnanswered: { round, ids: v.unanswered },
+    };
+  }
+}
+
+/** The effect after the push of a feedback round's revision: answers the round's items. */
+async function postFeedbackRepliesEffect(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
+  const patch = await answerFeedback(ctx, fence, null, '');
+  return patch ? { engineState: patch } : undefined;
+}
+
+/**
+ * A human feedback round whose revision changed nothing: each item is answered (and its thread
+ * resolved when answered `changed` or `explained`), one summary comment gives the counts, the chain
+ * goes back to `awaiting_merge` and the review is skipped. Without any response one comment says that
+ * nothing changed (with the agent's summary, redacted). The same feedback is not retried:
+ * `feedbackHandledAt` was set when the round started.
  */
 async function handBackUnchanged(ctx: EffectContext, fence: EffectFence, round: number): Promise<EffectOutcome<SoftwareState>> {
   const { repo, issueNumber } = ctx.chain.state;
   const n = await prNumber(ctx, 'no PR found for the feedback round');
-  const summary = summaryOf(ctx.job);
-  const why = summary ? neutralizeSummary(redactSecrets(summary, secretValuesOf(ctx))) : 'the agent gave no explanation';
-  await commentOnce(
-    ctx,
-    fence,
-    n,
-    `human-round-${round}-unchanged`,
-    `The factory looked at the feedback but made no change to the branch. The agent said:\n\n${why}`,
-  );
+  const answered = await answerFeedback(ctx, fence, n, '');
+  const c = answered?.lastCounts;
+  if (c !== undefined && c.changed + c.explained + c.declined > 0) {
+    await commentOnce(
+      ctx,
+      fence,
+      n,
+      `human-round-${round}`,
+      `The factory answered the feedback (round ${round}) without changing the branch: ${countsText(c)}.`,
+    );
+  } else {
+    const summary = summaryOf(ctx.job);
+    const why = summary ? neutralizeSummary(redactSecrets(summary, secretValuesOf(ctx))) : 'the agent gave no explanation';
+    await commentOnce(
+      ctx,
+      fence,
+      n,
+      `human-round-${round}-unchanged`,
+      `The factory looked at the feedback but made no change to the branch. The agent said:\n\n${why}`,
+    );
+  }
   fence.assertCurrent();
   const ready = PROFILES[ctx.chain.state.profile].onApprove === 'merge' ? [] : [LABEL_READY_FOR_MERGE];
   await ctx.host.setLabels(repo, n, ready, [LABEL_IN_PROGRESS]);
   await ctx.host.setLabels(repo, issueNumber, [], [LABEL_IN_PROGRESS]);
   ctx.events?.('feedback.unchanged', { round });
-  return { engineState: { phase: 'awaiting_merge' }, finish: { chainStatus: 'waiting' } };
+  return { engineState: { ...answered, phase: 'awaiting_merge' }, finish: { chainStatus: 'waiting' } };
 }
+
+const countsText = (c: { changed: number; explained: number; declined: number }): string =>
+  `${c.changed} changed, ${c.explained} explained, ${c.declined} declined`;
 
 /** After the factory's review approved a revision for a human round: one summary comment with the new commit. */
 async function roundSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
-  const { repo, humanRounds, lastSummary } = ctx.chain.state;
+  const { repo, humanRounds, lastCounts } = ctx.chain.state;
   const round = humanRounds ?? 0;
   const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
   if (!pr) throw new EffectError('no PR found for the round summary', 'effect_error');
-  const summary = lastSummary ? neutralizeSummary(redactSecrets(lastSummary, secretValuesOf(ctx))) : 'no summary was given';
   const commit = pr.headSha ? `https://github.com/${repo}/commit/${pr.headSha}` : '(unknown)';
   await commentOnce(
     ctx,
     fence,
     pr.number,
     `human-round-${round}`,
-    `The factory revised this pull request after the feedback (round ${round}).\n\n${summary}\n\nNew commit: ${commit}\n\nReview threads are left open for you to resolve.`,
+    `The factory revised this pull request after the feedback (round ${round}): ${commit}\n\n${countsText(lastCounts ?? { changed: 0, explained: 0, declined: 0 })}.`,
   );
 }
 
@@ -515,6 +592,8 @@ async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFenc
         return mergePr(ctx, fence);
       case 'round_summary':
         return roundSummary(ctx, fence);
+      case 'post_feedback_replies':
+        return postFeedbackRepliesEffect(ctx, fence);
       case 'conflict_summary':
         return conflictSummary(ctx, fence);
       case 'comment':

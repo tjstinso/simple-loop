@@ -13,8 +13,9 @@ import {
 } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
-import { defaultSleep, isTransient, runSoftwareEffect, withHostRetry } from './effects.js';
+import { defaultSleep, isTransient, neutralizeSummary, runSoftwareEffect, withHostRetry } from './effects.js';
 import { planFeedbackRound, DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS } from './feedback.js';
+import { postFeedbackReplies } from './replies.js';
 import { GitHostError, type GitHost, type Pr } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
@@ -55,6 +56,8 @@ export interface SoftwareEngineDeps {
     maxConflictRounds?: number;
   };
   sleep?: (ms: number) => Promise<void>;
+  /** Reports an error that does not stop the work (a feedback reply that could not be posted). */
+  onError?: (err: unknown, context: string) => void;
   /** Clock for stored rows (epoch ms); injected by the composition root. */
   now: () => number;
   /**
@@ -123,6 +126,35 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   }
 
   /**
+   * Posts the replies of an earlier round that could not be posted (no reply marker yet) and names
+   * unanswered items. Null when nothing is pending or nothing changed (the next pass tries again).
+   */
+  async function retryPendingReplies(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
+    const pending = s.pendingReplies ?? [];
+    const unanswered = s.pendingUnanswered;
+    if (pending.length === 0 && (unanswered?.ids.length ?? 0) === 0) return null;
+    const result = await postFeedbackReplies(
+      {
+        host: deps.host,
+        repo: s.repo,
+        chainId,
+        pr: pr.number,
+        headSha: pr.headSha,
+        redact,
+        neutralize: neutralizeSummary,
+        retry: (fn) => withHostRetry(fn, deps.sleep ?? defaultSleep),
+        assertCurrent: () => undefined,
+        events: (kind, detail) => recordEvent(deps.db, { at: deps.now(), chainId, kind, engine: 'software', detail: detail ?? {} }),
+        onError: (err, context) => deps.onError?.(err, context),
+      },
+      pending,
+      unanswered,
+    );
+    if (result.pendingReplies.length === pending.length && result.pendingUnanswered.ids.length === (unanswered?.ids.length ?? 0)) return null;
+    return { outcome: 'update', reason: 'feedback replies posted', engineState: { ...s, ...result } };
+  }
+
+  /**
    * The factory's pull request is open and waiting: starts a revision when a person left feedback
    * since `feedbackHandledAt`, or hands over (`needs_human`) when the chain used its human rounds.
    */
@@ -166,7 +198,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         feedbackHandledAt: plan.newestAt,
         conflictActive: false,
       },
-      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: round } },
+      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: round, feedbackItems: plan.refs } },
     };
   }
 
@@ -362,6 +394,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
           followups: { db: deps.db, now: deps.now },
           now: deps.now,
           secretValues: deps.secretValues,
+          onError: deps.onError,
           events: (kind, detail) =>
             recordEvent(deps.db, {
               at: deps.now(),
@@ -482,6 +515,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       }
       if (!pr) return { outcome: 'none' };
       if (pr.state === 'open') {
+        const replied = await retryPendingReplies(s, chain.id, pr);
+        if (replied) return replied;
         // A conflict comes first; feedback is looked at on a later pass or when there is no conflict.
         const conflict = await reconcileConflict(s, chain.id, pr);
         return conflict ?? reconcileFeedback(s, chain.id, pr.number);
