@@ -205,6 +205,7 @@ factory [--config <path>] dlq retry <job-id>
 factory [--config <path>] dlq discard <job-id>
 factory [--config <path>] cancel <chain-id>
 factory [--config <path>] policies
+factory [--config <path>] dashboard [--port <n>] [--host <addr>]
 factory --help
 ```
 
@@ -264,6 +265,32 @@ If labelling the issue fails when a job is dead-lettered (for example GitHub ans
 $ factory cancel 1
 cancelled chain 1
 ```
+
+## Dashboard
+
+`factory dashboard [--port <n>] [--host <addr>]` serves a page in the browser that shows where every chain is and who has to act next, so you do not have to combine `status`, `show` and `workers`. It listens on `127.0.0.1:4173` by default and runs until SIGINT or SIGTERM, then shuts down cleanly.
+
+**Local and unauthenticated.** The dashboard has no authentication. The default host is loopback, so only this machine can reach it. Binding to another address needs an explicit `--host` (for example `--host 0.0.0.0`) and prints a warning; anyone who can reach the port can then read your factory data (issue numbers, branch names, event details, costs).
+
+**Read-only.** The server opens the database with a read-only connection, answers only `GET` (every other method gets `405`), never calls GitHub and never starts, stops or retries a job. It needs the database to exist already (`factory submit` or `factory worker` creates it). It uses only Node built-ins; the page is one self-contained HTML document with inline CSS and JavaScript (no external scripts, fonts or images), so it works offline, and follows the system light or dark preference. It polls `/api/overview` every 5 seconds (paused while the tab is hidden), shows the time of the last successful refresh, and shows a "Disconnected" banner above the last data when the server cannot be reached. Expanded chains stay expanded across refreshes. All text from GitHub or an agent is rendered as text, never as HTML.
+
+**Sections.** The header counts live workers, running jobs and chains waiting on a person. "Needs you" lists chains waiting on a person or a dead-letter decision, with links; "In progress" lists chains with a running job (its worker, how long it has run, the latest events); "Queued" lists the rest of the open chains; "Recently finished" shows the last 20 completed or cancelled chains. Expanding a chain shows its jobs with cost and its full event timeline (the same events as `factory show`).
+
+**API.** `GET /api/overview` returns, in one response: `openChains` (status `active`, `waiting` or `dead_lettered`) and the 20 most recent `finishedChains`, each with subject, engine, status, phase, attempt, links, jobs, its 10 latest events, total cost and `waitingOn`; plus `workers` (alive when the last heartbeat is within twice the 30 s heartbeat interval, and the job each is on), `summary`, `totalCostUsd` and `generatedAt`. `GET /api/chains/<id>` returns the same data as `factory show --json`. The pull request link is a GitHub search for the chain's branch, because the pull request number is not recorded.
+
+**waitingOn.** Derived for each open chain:
+
+| `waitingOn` | When |
+| --- | --- |
+| `a worker` | a job is queued (the detail says when no worker is alive, and when it is a retry) |
+| `running` | a job is claimed by a live worker with an unexpired lease (shows how long it has run and when the lease expires) |
+| `a reviewer agent` | a review job is queued or running |
+| `a person: review and merge` | phase `awaiting_merge`; names the pull request's branch and how long it has waited |
+| `a person: needs attention` | phase `needs_human`; shows how long it has waited |
+| `a decision on the dead letter` | chain status `dead_lettered`; shows the reason (see `factory dlq`) |
+| `a stuck job` | a running job whose worker is dead or whose lease has expired (shown prominently) |
+
+**What it does not show.** What the agent is doing inside a running job (tool calls, files touched): the runner does not record its steps, so the dashboard shows only the recorded job and chain state and events. There are no controls (cancel, retry, submit) in the dashboard; use the commands above.
 
 ## Events
 

@@ -8,6 +8,13 @@ export function openDb(path: string): Database.Database {
   return db;
 }
 
+/** A read-only connection to an existing database: it cannot write, create or migrate anything. */
+export function openReadOnlyDb(path: string): Database.Database {
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  db.pragma('busy_timeout = 5000');
+  return db;
+}
+
 const KERNEL_DDL = `
 CREATE TABLE IF NOT EXISTS chains (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
