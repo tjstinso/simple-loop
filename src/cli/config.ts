@@ -25,6 +25,7 @@ export const RepoToolSchema = z
     setupTimeoutMs: z.number().int().min(1).default(300_000),
     verifyTimeoutMs: z.number().int().min(1).default(600_000),
     maxVerifyRounds: z.number().int().min(1).default(3),
+    verifyBaseline: z.boolean().default(true),
   })
   .strict();
 export type RepoToolConfig = z.infer<typeof RepoToolSchema>;

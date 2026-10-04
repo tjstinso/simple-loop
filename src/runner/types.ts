@@ -12,6 +12,10 @@ export interface RunInput {
   subject: unknown;
   workspace: Workspace;
   feedback?: string;
+  /** Text the engine adds to the policy prompt (placed before the work item). */
+  promptAddendum?: string;
+  /** What each verify command did on the unmodified tree, when the engine ran a baseline. */
+  baseline?: { command: string; status: 'pass' | 'fail'; output: string }[];
   /**
    * The shared cache repository and base branch a relative plugin directory is compared against
    * (see `assertPluginDirsUnchanged`). Supplied by the engine; without it a relative entry is refused.

@@ -16,7 +16,11 @@ import type { Workspace } from '../../runner/types.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildToolEnv, buildVerifyFeedback, runCommand, type RepoToolSettings } from './tool-run.js';
+import {
+  BASELINE_TAIL_LINES, BaselineFailingError, buildToolEnv, buildVerifyFeedback, runCommand,
+  type BaselineEntry, type RepoToolSettings,
+} from './tool-run.js';
+import { depCacheKey, isStandardInstall, pruneDepCache, restoreDepCache, storeDepCache } from './dep-cache.js';
 import { defaultSleep, isTransient, neutralizeSummary, runSoftwareEffect, withHostRetry } from './effects.js';
 import { planFeedbackRound, DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS } from './feedback.js';
 import { postFeedbackReplies } from './replies.js';
@@ -66,6 +70,8 @@ export interface SoftwareEngineDeps {
   };
   /** The environment the tool environment is built from (default `process.env`). */
   env?: () => NodeJS.ProcessEnv;
+  /** The workspace root; the dependency cache lives in `<workspaceRoot>/.cache/deps` (none without it). */
+  workspaceRoot?: string;
   /** Variable names that never reach a setup or verify command (the GitHub token variable). */
   withheldEnv?: readonly string[];
   sleep?: (ms: number) => Promise<void>;
@@ -82,6 +88,14 @@ export interface SoftwareEngineDeps {
 
 export { LABEL_DEAD_LETTER };
 
+/** Added to the execute prompt for a repository with `verify`: the factory runs the full checks itself. */
+export const VERIFY_PROMPT = [
+  "The project's dependencies are installed.",
+  'While working, run only targeted tests (the single test file for the code you are changing).',
+  'Do not run the full type-check, build or test suite before finishing: the factory runs them after you finish and returns any failures to you.',
+  'Finish as soon as the change is complete.',
+].join(' ');
+
 /** Consecutive maintenance passes a pull request may stay `unknown` before the engine moves on. */
 const MAX_UNKNOWN_PASSES = 5;
 
@@ -94,7 +108,12 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const cache = new Map<string, SoftwareWorkspace>();
   // `delivery` restarts at 1 for every job, so a delivery is identified by (chain, job, delivery).
   const key = (chainId: number, jobId: number, delivery: number) => `${chainId}:${jobId}:${delivery}`;
-  const forget = (chainId: number, jobId: number, delivery: number) => void cache.delete(key(chainId, jobId, delivery));
+  /** What each verify command did on the unmodified tree, per delivery (only for a passing baseline). */
+  const baselines = new Map<string, BaselineEntry[]>();
+  const forget = (chainId: number, jobId: number, delivery: number) => {
+    cache.delete(key(chainId, jobId, delivery));
+    baselines.delete(key(chainId, jobId, delivery));
+  };
   const allowedAuthorAssociations = deps.config.allowedAuthorAssociations ?? [...DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS];
   const maxHumanRounds = Math.max(1, deps.config.maxHumanRounds ?? 5);
   const maxConflictRounds = Math.max(1, deps.config.maxConflictRounds ?? 2);
@@ -423,6 +442,108 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     }
   }
 
+  /** Runs every verify command once on the unmodified tree; a command that fails does not stop the others. */
+  async function runBaseline(ws: Workspace, commands: string[][], timeoutMs: number, signal: AbortSignal | undefined): Promise<BaselineEntry[]> {
+    const home = await mkdtemp(join(tmpdir(), 'factory-tool-home-'));
+    try {
+      const env = buildToolEnv(deps.env?.() ?? process.env, { home, ...(deps.withheldEnv === undefined ? {} : { withheld: deps.withheldEnv }) });
+      const entries: BaselineEntry[] = [];
+      for (const argv of commands) {
+        const r = await runCommand(argv, { cwd: ws.path, env, timeoutMs, ...(signal === undefined ? {} : { signal }) });
+        if (signal?.aborted) throw new Error('aborted');
+        const text = r.spawnError ?? r.output;
+        entries.push({
+          command: argv.join(' ').slice(0, 300),
+          status: r.exitCode === 0 ? 'pass' : 'fail',
+          output: redact(text.split('\n').slice(-BASELINE_TAIL_LINES).join('\n')),
+        });
+      }
+      return entries;
+    } finally {
+      await rm(home, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** The tool environment for the cache's `cp` (only the allow-listed variables, an empty HOME is not needed). */
+  const cacheOptions = (signal: AbortSignal | undefined) => ({
+    workspaceRoot: deps.workspaceRoot!,
+    env: buildToolEnv(deps.env?.() ?? process.env, deps.withheldEnv === undefined ? {} : { withheld: deps.withheldEnv }),
+    ...(signal === undefined ? {} : { signal }),
+  });
+
+  /**
+   * Primes a workspace the engine just prepared, before any agent touches it: the dependencies (from
+   * the cache when the setup is the standard install, else by running `setup`) and, for an execute
+   * job, the baseline verification of the unmodified tree. A red baseline throws
+   * `BaselineFailingError` (retried like a transient failure, no agent started).
+   */
+  async function prime(chain: ChainView<SoftwareState>, job: Job, ws: Workspace, signal: AbortSignal | undefined): Promise<void> {
+    const cfg = deps.config.repos?.[chain.state.repo];
+    const setup = cfg?.setup ?? [];
+    const verify = cfg?.verify ?? [];
+    const conflicted = ((ws as SoftwareWorkspace).conflict?.paths.length ?? 0) > 0;
+    const wantBaseline = job.type === 'execute' && verify.length > 0 && cfg?.verifyBaseline !== false && !conflicted;
+    if (setup.length === 0 && !wantBaseline) return;
+
+    let cacheState: 'hit' | 'miss' | 'corrupt' | 'none' = 'none';
+    let keyPrefix: string | undefined;
+    const setupStarted = Date.now();
+    if (setup.length > 0) {
+      const cacheKey = deps.workspaceRoot !== undefined && isStandardInstall(setup) ? await depCacheKey(ws.path) : null;
+      if (cacheKey !== null) {
+        keyPrefix = cacheKey.slice(0, 12);
+        cacheState = await restoreDepCache(cacheKey, ws.path, cacheOptions(signal)).catch(() => 'corrupt' as const);
+      }
+      if (cacheState !== 'hit') {
+        await runSetup(chain, job, ws, signal);
+        // Stored only now, from the tree the engine prepared before the agent started.
+        if (cacheKey !== null) await storeDepCache(cacheKey, ws.path, cacheOptions(signal)).catch(() => false);
+      }
+    }
+    const setupDurationMs = Date.now() - setupStarted;
+
+    let baseline: 'pass' | 'fail' | 'skipped' = 'skipped';
+    let baselineDurationMs: number | undefined;
+    let entries: BaselineEntry[] = [];
+    if (wantBaseline) {
+      const started = Date.now();
+      entries = await runBaseline(ws, verify, cfg?.verifyTimeoutMs ?? 600_000, signal);
+      baselineDurationMs = Date.now() - started;
+      baseline = entries.every((e) => e.status === 'pass') ? 'pass' : 'fail';
+    }
+    const failing = entries.find((e) => e.status === 'fail');
+    jobEvent(chain, job, 'workspace.primed', {
+      cache: cacheState,
+      ...(keyPrefix === undefined ? {} : { keyPrefix }),
+      setupDurationMs,
+      baseline,
+      ...(baselineDurationMs === undefined ? {} : { baselineDurationMs }),
+      ...(failing === undefined ? {} : { failed: redact(failing.command) }),
+    });
+    if (failing) {
+      await announceBaselineFailure(chain, redact(failing.command));
+      throw new BaselineFailingError(redact(failing.command));
+    }
+    if (wantBaseline) baselines.set(key(chain.id, job.id, job.delivery), entries);
+  }
+
+  /** One comment per chain on the pull request (the issue for a first attempt) naming the red command. */
+  async function announceBaselineFailure(chain: ChainView<SoftwareState>, command: string): Promise<void> {
+    const s = chain.state;
+    try {
+      const sleep = deps.sleep ?? defaultSleep;
+      const pr = await withHostRetry(() => deps.host.findPrByHead(s.repo, s.branch), sleep);
+      await commentOnce(
+        s.repo,
+        pr?.number ?? s.issueNumber,
+        `<!-- factory:chain=${chain.id} event=baseline-failing -->`,
+        `The factory did not start the agent: the verification already fails on the unmodified base branch, so the base branch or the environment is red, not the change. Failing command: \`${command}\`. The factory retries later.`,
+      );
+    } catch (e) {
+      deps.onError?.(e, `baseline comment for chain ${chain.id}`);
+    }
+  }
+
   const workspace: WorkspaceProvider = {
     async prepare(chain: ChainView<any>, job: Job, signal?: AbortSignal): Promise<Workspace> {
       const ws = await deps.workspaces.prepare(chain, job);
@@ -443,7 +564,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         });
         if (conflict.refusal !== undefined || conflict.paths.length === 0) await handBackConflict(chain, job, conflict);
       }
-      await runSetup(chain, job, ws, signal);
+      await prime(chain, job, ws, signal);
       cache.set(key(chain.id, job.id, job.delivery), ws as SoftwareWorkspace);
       return ws;
     },
@@ -477,7 +598,11 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         if (!found) throw new Error(`no PR found for review of ${s.branch}`);
         pr = { number: found.number, baseBranch: (ws as SoftwareWorkspace).baseBranch };
       }
-      return buildSoftwareRunInput(chain, job, ws as SoftwareWorkspace, issue, pr);
+      const input = buildSoftwareRunInput(chain, job, ws as SoftwareWorkspace, issue, pr);
+      const base = baselines.get(key(chain.id, job.id, job.delivery));
+      if (base !== undefined) input.baseline = base;
+      if (job.type === 'execute' && (deps.config.repos?.[s.repo]?.verify?.length ?? 0) > 0) input.promptAddendum = VERIFY_PROMPT;
+      return input;
     },
 
     async verify(chain, job, ws, result, rerun, signal) {
@@ -507,7 +632,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         if (round >= maxRounds) {
           throw new EffectError(`verification failed after ${round} round(s) of fixes: ${show(f.argv)} (exit code ${f.exitCode ?? 'none'})`, 'runner_error');
         }
-        const feedback = buildVerifyFeedback(f.argv, f.exitCode, f.spawnError ?? f.output, deps.secretValues?.() ?? []);
+        const feedback = buildVerifyFeedback(f.argv, f.exitCode, f.spawnError ?? f.output, deps.secretValues?.() ?? [], baselines.get(key(chain.id, job.id, job.delivery)));
         rounds++;
         const next = (await rerun(feedback)) as typeof current;
         if (typeof next.costUsd === 'number') cost = (cost ?? 0) + next.costUsd;
@@ -748,6 +873,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       await step(() => sweepUnfiledFollowups(deps.db, deps.host, now, redact));
       await step(() => pruneFiledFollowups(deps.db, now, historyRetentionDays));
       await step(() => deps.workspaces.sweep(isLiveDelivery(now), now));
+      if (deps.workspaceRoot !== undefined) await step(() => pruneDepCache(deps.workspaceRoot!, now));
       if (errors.length > 0) throw errors[0];
     },
 
