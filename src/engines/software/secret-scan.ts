@@ -78,10 +78,30 @@ export function scanPaths(paths: readonly string[]): SecretFinding[] {
 
 /** `text` with every pattern match and every (usable) known value replaced by `[redacted]`. */
 export function redactSecrets(text: string, knownValues: readonly string[]): string {
-  let out = text;
-  for (const v of usableKnownValues(knownValues)) out = out.split(v).join(REDACTED);
-  for (const { pattern } of SECRET_PATTERNS) out = out.replace(new RegExp(pattern.source, 'g'), REDACTED);
-  return out;
+  // Every match range in the ORIGINAL text (values literally, patterns by regex), merged when they
+  // overlap or touch, then each merged range replaced once: overlapping values leak no tail.
+  const ranges: Array<[number, number]> = [];
+  for (const v of usableKnownValues(knownValues)) {
+    for (let i = text.indexOf(v); i !== -1; i = text.indexOf(v, i + 1)) ranges.push([i, i + v.length]);
+  }
+  for (const { pattern } of SECRET_PATTERNS) {
+    for (const m of text.matchAll(new RegExp(pattern.source, 'g'))) ranges.push([m.index, m.index + m[0].length]);
+  }
+  if (ranges.length === 0) return text;
+  ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of ranges) {
+    const last = merged.at(-1);
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  let out = '';
+  let at = 0;
+  for (const [s, e] of merged) {
+    out += text.slice(at, s) + REDACTED;
+    at = e;
+  }
+  return out + text.slice(at);
 }
 
 /** Variable names whose values the guard treats as secrets. */

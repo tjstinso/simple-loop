@@ -102,6 +102,20 @@ describe('redactSecrets', () => {
     expect(redactSecrets(text, [known])).toBe('key [redacted] and [redacted]; pass [redacted] again [redacted].');
   });
 
+  it('redacts overlapping known values as one range, leaking no tail', () => {
+    expect(redactSecrets('x abcdefghijkl1234mnopqrstuv y', ['abcdefghijkl1234', '1234mnopqrstuv'])).toBe('x [redacted] y');
+    expect(redactSecrets('x abcdefghijkl1234mnopqrstuv y', ['1234mnopqrstuv', 'abcdefghijkl1234'])).toBe('x [redacted] y');
+  });
+
+  it('redacts adjacent matches as one range', () => {
+    expect(redactSecrets('<abcdefghijklmnop0123456789qrst>', ['abcdefghijklmnop', '0123456789qrst'])).toBe('<[redacted]>');
+  });
+
+  it('redacts a known value overlapping a pattern match as one range', () => {
+    const key = 'sk-ant-' + 'k'.repeat(24);
+    expect(redactSecrets(`${key}tail-of-the-value!`, [`${key.slice(-10)}tail-of-the-value`])).toBe('[redacted]!');
+  });
+
   it('leaves clean text and short known values alone', () => {
     expect(redactSecrets('nothing to see here', ['short'])).toBe('nothing to see here');
   });
