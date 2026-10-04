@@ -175,8 +175,8 @@ describe('factory cli', () => {
     const { chain } = await h.submit(5);
     const job = h.claim()!;
     expect(await run(['status'], deps)).toBe(0);
-    expect(out[2]).toContain(`job ${job.id} execute attempt=1 running delivery=1 worker=w1`);
-    expect(out[2]).toContain(`lease-expires=${new Date(job.leaseExpiresAt!).toISOString()}`);
+    expect(out[1]).toContain(`job ${job.id} execute attempt=1 running delivery=1 worker=w1`);
+    expect(out[1]).toContain(`lease-expires=${new Date(job.leaseExpiresAt!).toISOString()}`);
     out.length = 0;
     expect(await run(['status', '--json'], deps)).toBe(0);
     const parsed = JSON.parse(out[0]!);
