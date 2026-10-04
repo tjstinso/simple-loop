@@ -10,7 +10,8 @@ import { migrate, openDb } from '../kernel/db.js';
 import { EngineRegistry } from '../kernel/engine-registry.js';
 import { createKernel, type Kernel } from '../kernel/kernel.js';
 import type { Policy } from '../policy/schema.js';
-import { loadPolicies, PolicyStore } from '../policy/store.js';
+import { resolvePolicies, type EffectivePolicy } from '../policy/resolve.js';
+import { PolicyStore } from '../policy/store.js';
 import { ClaudeCliRunner } from '../runner/claude-cli.js';
 import { RunnerRegistry } from '../runner/registry.js';
 import type { FactoryConfig } from './config.js';
@@ -19,6 +20,8 @@ export interface Runtime {
   kernel: Kernel;
   db: Database.Database;
   defaultEngine: string;
+  /** The policies in effect (name, source and merged value), for `factory policies`. */
+  effectivePolicies?: EffectivePolicy[];
   /** Checks the factory's GitHub identity (the token's login against `github.expectLogin`); run at worker start. */
   verifyIdentity?(): Promise<void>;
   close(): void;
@@ -41,7 +44,12 @@ export function buildRuntime(config: FactoryConfig): Runtime {
   const db = openDb(config.dbPath);
   try {
     migrate(db, [FOLLOWUPS_DDL]);
-    const policies = new PolicyStore(loadPolicies(config.policiesDir));
+    const effectivePolicies = resolvePolicies({
+      policiesDir: config.policiesDir,
+      shippedPolicies: config.shippedPolicies,
+      policyOverrides: config.policyOverrides,
+    });
+    const policies = new PolicyStore(effectivePolicies.map((e) => e.policy));
     const forwarded = passEnvNames(policies.all());
     const gh = config.github;
     const tokenEnv = gh?.tokenEnv;
@@ -105,6 +113,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       kernel,
       db,
       defaultEngine: config.defaultEngine,
+      effectivePolicies,
       ...(auth !== undefined && expectLogin !== undefined ? { verifyIdentity: () => verifyLogin(host, expectLogin) } : {}),
       close: () => db.close(),
     };

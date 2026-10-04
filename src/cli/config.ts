@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
+import { forbiddenOverrideKey, OVERRIDABLE_KEYS } from '../policy/resolve.js';
 
 const GithubSchema = z
   .object({
@@ -16,7 +17,9 @@ const GithubSchema = z
 
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
-  policiesDir: z.string().min(1).default('./policies'),
+  policiesDir: z.string().min(1).optional(),
+  shippedPolicies: z.boolean().default(true),
+  policyOverrides: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
   workspaceRoot: z.string().min(1).default('./.factory/workspaces'),
   defaultEngine: z.string().min(1).default('software'),
   defaultProfile: z.enum(['supervised', 'automatic']).default('supervised'),
@@ -29,6 +32,16 @@ const ConfigSchema = z.object({
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
 }).superRefine((c, ctx) => {
+  for (const [name, override] of Object.entries(c.policyOverrides ?? {})) {
+    const bad = forbiddenOverrideKey(override);
+    if (bad !== undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['policyOverrides', name, bad],
+        message: `only ${OVERRIDABLE_KEYS.join(' and ')} may be overridden`,
+      });
+    }
+  }
   // The token reaches git only through an HTTPS URL and the askpass helper; no credentials in the URL.
   if (c.github?.tokenEnv !== undefined && !/^https:\/\/[^@/]+\//.test(c.cloneUrlTemplate)) {
     ctx.addIssue({
@@ -68,10 +81,16 @@ export function loadConfig(path: string | undefined, cwd: string): FactoryConfig
     throw new Error(`invalid config ${file}: ${detail}`);
   }
   const c = res.data;
+  // Before policiesDir was optional it defaulted to ./policies; keep reading that directory when it exists.
+  const legacyDir = resolve(baseDir, 'policies');
+  const policiesDir = c.policiesDir === undefined ? (existsSync(legacyDir) ? legacyDir : undefined) : resolve(baseDir, c.policiesDir);
+  if (policiesDir === undefined && !c.shippedPolicies) {
+    throw new Error(`invalid config ${file}: policiesDir: is required when shippedPolicies is false`);
+  }
   return {
     ...c,
     dbPath: resolve(baseDir, c.dbPath),
-    policiesDir: resolve(baseDir, c.policiesDir),
+    ...(policiesDir === undefined ? {} : { policiesDir }),
     workspaceRoot: resolve(baseDir, c.workspaceRoot),
   };
 }

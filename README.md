@@ -169,7 +169,9 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | Field | Default | Meaning |
 |---|---|---|
 | `dbPath` | `./factory.db` | SQLite database file. |
-| `policiesDir` | `./policies` | Directory scanned for `*.yaml` policy files. |
+| `policiesDir` | absent | Directory scanned for `*.yaml` policy files, applied on top of the shipped policies. When the key is absent, `./policies` next to the config file is still read if it exists (the old default). Required when `shippedPolicies` is `false`. |
+| `shippedPolicies` | `true` | Load the policies that ship with the package (found from the installed package location, not the current directory) before `policiesDir`. |
+| `policyOverrides` | absent | Object keyed by policy name; see "Overriding policy settings". |
 | `workspaceRoot` | `./.factory/workspaces` | Root for the bare repository cache (`.cache/`) and the per-delivery worktrees (`<chainId>/j<jobId>-d<delivery>`). |
 | `defaultEngine` | `software` | Engine used when a submission names none. |
 | `defaultProfile` | `supervised` | `supervised` or `automatic`; used when the issue has no `factory:profile:automatic` label. |
@@ -197,6 +199,7 @@ factory [--config <path>] dlq list
 factory [--config <path>] dlq retry <job-id>
 factory [--config <path>] dlq discard <job-id>
 factory [--config <path>] cancel <chain-id>
+factory [--config <path>] policies
 factory --help
 ```
 
@@ -296,7 +299,7 @@ Closing the issue stops the chain: the next job is dead-lettered (`runner_error`
 
 ## Policies
 
-A policy is one YAML file in `policiesDir`:
+A policy is one YAML file (shipped in the package's `policies/`, or in `policiesDir`). The policy name is the file name without `.yaml`:
 
 | Field | Meaning |
 |---|---|
@@ -308,6 +311,23 @@ A policy is one YAML file in `policiesDir`:
 | `config` | Runner-specific settings, validated against the runner's schema at startup. |
 
 Matching: among the non-default policies of the kind, those whose `match.labels` are all present are candidates. Exactly one wins; more than one is an `ambiguous policy match` error; none falls back to the default of that kind; no default is an error. Files are loaded and validated at startup: each policy's `kind` must be declared by a registered engine, its `runner` must be registered, and its `config` must pass that runner's schema; otherwise every command fails with an error naming the policy. Restart the worker after editing them.
+
+### Overriding policy settings
+
+Policies load in this order: the shipped ones (unless `shippedPolicies` is `false`), then the `*.yaml` files in `policiesDir`: a file with the same name as a shipped policy replaces it whole, other files are added. Then `policyOverrides` is applied. Each value is a partial policy deep-merged over the loaded one: objects merge key by key, scalars and arrays replace. Only `runner` and `config` may be overridden; `kind`, `match` or any other key is a configuration error naming it. An override for a policy name that does not exist is an error. The merged result is validated like any policy at startup, before a worker claims work; errors name the policy and key.
+
+Example for an operator with a subscription and no API key (the whole run directory is this one file):
+
+```json
+{
+  "policyOverrides": {
+    "software-execute": { "config": { "bare": false } },
+    "software-review": { "config": { "bare": false } }
+  }
+}
+```
+
+`factory policies` prints each effective policy: name, source (`shipped`, `directory` or `overridden`), the labels it matches, and the effective `runner` and `config` with secret-looking values redacted.
 
 Two default policies ship:
 

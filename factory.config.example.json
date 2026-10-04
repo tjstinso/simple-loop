@@ -1,6 +1,6 @@
 {
   "dbPath": "./factory.db",
-  "policiesDir": "./policies",
+  "shippedPolicies": true,
   "workspaceRoot": "./.factory/workspaces",
   "defaultEngine": "software",
   "defaultProfile": "supervised",
