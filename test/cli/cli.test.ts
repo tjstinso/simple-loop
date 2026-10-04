@@ -128,6 +128,38 @@ describe('factory cli', () => {
     expect(out[1]).toMatch(/^ {2}job \d+ execute attempt=1 queued delivery=0 last-event=\d+s ago$/);
   });
 
+  it('show and status print when a waiting chain was last checked, or that it never was', async () => {
+    const { h, out, deps } = setup();
+    const { chain } = await h.submit(5);
+    h.db.prepare(`UPDATE chains SET status = 'waiting' WHERE id = ?`).run(chain.id);
+    expect(await run(['show', String(chain.id)], deps)).toBe(0);
+    expect(out[1]).toBe('never checked');
+    out.length = 0;
+    expect(await run(['status'], deps)).toBe(0);
+    expect(out[0]).toBe(`${chain.id} software waiting ${h.engine.describe(h.chain(chain.id))} never checked`);
+
+    h.db.prepare(`UPDATE chains SET last_checked_at = ?, last_check_result = 'none' WHERE id = ?`).run(h.clock() - 20_000, chain.id);
+    out.length = 0;
+    expect(await run(['show', String(chain.id)], deps)).toBe(0);
+    expect(out[1]).toBe('last checked: 20s ago (none)');
+    out.length = 0;
+    expect(await run(['status'], deps)).toBe(0);
+    expect(out[0]).toBe(`${chain.id} software waiting ${h.engine.describe(h.chain(chain.id))} last checked: 20s ago (none)`);
+    out.length = 0;
+    expect(await run(['status', '--json'], deps)).toBe(0);
+    expect(JSON.parse(out[0]!)[0]).toMatchObject({ lastCheckedAt: h.clock() - 20_000, lastCheckResult: 'none' });
+    out.length = 0;
+    expect(await run(['show', String(chain.id), '--json'], deps)).toBe(0);
+    expect(JSON.parse(out[0]!).chain).toMatchObject({ lastCheckedAt: h.clock() - 20_000, lastCheckResult: 'none' });
+  });
+
+  it('show and status say nothing about checks for a chain that is not waiting', async () => {
+    const { h, out, deps } = setup();
+    const { chain } = await h.submit(5);
+    expect(await run(['show', String(chain.id)], deps)).toBe(0);
+    expect(out.join('\n')).not.toMatch(/checked/);
+  });
+
   it('status shows the worker and lease of a running job, and --json prints the same data', async () => {
     const { h, out, deps } = setup();
     const { chain } = await h.submit(5);

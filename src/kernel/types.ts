@@ -150,7 +150,11 @@ export interface WorkspaceProvider {
 }
 
 export type ReconcileOutcome<S = unknown> =
-  | { outcome: 'none' }
+  /**
+   * Nothing to do. `check` is what the pass records as the result of the look (default `none`):
+   * `unknown` when GitHub had not computed mergeability yet, `error: <why>` for a transient host failure.
+   */
+  | { outcome: 'none'; check?: string }
   | { outcome: 'completed'; reason: string }
   | { outcome: 'cancelled'; reason: string }
   /**
@@ -181,6 +185,8 @@ export interface Engine<S = unknown> {
    */
   runEffect(effect: Effect, ctx: RunEffectContext<S>): Promise<void | EffectOutcome<S>>;
   describe(chain: ChainView<S>): string;
+  /** Removes secrets from text the kernel stores about a failure (the recorded result of a check). */
+  redact?(text: string): string;
   surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
   /**
    * Optional: called by `Kernel.retryDeadLetter` after a dead-lettered job was re-queued, with the

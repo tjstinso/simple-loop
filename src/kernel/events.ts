@@ -29,8 +29,12 @@ export interface EventRow {
   detail: Record<string, unknown>;
 }
 
+/** `text` capped at 200 characters, the last one an ellipsis when it was cut. */
+export const capEventText = (text: string): string =>
+  text.length > EVENT_TEXT_MAX ? `${text.slice(0, EVENT_TEXT_MAX - 1)}…` : text;
+
 function bounded(v: unknown, depth = 0): unknown {
-  if (typeof v === 'string') return v.length > EVENT_TEXT_MAX ? `${v.slice(0, EVENT_TEXT_MAX - 1)}…` : v;
+  if (typeof v === 'string') return capEventText(v);
   if (Array.isArray(v)) return depth > 2 ? null : v.slice(0, 20).map((x) => bounded(x, depth + 1));
   if (v !== null && typeof v === 'object') {
     if (depth > 2) return null;

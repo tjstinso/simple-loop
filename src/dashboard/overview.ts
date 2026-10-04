@@ -10,6 +10,9 @@ export { HEARTBEAT_MS };
 export const DEAD_WORKERS_SHOWN = 5;
 export const FINISHED_LIMIT = 20;
 export const EVENTS_PER_CHAIN = 10;
+/** The default maintenance interval of a worker; a waiting chain unchecked for 3 of them has no worker running maintenance. */
+export const MAINTENANCE_MS = 60_000;
+export const STALE_CHECK_INTERVALS = 3;
 
 export type WaitingKind = 'worker' | 'running' | 'reviewer' | 'person_merge' | 'person_attention' | 'dead_letter' | 'stuck' | 'none';
 
@@ -131,6 +134,11 @@ export interface ChainOverview {
   totalCostUsd: number;
   /** Null for a finished chain. */
   waitingOn: WaitingOn | null;
+  /** When the maintenance pass last looked at this chain, and what it found (`none`, `unknown`, `error: ...`). */
+  lastCheckedAt: number | null;
+  lastCheckResult: string | null;
+  /** A `waiting` chain not checked for more than three maintenance intervals: no worker runs maintenance. */
+  checkStale: boolean;
 }
 
 export interface JobOverview {
@@ -175,6 +183,9 @@ interface ChainRow {
   engine_state: string;
   created_at: number;
   updated_at: number;
+  /** Absent when the database was created before the columns existed and has not been migrated yet. */
+  last_checked_at?: number | null;
+  last_check_result?: string | null;
 }
 
 interface JobRow {
@@ -212,7 +223,8 @@ function subjectOf(key: string, state: Record<string, unknown>): { repo: string;
 }
 
 /** Everything the dashboard shows, from one read-only pass over the database. */
-export function buildOverview(db: Db, now: number, opts: LivenessProbe = {}): Overview {
+export function buildOverview(db: Db, now: number, opts: LivenessProbe & { maintenanceMs?: number } = {}): Overview {
+  const staleCheckMs = STALE_CHECK_INTERVALS * (opts.maintenanceMs ?? MAINTENANCE_MS);
   const workerRows = db.prepare('SELECT * FROM workers ORDER BY id').all() as {
     id: string; pid: number; host: string; last_seen_at: number; current_job_id: number | null; current_delivery: number | null;
   }[];
@@ -291,6 +303,9 @@ export function buildOverview(db: Db, now: number, opts: LivenessProbe = {}): Ov
         now,
       });
     }
+    const lastCheckedAt = c.last_checked_at ?? null;
+    const checkStale =
+      c.status === 'waiting' && now - (lastCheckedAt ?? waiting?.since ?? c.updated_at) > staleCheckMs;
     const prVisible = hasPr || phase === 'awaiting_merge' || phase === 'merged';
     return {
       id: c.id,
@@ -316,6 +331,9 @@ export function buildOverview(db: Db, now: number, opts: LivenessProbe = {}): Ov
       events,
       totalCostUsd: jobs.reduce((sum, j) => sum + (j.costUsd ?? 0), 0),
       waitingOn: waiting,
+      lastCheckedAt,
+      lastCheckResult: c.last_check_result ?? null,
+      checkStale,
     };
   };
 

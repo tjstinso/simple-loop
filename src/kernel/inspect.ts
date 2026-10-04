@@ -74,19 +74,45 @@ export function chainCost(db: Db, chainId: number): ChainCost {
 }
 
 export interface ChainTimeline {
-  chain: { id: number; engine: string; subjectKey: string; status: string; createdAt: number };
+  chain: {
+    id: number;
+    engine: string;
+    subjectKey: string;
+    status: string;
+    createdAt: number;
+    lastCheckedAt: number | null;
+    lastCheckResult: string | null;
+  };
   events: EventRow[];
   cost: ChainCost;
 }
 
 /** Null when the chain does not exist. */
 export function chainTimeline(db: Db, chainId: number): ChainTimeline | null {
-  const c = db.prepare('SELECT id, engine, subject_key, status, created_at FROM chains WHERE id = ?').get(chainId) as
-    | { id: number; engine: string; subject_key: string; status: string; created_at: number }
+  const c = db
+    .prepare('SELECT id, engine, subject_key, status, created_at, last_checked_at, last_check_result FROM chains WHERE id = ?')
+    .get(chainId) as
+    | {
+        id: number;
+        engine: string;
+        subject_key: string;
+        status: string;
+        created_at: number;
+        last_checked_at: number | null;
+        last_check_result: string | null;
+      }
     | undefined;
   if (!c) return null;
   return {
-    chain: { id: c.id, engine: c.engine, subjectKey: c.subject_key, status: c.status, createdAt: c.created_at },
+    chain: {
+      id: c.id,
+      engine: c.engine,
+      subjectKey: c.subject_key,
+      status: c.status,
+      createdAt: c.created_at,
+      lastCheckedAt: c.last_checked_at,
+      lastCheckResult: c.last_check_result,
+    },
     events: chainEvents(db, chainId),
     cost: chainCost(db, chainId),
   };
@@ -171,6 +197,12 @@ export function formatAge(ms: number): string {
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   if (s < 86_400) return `${Math.floor(s / 3600)}h`;
   return `${Math.floor(s / 86_400)}d`;
+}
+
+/** `last checked: 20s ago (none)`, or `never checked` when the maintenance pass has not looked yet. */
+export function formatLastCheck(at: number | null, result: string | null, now: number): string {
+  if (at === null) return 'never checked';
+  return `last checked: ${formatAge(Math.max(0, now - at))} ago${result === null ? '' : ` (${result})`}`;
 }
 
 export const formatCost = (usd: number): string => `$${usd.toFixed(4)}`;

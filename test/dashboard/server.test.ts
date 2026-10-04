@@ -256,6 +256,38 @@ describe('page rendering', () => {
     });
   });
 
+  it('shows the age of the last check and "not checked recently" as text for a stale waiting chain', async () => {
+    t = makeDb();
+    const fresh = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 1 });
+    const stale = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 2 });
+    const never = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 3, at: NOW - 10_000 });
+    const set = t.db.prepare('UPDATE chains SET last_checked_at = ?, last_check_result = ? WHERE id = ?');
+    set.run(NOW - 20_000, 'none', fresh);
+    set.run(NOW - 600_000, 'none', stale);
+    const overview = buildOverview(t.db, NOW);
+    const root = new FakeNode('div');
+    const document = {
+      getElementById: () => root,
+      createElement: (tag: string) => new FakeNode(tag),
+      createTextNode: (text: string) => new FakeNode('#text', text),
+      addEventListener: () => {},
+      hidden: false,
+    };
+    const fetchStub = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(overview) });
+    vm.runInNewContext(scriptOf(PAGE_HTML), { document, fetch: fetchStub, setTimeout: () => 0, clearTimeout: () => {}, Date, JSON, Object, Promise, String, Number, Math, Array });
+    await new Promise((r) => setTimeout(r, 20));
+    const texts: string[] = [];
+    root.walk((n) => {
+      if (n.text !== null) texts.push(n.text);
+    });
+    const all = texts.join('\n');
+    expect(all).toContain('checked 20s ago (none)');
+    expect(all).toContain('never checked');
+    expect(all).toMatch(/\u26A0 not checked recently \u2014 checked 10m 0s ago \(none\)/);
+    expect(texts.filter((x) => x.includes('not checked recently'))).toHaveLength(1);
+    expect(never).toBeGreaterThan(0);
+  });
+
   it('never uses a markup-parsing API', () => {
     expect(PAGE_HTML).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function/);
   });
