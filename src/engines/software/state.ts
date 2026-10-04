@@ -26,6 +26,8 @@ export const SoftwareStateSchema = z.object({
   branch: z.string(),
   attempt: z.number().int().min(1),
   phase: PhaseSchema,
+  /** Number of the pull request the factory opened (absent on chains from before it was recorded). */
+  prNumber: z.number().int().min(1).optional(),
   /** ISO time up to which people's pull request feedback was handled (initially: when the PR was opened). */
   feedbackHandledAt: z.string().optional(),
   /** Feedback rounds started by people (absent: 0); counted apart from the factory's own review attempts. */

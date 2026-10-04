@@ -47,8 +47,22 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
   const json = (res: import('node:http').ServerResponse, status: number, value: unknown, extra: Record<string, string> = {}) =>
     send(res, status, 'application/json; charset=utf-8', JSON.stringify(value), extra);
 
-  const server = createServer((req, res) => {
+  // Set once listening: the port is only known then (it may be ephemeral).
+  let boundPort = 0;
+  const allowedHosts = (): Set<string> => {
+    const names = ['localhost', '127.0.0.1', '[::1]', host.includes(':') && !host.startsWith('[') ? `[${host}]` : host];
+    return new Set(names.map((n) => `${n.toLowerCase()}:${boundPort}`));
+  };
+
+  // `requireHostHeader: false` so a request without Host reaches the check below (421) instead of Node's own 400.
+  const server = createServer({ requireHostHeader: false }, (req, res) => {
     try {
+      // Before routing, so 404 and 405 are covered: a DNS-rebinding page reaches us under its own name.
+      const hostHeader = req.headers.host;
+      if (hostHeader === undefined || !allowedHosts().has(hostHeader.toLowerCase())) {
+        send(res, 421, 'text/plain; charset=utf-8', 'Misdirected Request: unexpected Host header\n');
+        return;
+      }
       if (req.method !== 'GET') {
         json(res, 405, { error: 'method not allowed' }, { allow: 'GET' });
         return;
@@ -79,6 +93,7 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
     server.listen(opts.port ?? DEFAULT_PORT, host, () => {
       server.off('error', reject);
       const addr = server.address() as AddressInfo;
+      boundPort = addr.port;
       resolve({
         server,
         host,

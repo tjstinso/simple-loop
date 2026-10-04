@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
@@ -70,6 +71,47 @@ describe('dashboard server', () => {
       expect(res.headers.get('allow')).toBe('GET');
     }
     expect((await fetch(url('/'), { method: 'POST', body: 'x' })).status).toBe(405);
+  });
+
+  describe('Host header check', () => {
+    const get = (port: number, path: string, host: string | null, method = 'GET', connect = '127.0.0.1') =>
+      new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const headers: Record<string, string> = host === null ? {} : { host };
+        const req = request({ host: connect, port, path, method, headers, setHost: false }, (res) => {
+          let body = '';
+          res.on('data', (d: Buffer) => (body += d.toString()));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+    it('accepts loopback names with the listening port and rejects everything else with 421', async () => {
+      await start();
+      const port = dash!.port;
+      for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+        expect((await get(port, '/api/overview', host)).status).toBe(200);
+      }
+      for (const host of [`evil.example:${port}`, '127.0.0.1:1', '127.0.0.1', null]) {
+        for (const path of ['/', '/api/overview', '/nope']) {
+          const res = await get(port, path, host);
+          expect(res.status).toBe(421);
+          expect(res.body.trim().split('\n')).toHaveLength(1);
+          expect(res.body).not.toContain('"');
+        }
+        expect((await get(port, '/api/overview', host, 'POST')).status).toBe(421);
+      }
+    });
+
+    it('accepts an operator-supplied --host only for that exact value', async () => {
+      t = makeDb();
+      dash = await startDashboard({ db: openReadOnlyDb(t.path), host: '127.0.0.2', port: 0, now: () => NOW });
+      const port = dash.port;
+      const at = (host: string) => get(port, '/', host, 'GET', '127.0.0.2');
+      expect((await at(`127.0.0.2:${port}`)).status).toBe(200);
+      expect((await at(`127.0.0.3:${port}`)).status).toBe(421);
+      expect((await at(`other.example:${port}`)).status).toBe(421);
+    });
   });
 
   it('never writes: the connection is read-only', async () => {

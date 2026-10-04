@@ -579,6 +579,18 @@ describe('runSoftwareEffect', () => {
     expect(host.calls.map((c) => c.method)).not.toContain('openPr');
   });
 
+  it('open_pr records the new PR number in the event and the chain state', async () => {
+    const events: { kind: string; detail?: Record<string, unknown> }[] = [];
+    const out = await runSoftwareEffect(
+      { kind: 'open_pr' },
+      ctx({ events: (kind: string, detail?: Record<string, unknown>) => void events.push({ kind, detail }) }),
+      fence(),
+    );
+    const pr = [...host.prs.values()][0]!;
+    expect(events).toEqual([{ kind: 'pr.opened', detail: { branch: BRANCH, base: 'main', number: pr.number } }]);
+    expect(out).toMatchObject({ engineState: { prNumber: pr.number } });
+  });
+
   it('open_pr opens a new PR when the earlier one for the branch is closed', async () => {
     const old = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     host.prs.get(old.number)!.state = 'closed';
