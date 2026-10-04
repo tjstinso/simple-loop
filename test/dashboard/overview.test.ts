@@ -113,6 +113,12 @@ describe('buildOverview', () => {
     return { queued, running, stuck, expired, person, human, dead, review };
   }
 
+  it('reports the concurrency limit, null when there is none', () => {
+    t = makeDb();
+    expect(buildOverview(t.db, NOW).limits).toEqual({ maxConcurrentJobs: null });
+    expect(buildOverview(t.db, NOW, { maxConcurrentJobs: 4 }).limits).toEqual({ maxConcurrentJobs: 4 });
+  });
+
   it('reports when each chain was last checked and flags a waiting chain unchecked for over three intervals', () => {
     t = makeDb();
     const fresh = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 1 });

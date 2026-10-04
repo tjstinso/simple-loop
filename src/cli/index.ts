@@ -13,6 +13,7 @@ import {
   parseDuration,
 } from '../kernel/inspect.js';
 import type { Kernel } from '../kernel/kernel.js';
+import { countRunning } from '../kernel/queue.js';
 import type { ChainView } from '../kernel/types.js';
 import { describePolicy } from '../policy/resolve.js';
 import { routeEngine } from '../router/router.js';
@@ -182,6 +183,7 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       await rt.verifyIdentity?.();
       const worker = kernel.startWorker({
         ...(pollMs === undefined ? {} : { pollMs }),
+        ...(rt.maintenanceMs === undefined ? {} : { maintenanceMs: rt.maintenanceMs }),
         ...(values.id === undefined ? {} : { id: values.id }),
         onError: (err) => stderr(`error: ${message(err)}`),
       });
@@ -203,9 +205,12 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         stdout(JSON.stringify(chains));
         return 0;
       }
+      const max = kernel.deps.config.maxConcurrentJobs;
+      const running = countRunning(rt.db);
       const lines = statusLines(chains, kernel.deps.clock());
       if (lines.length === 0) stdout('no open chains');
       for (const l of lines) stdout(l);
+      stdout(`slots: ${running}${max === undefined ? ' (no limit)' : ` of ${max}`}`);
       return 0;
     }
     case 'show': {
@@ -347,10 +352,11 @@ async function runDashboard(
   }
   const host = values.host ?? DEFAULT_HOST;
   if (host === '') throw new UsageError('--host needs an address');
-  const db = openReadOnlyDb(loadConfig(config, cwd).dbPath);
+  const cfg = loadConfig(config, cwd);
+  const db = openReadOnlyDb(cfg.dbPath);
   let dash;
   try {
-    dash = await startDashboard({ db, host, port });
+    dash = await startDashboard({ db, host, port, ...(cfg.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: cfg.maxConcurrentJobs }) });
   } catch (e) {
     db.close();
     throw e;

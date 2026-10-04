@@ -32,6 +32,10 @@ describe('loadConfig', () => {
       maxHumanRounds: 5,
       maxConflictRounds: 2,
       maxCiRounds: 2,
+      leaseMs: 300000,
+      heartbeatMs: 30000,
+      maintenanceMs: 60000,
+      maxDeliveries: 3,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
     });
   });
@@ -86,6 +90,40 @@ describe('loadConfig', () => {
     expect(() => loadConfig(undefined, d)).toThrow(/defaultProfile/);
     writeFileSync(join(d, 'factory.config.json'), '{ not json');
     expect(() => loadConfig(undefined, d)).toThrow(/factory\.config\.json/);
+  });
+
+  describe('concurrency and timing keys', () => {
+    const load = (cfg: unknown) => {
+      const d = tmp();
+      writeFileSync(join(d, 'factory.config.json'), JSON.stringify(cfg));
+      return loadConfig(undefined, d);
+    };
+
+    it('accepts them and leaves maxConcurrentJobs unset by default', () => {
+      expect(load({}).maxConcurrentJobs).toBeUndefined();
+      expect(load({ maxConcurrentJobs: 2, leaseMs: 20_000, heartbeatMs: 5_000, maintenanceMs: 5_000, maxDeliveries: 1 })).toMatchObject({
+        maxConcurrentJobs: 2, leaseMs: 20_000, heartbeatMs: 5_000, maintenanceMs: 5_000, maxDeliveries: 1,
+      });
+    });
+
+    it('rejects values below the minimums, naming the key', () => {
+      for (const [key, value] of [
+        ['maxConcurrentJobs', 0], ['maxConcurrentJobs', 1.5], ['leaseMs', 9_999], ['heartbeatMs', 999],
+        ['maintenanceMs', 4_999], ['maxDeliveries', 0],
+      ] as const) {
+        expect(() => load({ [key]: value }), `${key}=${value}`).toThrow(new RegExp(key));
+      }
+    });
+
+    it('rejects a heartbeat that is not smaller than half the lease, naming both keys', () => {
+      expect(() => load({ leaseMs: 20_000, heartbeatMs: 10_000 })).toThrow(/heartbeatMs.*leaseMs/);
+      expect(() => load({ leaseMs: 20_000, heartbeatMs: 9_999 })).not.toThrow();
+      expect(() => load({ heartbeatMs: 150_000 })).toThrow(/heartbeatMs.*leaseMs/);
+    });
+
+    it('still ignores unknown keys', () => {
+      expect(load({ maxConcurrentJob: 1 }).maxConcurrentJobs).toBeUndefined();
+    });
   });
 
   it('example config file parses to the defaults', () => {

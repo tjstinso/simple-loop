@@ -6,6 +6,7 @@ import { cancelChain, listUnsurfacedDeadLetters, markDeadLetterSurfaced } from '
 import { recordEvent } from './events.js';
 import {
   claimNext,
+  recordThrottled,
   completeWaitingChain,
   getChain,
   getJob,
@@ -493,7 +494,8 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
     while (!stopping) {
       let job: Job | null = null;
       try {
-        job = claimNext(db, id, clock(), config.leaseMs);
+        job = claimNext(db, id, clock(), config.leaseMs, config.maxConcurrentJobs);
+        if (!job && config.maxConcurrentJobs !== undefined) recordThrottled(db, clock(), config.maxConcurrentJobs);
       } catch (e) {
         report(e);
       }

@@ -20,6 +20,8 @@ export interface Runtime {
   kernel: Kernel;
   db: Database.Database;
   defaultEngine: string;
+  /** Interval of the worker's periodic maintenance. */
+  maintenanceMs?: number;
   /** The policies in effect (name, source and merged value), for `factory policies`. */
   effectivePolicies?: EffectivePolicy[];
   /** Reads the GitHub token and creates the auth directory now; throws when the token is missing. A no-op without `github.tokenEnv`. */
@@ -47,6 +49,13 @@ export function buildRuntime(config: FactoryConfig): Runtime {
   let lazy: LazyGithubAuth | undefined;
   try {
     migrate(db, [FOLLOWUPS_DDL]);
+    const kernelConfig = {
+      leaseMs: config.leaseMs,
+      heartbeatMs: config.heartbeatMs,
+      maxDeliveries: config.maxDeliveries,
+      ...(config.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: config.maxConcurrentJobs }),
+      historyRetentionDays: config.historyRetentionDays,
+    };
     const effectivePolicies = resolvePolicies({
       policiesDir: config.policiesDir,
       shippedPolicies: config.shippedPolicies,
@@ -110,18 +119,14 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       policies,
       clock,
       onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),
-      config: {
-        leaseMs: 300_000,
-        heartbeatMs: 30_000,
-        maxDeliveries: 3,
-        historyRetentionDays: config.historyRetentionDays,
-      },
+      config: kernelConfig,
     });
     const expectLogin = gh?.expectLogin;
     return {
       kernel,
       db,
       defaultEngine: config.defaultEngine,
+      maintenanceMs: config.maintenanceMs,
       effectivePolicies,
       ...(lazy !== undefined ? { requireGithub: () => void lazy?.ensure() } : {}),
       ...(auth !== undefined && expectLogin !== undefined ? { verifyIdentity: () => verifyLogin(host, expectLogin) } : {}),

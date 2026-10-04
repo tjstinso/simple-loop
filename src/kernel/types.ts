@@ -243,6 +243,8 @@ export interface KernelDeps {
     leaseMs: number;
     heartbeatMs: number;
     maxDeliveries: number;
+    /** At most this many jobs run at once across all workers on the database (default: no limit). */
+    maxConcurrentJobs?: number;
     /** History tables are pruned by age after this many days (default 30). */
     historyRetentionDays?: number;
   };

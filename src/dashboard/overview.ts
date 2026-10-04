@@ -167,6 +167,7 @@ export interface WorkerOverview {
 
 export interface Overview {
   generatedAt: number;
+  limits: { maxConcurrentJobs: number | null };
   /** `workers` counts alive workers only; `aliveWorkers` is an alias kept for one release; `stoppedWorkers` is the total of dead ones. */
   summary: { workers: number; aliveWorkers: number; stoppedWorkers: number; runningJobs: number; waitingOnPerson: number };
   openChains: ChainOverview[];
@@ -223,7 +224,11 @@ function subjectOf(key: string, state: Record<string, unknown>): { repo: string;
 }
 
 /** Everything the dashboard shows, from one read-only pass over the database. */
-export function buildOverview(db: Db, now: number, opts: LivenessProbe & { maintenanceMs?: number } = {}): Overview {
+export function buildOverview(
+  db: Db,
+  now: number,
+  opts: LivenessProbe & { maintenanceMs?: number; maxConcurrentJobs?: number | null } = {},
+): Overview {
   const staleCheckMs = STALE_CHECK_INTERVALS * (opts.maintenanceMs ?? MAINTENANCE_MS);
   const workerRows = db.prepare('SELECT * FROM workers ORDER BY id').all() as {
     id: string; pid: number; host: string; last_seen_at: number; current_job_id: number | null; current_delivery: number | null;
@@ -351,6 +356,7 @@ export function buildOverview(db: Db, now: number, opts: LivenessProbe & { maint
 
   return {
     generatedAt: now,
+    limits: { maxConcurrentJobs: opts.maxConcurrentJobs ?? null },
     summary: {
       workers: aliveWorkers.length,
       aliveWorkers: aliveWorkers.length,

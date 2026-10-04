@@ -393,3 +393,33 @@ describe('commitTransition', () => {
     expect(jobs[1].payload).toBeNull();
   });
 });
+
+describe('claimNext with a concurrency limit', () => {
+  it('returns null at the limit and claims again once a slot frees', () => {
+    const db = mk();
+    seed(db, 'a', 10);
+    seed(db, 'b', 20);
+    seed(db, 'c', 30);
+    const a = claimNext(db, 'w1', 100, 1000, 2)!;
+    expect(claimNext(db, 'w2', 100, 1000, 2)).not.toBeNull();
+    expect(claimNext(db, 'w3', 100, 1000, 2)).toBeNull();
+    failJob(db, fenceOf(a), 'boom');
+    expect(claimNext(db, 'w3', 100, 1000, 2)).not.toBeNull();
+  });
+
+  it('counts a running job whose lease has expired', () => {
+    const db = mk();
+    seed(db, 'a', 10);
+    seed(db, 'b', 20);
+    claimNext(db, 'w1', 100, 1000, 1);
+    expect(claimNext(db, 'w2', 1_000_000, 1000, 1)).toBeNull();
+  });
+
+  it('is unlimited without a limit', () => {
+    const db = mk();
+    seed(db, 'a', 10);
+    seed(db, 'b', 20);
+    expect(claimNext(db, 'w1', 100, 1000)).not.toBeNull();
+    expect(claimNext(db, 'w2', 100, 1000)).not.toBeNull();
+  });
+});

@@ -21,6 +21,8 @@ export interface DashboardOptions {
   host?: string;
   port?: number;
   now?: () => number;
+  /** The configured `maxConcurrentJobs`, shown in the overview (absent: no limit). */
+  maxConcurrentJobs?: number;
 }
 
 export interface DashboardServer {
@@ -73,7 +75,7 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
         return;
       }
       if (path === '/api/overview') {
-        json(res, 200, buildOverview(opts.db, now()));
+        json(res, 200, buildOverview(opts.db, now(), { maxConcurrentJobs: opts.maxConcurrentJobs ?? null }));
         return;
       }
       const m = /^\/api\/chains\/([0-9]+)$/.exec(path);

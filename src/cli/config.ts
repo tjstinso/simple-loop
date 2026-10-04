@@ -31,6 +31,11 @@ const ConfigSchema = z.object({
   maxHumanRounds: z.number().int().min(1).default(5),
   maxConflictRounds: z.number().int().min(1).default(2),
   maxCiRounds: z.number().int().min(1).default(2),
+  maxConcurrentJobs: z.number().int().min(1).optional(),
+  leaseMs: z.number().int().min(10_000).default(300_000),
+  heartbeatMs: z.number().int().min(1_000).default(30_000),
+  maintenanceMs: z.number().int().min(5_000).default(60_000),
+  maxDeliveries: z.number().int().min(1).default(3),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
 }).superRefine((c, ctx) => {
@@ -43,6 +48,13 @@ const ConfigSchema = z.object({
         message: `only ${OVERRIDABLE_KEYS.join(' and ')} may be overridden`,
       });
     }
+  }
+  if (c.heartbeatMs >= c.leaseMs / 2) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['heartbeatMs'],
+      message: `must be smaller than half of leaseMs (heartbeatMs ${c.heartbeatMs}, leaseMs ${c.leaseMs})`,
+    });
   }
   // The token reaches git only through an HTTPS URL and the askpass helper; no credentials in the URL.
   if (c.github?.tokenEnv !== undefined && !/^https:\/\/[^@/]+\//.test(c.cloneUrlTemplate)) {

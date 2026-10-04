@@ -37,7 +37,7 @@ function untilAborted(signal: AbortSignal): Promise<never> {
   });
 }
 
-function setup(o: { runner?: Runner; engines?: Engine<any>[]; historyRetentionDays?: number } = {}) {
+function setup(o: { runner?: Runner; engines?: Engine<any>[]; historyRetentionDays?: number; maxConcurrentJobs?: number } = {}) {
   const echo = makeEchoEngine('echo');
   const engines = new EngineRegistry();
   engines.register(echo);
@@ -58,6 +58,7 @@ function setup(o: { runner?: Runner; engines?: Engine<any>[]; historyRetentionDa
       leaseMs: LEASE,
       heartbeatMs: HEARTBEAT,
       maxDeliveries: 3,
+      ...(o.maxConcurrentJobs !== undefined ? { maxConcurrentJobs: o.maxConcurrentJobs } : {}),
       ...(o.historyRetentionDays !== undefined ? { historyRetentionDays: o.historyRetentionDays } : {}),
     },
   });
@@ -642,5 +643,111 @@ describe('kernel.enqueue', () => {
     } finally {
       s.kernel.close();
     }
+  });
+});
+
+describe('maxConcurrentJobs', () => {
+  let kernels: Kernel[] = [];
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW });
+    kernels = [];
+  });
+  afterEach(() => {
+    for (const k of kernels) k.close();
+    vi.useRealTimers();
+  });
+
+  /** Two keys queued; each run blocks until released and the peak number of simultaneous runs is recorded. */
+  function limited(maxConcurrentJobs: number | undefined) {
+    const releases: Array<(v: unknown) => void> = [];
+    const gauge = { active: 0, peak: 0, started: 0 };
+    const s = setup({
+      ...(maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs }),
+      runner: customRunner(async (_input, signal) => {
+        gauge.active++;
+        gauge.started++;
+        gauge.peak = Math.max(gauge.peak, gauge.active);
+        try {
+          return await Promise.race([new Promise((r) => releases.push(r)), untilAborted(signal)]);
+        } finally {
+          gauge.active--;
+        }
+      }),
+    });
+    kernels.push(s.kernel);
+    return { ...s, gauge, releases };
+  }
+  const running = (db: ReturnType<typeof setup>['db']) =>
+    (db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'`).get() as { n: number }).n;
+
+  it('a limit of 1 runs two queued jobs one after the other with two workers', async () => {
+    const s = limited(1);
+    await s.kernel.enqueue('echo', { key: 'a' });
+    await s.kernel.enqueue('echo', { key: 'b' });
+    const w1 = s.start({ id: 'w1' });
+    const w2 = s.start({ id: 'w2' });
+    await tick(500);
+    expect(running(s.db)).toBe(1);
+    expect(s.gauge.started).toBe(1);
+
+    s.releases[0]!({ value: 'x' });
+    await tick(500);
+    expect(s.gauge.started).toBe(2);
+    expect(running(s.db)).toBe(1);
+    s.releases[1]!({ value: 'y' });
+    await tick(500);
+    expect(s.gauge.peak).toBe(1);
+    expect(s.errors).toEqual([]);
+    await Promise.all([w1.stop(), w2.stop()]);
+  });
+
+  it('a limit of 2 lets two jobs run together, counting jobs claimed by different workers', async () => {
+    const s = limited(2);
+    for (const k of ['a', 'b', 'c']) await s.kernel.enqueue('echo', { key: k });
+    const w1 = s.start({ id: 'w1' });
+    const w2 = s.start({ id: 'w2' });
+    const w3 = s.start({ id: 'w3' });
+    await tick(500);
+    expect(s.gauge.peak).toBe(2);
+    const claimedBy = s.db.prepare(`SELECT claimed_by FROM jobs WHERE status = 'running'`).all() as Array<{ claimed_by: string }>;
+    expect(new Set(claimedBy.map((r) => r.claimed_by)).size).toBe(2);
+    expect(running(s.db)).toBe(2);
+    await Promise.all([w1.stop(), w2.stop(), w3.stop()]);
+  });
+
+  it('without a limit every worker runs a job at once', async () => {
+    const s = limited(undefined);
+    for (const k of ['a', 'b', 'c']) await s.kernel.enqueue('echo', { key: k });
+    const ws = ['w1', 'w2', 'w3'].map((id) => s.start({ id }));
+    await tick(500);
+    expect(s.gauge.peak).toBe(3);
+    await Promise.all(ws.map((w) => w.stop()));
+  });
+
+  it('a blocked worker is quiet: no errors and one job.throttled event per minute', async () => {
+    const s = limited(1);
+    await s.kernel.enqueue('echo', { key: 'a' });
+    const { job: queued } = await s.kernel.enqueue('echo', { key: 'b' });
+    const w1 = s.start({ id: 'w1' });
+    const w2 = s.start({ id: 'w2' });
+    const throttled = () =>
+      s.db.prepare(`SELECT job_id, detail FROM events WHERE kind = 'job.throttled' ORDER BY id`).all() as Array<{ job_id: number; detail: string }>;
+    await tick(10_000);
+    expect(throttled()).toHaveLength(1);
+    expect(throttled()[0]).toMatchObject({ job_id: queued.id });
+    expect(JSON.parse(throttled()[0]!.detail)).toEqual({ running: 1, limit: 1 });
+    await tick(60_000);
+    expect(throttled()).toHaveLength(2);
+    expect(s.errors).toEqual([]);
+    await Promise.all([w1.stop(), w2.stop()]);
+  });
+
+  it('records no throttle event when nothing is queued', async () => {
+    const s = limited(1);
+    await s.kernel.enqueue('echo', { key: 'a' });
+    const w = s.start({ id: 'w1' });
+    await tick(5_000);
+    expect(s.db.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'job.throttled'`).get()).toEqual({ n: 0 });
+    await w.stop();
   });
 });

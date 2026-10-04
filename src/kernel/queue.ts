@@ -136,9 +136,12 @@ const json = (v: unknown): string | null => (v === undefined ? null : JSON.strin
  * write lock is taken before the job is selected; at most one connection can
  * be inside this transaction at a time, and each sees all earlier claims.
  * Every claim increments `delivery`, which becomes the fence for later writes.
+ * With `maxConcurrent`, nothing is claimed (null) while that many jobs are `running`, counted in
+ * the same transaction; a running job with an expired lease counts until the reaper reclaims it.
  */
-export function claimNext(db: Db, workerId: string, now: number, leaseMs: number): Job | null {
+export function claimNext(db: Db, workerId: string, now: number, leaseMs: number, maxConcurrent?: number): Job | null {
   const claim = db.transaction((): Job | null => {
+    if (maxConcurrent !== undefined && countRunning(db) >= maxConcurrent) return null;
     const r = db
       .prepare(
         `UPDATE jobs
@@ -162,6 +165,44 @@ export function claimNext(db: Db, workerId: string, now: number, leaseMs: number
     return rowToJob(r);
   });
   return claim.immediate();
+}
+
+/** The number of jobs with status `running`. */
+export function countRunning(db: Db): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'`).get() as { n: number }).n;
+}
+
+/** At most one `job.throttled` event per this interval. */
+export const THROTTLE_EVENT_INTERVAL_MS = 60_000;
+
+/**
+ * Records `job.throttled` (against the oldest queued job) when the limit is reached and work is
+ * queued, unless one was recorded within the last minute by any worker. Returns whether it recorded.
+ */
+export function recordThrottled(db: Db, now: number, limit: number): boolean {
+  return db
+    .transaction((): boolean => {
+      const running = countRunning(db);
+      if (running < limit) return false;
+      const next = db.prepare(`SELECT id, chain_id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1`).get() as
+        | { id: number; chain_id: number }
+        | undefined;
+      if (!next) return false;
+      const recent = db
+        .prepare(`SELECT 1 FROM events WHERE at > ? AND kind = 'job.throttled' LIMIT 1`)
+        .get(now - THROTTLE_EVENT_INTERVAL_MS);
+      if (recent !== undefined) return false;
+      recordEvent(db, {
+        at: now,
+        chainId: next.chain_id,
+        jobId: next.id,
+        kind: 'job.throttled',
+        engine: 'kernel',
+        detail: { running, limit },
+      });
+      return true;
+    })
+    .immediate();
 }
 
 /** Extend the lease of a running job. Returns false if the fence is stale. */
