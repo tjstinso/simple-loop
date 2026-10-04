@@ -31,6 +31,7 @@ describe('loadConfig', () => {
       allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
       maxHumanRounds: 5,
       maxConflictRounds: 2,
+      maxCiRounds: 2,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
     });
   });

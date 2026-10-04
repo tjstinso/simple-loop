@@ -64,5 +64,6 @@ export type SoftwareEffect =
   | { kind: 'round_summary' }
   | { kind: 'post_feedback_replies' }
   | { kind: 'conflict_summary' }
+  | { kind: 'ci_summary' }
   | { kind: 'comment'; target: 'issue' | 'pr'; body: string; marker: string }
   | { kind: 'file_followups'; followups: Followup[] };

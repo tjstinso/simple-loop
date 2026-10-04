@@ -498,3 +498,82 @@ describe('gh subprocess timeouts', () => {
     expect(ok.timedOut).toBeFalsy();
   });
 });
+
+describe('FakeGitHost checks', () => {
+  it('derives the state from the checks of exactly that sha', async () => {
+    const gh = new FakeGitHost();
+    expect(await gh.getChecks(R, 'abc1234')).toEqual({ state: 'none', checks: [] });
+    gh.setChecks('abc1234', [{ name: 'a', status: 'completed', conclusion: 'success' }]);
+    expect((await gh.getChecks(R, 'abc1234')).state).toBe('passing');
+    expect((await gh.getChecks(R, 'def5678')).state).toBe('none');
+    gh.setFailedLog(4, 'l1\nl2\nl3');
+    expect(await gh.getFailedLogExcerpt(R, 4, 2)).toBe('l2\nl3');
+    await expect(gh.getFailedLogExcerpt(R, 5, 2)).rejects.toMatchObject({ status: 404 });
+    gh.failNext('getChecks', new GitHostError('boom', 502));
+    await expect(gh.getChecks(R, 'abc1234')).rejects.toMatchObject({ status: 502 });
+  });
+});
+
+describe('GhCliHost getChecks', () => {
+  const SHA = 'abc1234def';
+  const run = (i: number, over: object = {}) => ({
+    name: `job ${i}`, status: 'completed', conclusion: 'success', details_url: `https://github.com/o/r/actions/runs/${1000 + i}/job/${i}`, ...over,
+  });
+  const runs = (list: object[]) => JSON.stringify({ total_count: list.length, check_runs: list });
+  const statuses = (list: object[]) => JSON.stringify({ state: 'pending', statuses: list });
+
+  it('pages both endpoints by hand and maps runs and legacy statuses', async () => {
+    const { exec, calls } = stub([
+      { stdout: runs(Array.from({ length: 100 }, (_, i) => run(i))) },
+      { stdout: runs([run(100, { conclusion: 'failure' })]) },
+      { stdout: statuses(Array.from({ length: 100 }, (_, i) => ({ context: `ci/${i}`, state: 'success' }))) },
+      { stdout: statuses([{ context: 'ci/last', state: 'error', target_url: 'https://ci.example/x' }]) },
+    ]);
+    const r = await new GhCliHost({ exec }).getChecks(R, SHA);
+    expect(calls.map((c) => c[1])).toEqual([
+      ['api', '-X', 'GET', `repos/o/r/commits/${SHA}/check-runs`, '-f', 'per_page=100', '-f', 'page=1'],
+      ['api', '-X', 'GET', `repos/o/r/commits/${SHA}/check-runs`, '-f', 'per_page=100', '-f', 'page=2'],
+      ['api', '-X', 'GET', `repos/o/r/commits/${SHA}/status`, '-f', 'per_page=100', '-f', 'page=1'],
+      ['api', '-X', 'GET', `repos/o/r/commits/${SHA}/status`, '-f', 'per_page=100', '-f', 'page=2'],
+    ]);
+    expect(r.checks).toHaveLength(202);
+    expect(r.state).toBe('failing');
+    expect(r.checks[100]).toEqual({
+      name: 'job 100', status: 'completed', conclusion: 'failure', detailsUrl: 'https://github.com/o/r/actions/runs/1100/job/100', runId: 1100,
+    });
+    expect(r.checks[201]).toEqual({ name: 'ci/last', status: 'completed', conclusion: 'failure', detailsUrl: 'https://ci.example/x' });
+  });
+
+  const stateOf = async (checkRuns: object[], st: object[] = []) => {
+    const { exec } = stub([{ stdout: runs(checkRuns) }, { stdout: statuses(st) }]);
+    return (await new GhCliHost({ exec }).getChecks(R, SHA)).state;
+  };
+
+  it('none without checks', async () => expect(await stateOf([])).toBe('none'));
+  it('passing when all completed with success, neutral or skipped', async () => {
+    expect(await stateOf([run(1), run(2, { conclusion: 'neutral' }), run(3, { conclusion: 'skipped' })], [{ context: 'c', state: 'success' }])).toBe('passing');
+  });
+  it('pending when a check is not completed', async () => {
+    expect(await stateOf([run(1), run(2, { status: 'in_progress', conclusion: null })])).toBe('pending');
+    expect(await stateOf([run(1), run(2, { status: 'queued', conclusion: null })])).toBe('pending');
+    expect(await stateOf([run(1)], [{ context: 'c', state: 'pending' }])).toBe('pending');
+  });
+  it.each(['failure', 'timed_out', 'cancelled', 'action_required'])('failing on %s', async (conclusion) => {
+    expect(await stateOf([run(1, { conclusion })])).toBe('failing');
+  });
+  it('a mix of failing, pending and passing is failing', async () => {
+    expect(await stateOf([run(1), run(2, { status: 'in_progress', conclusion: null }), run(3, { conclusion: 'failure' })])).toBe('failing');
+  });
+
+  it('refuses a value that is not a sha and maps failures like the other calls', async () => {
+    const { exec } = stub([{ stderr: 'boom (HTTP 502)', exitCode: 1 }]);
+    await expect(new GhCliHost({ exec }).getChecks(R, '../x')).rejects.toBeInstanceOf(GitHostError);
+    await expect(new GhCliHost({ exec }).getChecks(R, SHA)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('reads the end of the failing log with gh run view --log-failed', async () => {
+    const { exec, calls } = stub([{ stdout: `${Array.from({ length: 10 }, (_, i) => `l${i + 1}`).join('\n')}\n` }]);
+    expect(await new GhCliHost({ exec }).getFailedLogExcerpt(R, 77, 3)).toBe('l8\nl9\nl10');
+    expect(calls[0]![1]).toEqual(['run', 'view', '77', '--repo', R, '--log-failed']);
+  });
+});
