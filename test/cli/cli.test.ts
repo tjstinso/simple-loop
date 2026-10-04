@@ -299,6 +299,20 @@ describe('factory cli', () => {
     expect(out).toContain('worker w-test stopped');
   });
 
+  it('worker refuses to start when the identity check fails, and starts nothing', async () => {
+    const { out, err, deps } = setup();
+    const runtime: Runtime = {
+      ...deps.runtime!,
+      verifyIdentity: async () => {
+        throw new Error("the GitHub token resolves to the login 'a', but github.expectLogin is 'b'");
+      },
+    };
+    expect(await run(['worker', '--id', 'w-id'], { ...deps, runtime })).toBe(1);
+    expect(err.join('\n')).toContain("'a'");
+    expect(err.join('\n')).toContain("'b'");
+    expect(out.join('\n')).not.toContain('started');
+  });
+
   it('does not close an injected runtime', async () => {
     const { deps, closed } = setup();
     await run(['status'], deps);

@@ -2,6 +2,18 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 
+const GithubSchema = z
+  .object({
+    tokenEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'must be an environment variable name').optional(),
+    expectLogin: z.string().min(1).optional(),
+    commitName: z.string().min(1).optional(),
+    commitEmail: z.string().min(1).optional(),
+  })
+  .refine((g) => g.tokenEnv === undefined || g.expectLogin !== undefined, {
+    message: 'expectLogin is required when tokenEnv is set',
+    path: ['expectLogin'],
+  });
+
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
   policiesDir: z.string().min(1).default('./policies'),
@@ -15,6 +27,16 @@ const ConfigSchema = z.object({
   allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
   maxHumanRounds: z.number().int().min(1).default(5),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
+  github: GithubSchema.optional(),
+}).superRefine((c, ctx) => {
+  // The token reaches git only through an HTTPS URL and the askpass helper; no credentials in the URL.
+  if (c.github?.tokenEnv !== undefined && !/^https:\/\/[^@/]+\//.test(c.cloneUrlTemplate)) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['cloneUrlTemplate'],
+      message: 'must be an https:// URL without credentials when github.tokenEnv is set',
+    });
+  }
 });
 
 export type FactoryConfig = z.infer<typeof ConfigSchema>;

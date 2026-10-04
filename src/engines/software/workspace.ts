@@ -4,7 +4,8 @@ import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile 
 import { join, resolve, sep } from 'node:path';
 import type { ChainView, Job, WorkspaceProvider } from '../../kernel/types.js';
 import type { Workspace } from '../../runner/types.js';
-import { GIT_LOCAL_TIMEOUT_MS, GIT_NETWORK_TIMEOUT_MS, GIT_SSH_BATCH } from './git-ports.js';
+import { FACTORY_GIT_EMAIL, FACTORY_GIT_NAME, GIT_LOCAL_TIMEOUT_MS, GIT_NETWORK_TIMEOUT_MS, GIT_SSH_BATCH } from './git-ports.js';
+import { gitAuthEnv, NO_CREDENTIAL_HELPER_ARGS, type CommitIdentity, type GithubAuth } from './identity.js';
 import type { SoftwareState } from './state.js';
 
 export interface SoftwareWorkspace extends Workspace {
@@ -42,6 +43,10 @@ export interface GitWorkspaceOptions {
    * (default DEFAULT_SWEEP_GRACE_MS, 10 min); 0 disables the check.
    */
   sweepGraceMs?: number;
+  /** The factory's GitHub identity: fetch, ls-remote and clone authenticate with its token (HTTPS, GIT_ASKPASS). */
+  auth?: GithubAuth;
+  /** Identity written to the cache repository's `user.name`/`user.email` (default `factory <factory@localhost>`). */
+  identity?: CommitIdentity;
 }
 
 export const DEFAULT_SWEEP_GRACE_MS = 600_000;
@@ -117,16 +122,23 @@ interface Timeouts {
   network: number;
 }
 
-function git(cwd: string, args: string[], t: Timeouts = { local: GIT_LOCAL_TIMEOUT_MS, network: GIT_NETWORK_TIMEOUT_MS }): Promise<string> {
-  const timeout = NETWORK_COMMANDS.has(args[0] ?? '') ? t.network : t.local;
+function git(
+  cwd: string,
+  args: string[],
+  t: Timeouts = { local: GIT_LOCAL_TIMEOUT_MS, network: GIT_NETWORK_TIMEOUT_MS },
+  auth?: GithubAuth,
+): Promise<string> {
+  const network = NETWORK_COMMANDS.has(args[0] ?? '');
+  const timeout = network ? t.network : t.local;
+  const withAuth = network && auth !== undefined;
   return new Promise((resolve, reject) => {
     // Hooks off: the agent can write the shared cache (hooks/, core.hooksPath) and must not get
     // code run by the worker's own git commands (worktree add runs post-checkout).
-    const argv = ['-c', 'core.hooksPath=/dev/null', ...args];
+    const argv = ['-c', 'core.hooksPath=/dev/null', ...(withAuth ? NO_CREDENTIAL_HELPER_ARGS : []), ...args];
     execFile(
       'git',
       argv,
-      { cwd, env: gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout, killSignal: 'SIGKILL' },
+      { cwd, env: withAuth ? { ...gitEnv(), ...gitAuthEnv(auth) } : gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
         const e = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: string | null }) | null;
         if (e?.killed === true && e.signal === 'SIGKILL') reject(new Error(`git ${args.join(' ')} timed out after ${timeout} ms`));
@@ -158,7 +170,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   }
 
   private git(cwd: string, args: string[]): Promise<string> {
-    return git(cwd, args, this.timeouts);
+    return git(cwd, args, this.timeouts, this.opts.auth);
   }
 
   private cachePath(repo: string): string {
@@ -316,8 +328,8 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     await this.setConfig(cache, 'remote.origin.url', url);
     await this.setConfig(cache, 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*');
     await this.setConfig(cache, 'remote.origin.pushurl', DISABLED_PUSH_URL);
-    await this.setConfig(cache, 'user.name', 'factory');
-    await this.setConfig(cache, 'user.email', 'factory@localhost');
+    await this.setConfig(cache, 'user.name', this.opts.identity?.name ?? FACTORY_GIT_NAME);
+    await this.setConfig(cache, 'user.email', this.opts.identity?.email ?? FACTORY_GIT_EMAIL);
     return cache;
   }
 

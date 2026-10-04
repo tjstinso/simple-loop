@@ -742,6 +742,24 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
     });
   });
 
+  it('never shows the GitHub token to the agent, in either mode, even when listed in passEnv', async () => {
+    const token = 'gh' + 'p_' + 'Zy9X'.repeat(9);
+    await withParentEnv(
+      { FACTORY_GH_TOKEN: token, GH_TOKEN: token, GITHUB_TOKEN: token, GIT_ASKPASS: '/tmp/askpass', FACTORY_OTHER: 'kept' },
+      async () => {
+        const r = new ClaudeCliRunner({ bin: STUB, env: { STUB_MODE: 'echo', ANTHROPIC_API_KEY: 'test-key' }, withheldEnv: ['FACTORY_GH_TOKEN'] });
+        for (const bare of [true, false]) {
+          const cfg = config({ resultFormat: 'json', bare, ...(bare ? { passEnv: ['FACTORY_GH_TOKEN', 'FACTORY_OTHER'] } : {}) });
+          const res = (await r.run(input({ config: cfg }), signal())) as { env: Record<string, string> };
+          for (const k of ['FACTORY_GH_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'GIT_ASKPASS']) expect(res.env[k], `${k} bare=${bare}`).toBeUndefined();
+          expect(Object.values(res.env)).not.toContain(token);
+        }
+        const nonBare = (await r.run(input({ config: config({ resultFormat: 'json', bare: false }) }), signal())) as { env: Record<string, string> };
+        expect(nonBare.env.FACTORY_OTHER).toBe('kept');
+      },
+    );
+  });
+
   it('the shipped policies set bare true and validate', () => {
     const schema = new ClaudeCliRunner().configSchema;
     const policies = loadPolicies(join(import.meta.dirname, '../../policies'));
