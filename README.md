@@ -244,7 +244,7 @@ With nothing open it prints `no open chains`.
 
 **events.** `factory events` prints the newest events across chains, oldest first. `--since <duration>` (`30s`, `15m`, `2h`, `7d`), `--chain <id>` and `--limit <n>` (default 50) narrow it; `--json` prints the rows.
 
-**workers.** `factory workers` prints each registered worker: id, pid, host, whether its process is alive (`unknown` when it runs on another host), the job and delivery it is on (or `idle`) and the age of its last heartbeat.
+**workers.** `factory workers` prints each registered worker: id, pid, host, whether it is alive (see the liveness rule under Dashboard), the job and delivery it is on (or `idle`) and the age of its last heartbeat.
 
 **dlq.** `list` prints unresolved dead letters, newest first: `job <job-id> chain <chain-id> <reason> <first line of the error, at most 120 characters>`. The reason is one of `runner_error`, `timeout`, `max_deliveries`, `effect_error`. Empty output is `no dead letters`.
 
@@ -278,7 +278,13 @@ cancelled chain 1
 
 **Sections.** The header counts live workers, running jobs and chains waiting on a person. "Needs you" lists chains waiting on a person or a dead-letter decision, with links; "In progress" lists chains with a running job (its worker, how long it has run, the latest events); "Queued" lists the rest of the open chains; "Recently finished" shows the last 20 completed or cancelled chains. Expanding a chain shows its jobs with cost and its full event timeline (the same events as `factory show`).
 
-**API.** `GET /api/overview` returns, in one response: `openChains` (status `active`, `waiting` or `dead_lettered`) and the 20 most recent `finishedChains`, each with subject, engine, status, phase, attempt, links, jobs, its 10 latest events, total cost and `waitingOn`; plus `workers` (alive when the last heartbeat is within twice the 30 s heartbeat interval, and the job each is on), `summary`, `totalCostUsd` and `generatedAt`. `GET /api/chains/<id>` returns the same data as `factory show --json`. The pull request link is a GitHub search for the chain's branch, because the pull request number is not recorded.
+**API.** `GET /api/overview` returns, in one response: `openChains` (status `active`, `waiting` or `dead_lettered`) and the 20 most recent `finishedChains`, each with subject, engine, status, phase, attempt, links, jobs, its 10 latest events, total cost and `waitingOn`; plus `workers` (the alive ones first, then at most the 5 most recently seen dead ones, and the job each is on), `summary` (`workers` counts alive workers only; `aliveWorkers` is an alias for it, kept for one release; `stoppedWorkers` is the number of dead workers in total), `totalCostUsd` and `generatedAt`. `GET /api/chains/<id>` returns the same data as `factory show --json`. The pull request link is `https://github.com/<repo>/pull/<number>` when the chain recorded the number (the `pr.opened` event and the chain state carry it); chains from before that fall back to a GitHub search for the chain's branch.
+
+**Worker liveness.** `factory workers` and the dashboard use one rule. A worker on this host is alive while its process id exists (`kill(pid, 0)`; a permission error also counts as alive), however long it has been idle, because an idle worker does not stamp its heartbeat. A worker on another host cannot be probed, so it is alive while its heartbeat is younger than twice the 30 s heartbeat interval. A reused process id is not detected.
+
+**Worker grouping.** The page lists alive workers in a table and puts the dead ones in a collapsed "Stopped workers (N)" group, where N is the total number of dead workers; the API and the page carry only the 5 most recently seen of them.
+
+**Host check.** Every request, including the `404` and `405` cases, must carry a `Host` header whose hostname is `localhost`, `127.0.0.1` or `[::1]` (or exactly the value given with `--host`) and whose port is the port the server listens on. Anything else, including a missing `Host`, gets `421 Misdirected Request` with a one-line plain-text body and no data. This stops DNS-rebinding pages from reading the dashboard through the browser. A reverse proxy in front of the dashboard must keep the original `Host` header (and so use a matching name and port) or rewrite it to `127.0.0.1:<port>`, otherwise every request is refused.
 
 **waitingOn.** Derived for each open chain:
 

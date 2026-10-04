@@ -409,17 +409,17 @@ async function openPr(ctx: EffectContext, fence: EffectFence): Promise<EffectOut
   const { repo, issueNumber, branch } = ctx.chain.state;
   const issue = await openIssue(ctx);
   const existing = await ctx.host.findPrByHead(repo, branch);
-  if (existing?.state === 'open') return;
+  if (existing?.state === 'open') return ctx.chain.state.prNumber === existing.number ? undefined : { engineState: { prNumber: existing.number } };
   const summary = summaryOf(ctx.job);
   const marker = `<!-- factory:chain=${ctx.chain.id} job=${ctx.job.id} event=open-pr -->`;
   // Redacted before neutralizing and capping, so a secret is never cut in half and kept.
   const safeSummary = summary ? neutralizeSummary(redactSecrets(summary, secretValuesOf(ctx))) : null;
   const body = [`Closes #${issueNumber}`, ...(safeSummary ? [safeSummary] : []), marker].join('\n\n');
   fence.assertCurrent();
-  await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: titleOf(ctx, issue), body });
-  ctx.events?.('pr.opened', { branch, base: ws.baseBranch });
+  const pr = await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: titleOf(ctx, issue), body });
+  ctx.events?.('pr.opened', { branch, base: ws.baseBranch, number: pr.number });
   // People's feedback counts from here on.
-  return ctx.now ? { engineState: { feedbackHandledAt: new Date(ctx.now()).toISOString() } } : undefined;
+  return { engineState: { prNumber: pr.number, ...(ctx.now ? { feedbackHandledAt: new Date(ctx.now()).toISOString() } : {}) } };
 }
 
 async function setLabels(ctx: EffectContext, fence: EffectFence, e: Extract<Supported, { kind: 'set_labels' }>): Promise<void> {

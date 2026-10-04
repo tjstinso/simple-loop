@@ -1,11 +1,13 @@
 import type Database from 'better-sqlite3';
 import { recentEvents, type EventRow } from '../kernel/events.js';
+import { HEARTBEAT_MS, isWorkerAlive, type LivenessProbe } from '../kernel/inspect.js';
 import { costOf } from '../kernel/queue.js';
 
 type Db = Database.Database;
 
-/** The kernel's heartbeat interval (see the runtime); a worker is alive within twice this. */
-export const HEARTBEAT_MS = 30_000;
+export { HEARTBEAT_MS };
+/** Dead workers listed after the alive ones: the most recently seen. */
+export const DEAD_WORKERS_SHOWN = 5;
 export const FINISHED_LIMIT = 20;
 export const EVENTS_PER_CHAIN = 10;
 /** The default maintenance interval of a worker; a waiting chain unchecked for 3 of them has no worker running maintenance. */
@@ -160,11 +162,13 @@ export interface WorkerOverview {
   currentJobId: number | null;
   currentChainId: number | null;
   currentDelivery: number | null;
+  lastSeenAt: number;
 }
 
 export interface Overview {
   generatedAt: number;
-  summary: { workers: number; aliveWorkers: number; runningJobs: number; waitingOnPerson: number };
+  /** `workers` counts alive workers only; `aliveWorkers` is an alias kept for one release; `stoppedWorkers` is the total of dead ones. */
+  summary: { workers: number; aliveWorkers: number; stoppedWorkers: number; runningJobs: number; waitingOnPerson: number };
   openChains: ChainOverview[];
   finishedChains: ChainOverview[];
   totalCostUsd: number;
@@ -219,16 +223,14 @@ function subjectOf(key: string, state: Record<string, unknown>): { repo: string;
 }
 
 /** Everything the dashboard shows, from one read-only pass over the database. */
-export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number; maintenanceMs?: number } = {}): Overview {
-  const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
+export function buildOverview(db: Db, now: number, opts: LivenessProbe & { maintenanceMs?: number } = {}): Overview {
   const staleCheckMs = STALE_CHECK_INTERVALS * (opts.maintenanceMs ?? MAINTENANCE_MS);
-
   const workerRows = db.prepare('SELECT * FROM workers ORDER BY id').all() as {
     id: string; pid: number; host: string; last_seen_at: number; current_job_id: number | null; current_delivery: number | null;
   }[];
   const workerAlive: Record<string, boolean> = {};
-  const workers: WorkerOverview[] = workerRows.map((w) => {
-    const alive = now - w.last_seen_at <= 2 * heartbeatMs;
+  const allWorkers: WorkerOverview[] = workerRows.map((w) => {
+    const alive = isWorkerAlive(w, now, opts);
     workerAlive[w.id] = alive;
     const chain =
       w.current_job_id === null
@@ -243,14 +245,19 @@ export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number;
       currentJobId: w.current_job_id,
       currentChainId: chain?.chain_id ?? null,
       currentDelivery: w.current_delivery,
+      lastSeenAt: w.last_seen_at,
     };
   });
+  const aliveWorkers = allWorkers.filter((w) => w.alive);
+  const deadWorkers = allWorkers.filter((w) => !w.alive).sort((a, b) => b.lastSeenAt - a.lastSeenAt || a.id.localeCompare(b.id));
+  const workers = [...aliveWorkers, ...deadWorkers.slice(0, DEAD_WORKERS_SHOWN)];
 
   const toChain = (c: ChainRow, open: boolean): ChainOverview => {
     const state = parseState(c.engine_state);
     const subject = subjectOf(c.subject_key, state);
     const phase = str(state.phase);
     const branch = str(state.branch);
+    const prNumber = int(state.prNumber);
     const events = recentEvents(db, { chainId: c.id, limit: EVENTS_PER_CHAIN });
     const hasPr = (db.prepare(`SELECT 1 FROM events WHERE chain_id = ? AND kind = 'pr.opened' LIMIT 1`).get(c.id) as unknown) !== undefined;
     const jobRows = db.prepare('SELECT * FROM jobs WHERE chain_id = ? ORDER BY id').all(c.id) as JobRow[];
@@ -312,8 +319,13 @@ export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number;
       updatedAt: c.updated_at,
       links: {
         issue: subject ? `https://github.com/${subject.repo}/issues/${subject.issueNumber}` : null,
-        // The pull request number is not recorded, so this is a search for the pull request of the chain's branch.
-        pullRequest: subject && branch !== null && prVisible ? `https://github.com/${subject.repo}/pulls?q=${encodeURIComponent(`is:pr head:${branch}`)}` : null,
+        // Chains from before the number was recorded fall back to a search for the branch's pull request.
+        pullRequest:
+          subject && prNumber !== null
+            ? `https://github.com/${subject.repo}/pull/${prNumber}`
+            : subject && branch !== null && prVisible
+              ? `https://github.com/${subject.repo}/pulls?q=${encodeURIComponent(`is:pr head:${branch}`)}`
+              : null,
       },
       jobs,
       events,
@@ -340,8 +352,9 @@ export function buildOverview(db: Db, now: number, opts: { heartbeatMs?: number;
   return {
     generatedAt: now,
     summary: {
-      workers: workers.length,
-      aliveWorkers: workers.filter((w) => w.alive).length,
+      workers: aliveWorkers.length,
+      aliveWorkers: aliveWorkers.length,
+      stoppedWorkers: deadWorkers.length,
       runningJobs: openChains.reduce((n, c) => n + c.jobs.filter((j) => j.status === 'running').length, 0),
       waitingOnPerson: openChains.filter((c) => c.waitingOn?.kind === 'person_merge' || c.waitingOn?.kind === 'person_attention' || c.waitingOn?.kind === 'dead_letter').length,
     },

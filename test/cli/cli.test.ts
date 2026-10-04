@@ -221,7 +221,7 @@ describe('factory cli', () => {
       .run(process.pid, process.pid, hostname(), h.clock() - 5000, h.clock() - 5000, h.clock() - 90_000, h.clock() - 90_000);
     expect(await run(['workers'], deps)).toBe(0);
     expect(out).toEqual([
-      `w-away pid=1 host=elsewhere unknown idle heartbeat=1m ago`,
+      `w-away pid=1 host=elsewhere dead idle heartbeat=1m ago`,
       `w-here pid=${process.pid} host=${hostname()} alive job=4 delivery=2 heartbeat=5s ago`,
     ]);
     out.length = 0;

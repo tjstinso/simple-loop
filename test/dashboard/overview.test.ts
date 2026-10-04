@@ -198,7 +198,38 @@ describe('buildOverview', () => {
     expect(alive.currentChainId).toBe(ids.running);
     expect(alive.currentJobId).not.toBeNull();
     expect(dead.alive).toBe(false);
-    expect(o.summary).toMatchObject({ workers: 2, aliveWorkers: 1, runningJobs: 3, waitingOnPerson: 3 });
+    expect(o.summary).toMatchObject({ workers: 1, aliveWorkers: 1, stoppedWorkers: 1, runningJobs: 3, waitingOnPerson: 3 });
+  });
+
+  it('lists alive workers first, then only the 5 most recently seen dead ones', () => {
+    t = makeDb();
+    for (let i = 0; i < 13; i++) addWorker(t.db, `dead-${String(i).padStart(2, '0')}`, NOW - 120_000 - i * 1000);
+    addWorker(t.db, 'alive-1', NOW - 1000);
+    addWorker(t.db, 'alive-2', NOW - 2000);
+    const o = buildOverview(t.db, NOW);
+    expect(o.workers.map((w) => w.id)).toEqual(['alive-1', 'alive-2', 'dead-00', 'dead-01', 'dead-02', 'dead-03', 'dead-04']);
+    expect(o.summary).toMatchObject({ workers: 2, aliveWorkers: 2, stoppedWorkers: 13 });
+  });
+
+  it('counts an idle worker with an old heartbeat as alive when its process exists', () => {
+    t = makeDb();
+    t.db
+      .prepare(`INSERT INTO workers (id, pid, pgid, host, started_at, last_seen_at) VALUES ('idle', ?, 1, 'here', 0, ?)`)
+      .run(process.pid, NOW - 3_600_000);
+    const o = buildOverview(t.db, NOW, { host: 'here' });
+    expect(o.workers[0]).toMatchObject({ id: 'idle', alive: true });
+    expect(o.summary.workers).toBe(1);
+  });
+
+  it('links to the pull request by number when recorded, else to a search', () => {
+    t = makeDb();
+    const withNumber = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 7 });
+    const old = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 8 });
+    const state = JSON.parse((t.db.prepare('SELECT engine_state FROM chains WHERE id = ?').get(withNumber) as { engine_state: string }).engine_state);
+    t.db.prepare('UPDATE chains SET engine_state = ? WHERE id = ?').run(JSON.stringify({ ...state, prNumber: 42 }), withNumber);
+    const o = buildOverview(t.db, NOW);
+    expect(o.openChains.find((c) => c.id === withNumber)!.links.pullRequest).toBe('https://github.com/o/r/pull/42');
+    expect(o.openChains.find((c) => c.id === old)!.links.pullRequest).toContain('https://github.com/o/r/pulls?q=');
   });
 
   it('is empty on an empty database', () => {

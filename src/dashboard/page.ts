@@ -161,17 +161,26 @@ const SCRIPT = `
     var queued = open.filter(function (c) { return !isPerson(c) && !hasRunning(c); });
     var s = data.summary;
     var head = el('header', null, el('h1', null, 'Factory dashboard'),
-      el('span', { class: 'stat' }, el('b', null, s.aliveWorkers), ' workers alive (' + s.workers + ' known)'),
+      el('span', { class: 'stat' }, el('b', null, s.workers), ' workers alive'),
       el('span', { class: 'stat' }, el('b', null, s.runningJobs), ' running'),
       el('span', { class: 'stat' }, el('b', null, s.waitingOnPerson), ' waiting on a person'),
       el('span', { class: 'muted' }, 'total cost ' + money(data.totalCostUsd)),
       el('span', { class: 'muted' }, 'last refresh ' + (lastOk ? clock(lastOk) : 'never')));
-    var workers = data.workers.length
-      ? el.apply(null, ['table', null, el('tr', null, ['worker', 'pid', 'host', 'state', 'heartbeat', 'job'].map(function (h) { return el('th', null, h); }))].concat(data.workers.map(function (w) {
-          return el('tr', null, el('td', null, w.id), el('td', null, w.pid), el('td', null, w.host), el('td', null, w.alive ? '\\u2714 alive' : '\\u2716 dead'),
-            el('td', null, dur(w.heartbeatAgeMs) + ' ago'), el('td', null, w.currentJobId === null ? 'idle' : 'job ' + w.currentJobId + (w.currentChainId ? ' (chain ' + w.currentChainId + ')' : '')));
-        })))
-      : el('div', { class: 'empty' }, 'no workers have registered');
+    var workerRow = function (w) {
+      return el('tr', null, el('td', null, w.id), el('td', null, w.pid), el('td', null, w.host), el('td', null, w.alive ? '\\u2714 alive' : '\\u2716 dead'),
+        el('td', null, dur(w.heartbeatAgeMs) + ' ago'), el('td', null, w.currentJobId === null ? 'idle' : 'job ' + w.currentJobId + (w.currentChainId ? ' (chain ' + w.currentChainId + ')' : '')));
+    };
+    var workerTable = function (list) {
+      return el.apply(null, ['table', null, el('tr', null, ['worker', 'pid', 'host', 'state', 'heartbeat', 'job'].map(function (h) { return el('th', null, h); }))].concat(list.map(workerRow)));
+    };
+    var aliveList = data.workers.filter(function (w) { return w.alive; });
+    var stoppedList = data.workers.filter(function (w) { return !w.alive; });
+    var workers = el('div', null,
+      aliveList.length ? workerTable(aliveList) : el('div', { class: 'empty' }, data.workers.length ? 'no worker is alive' : 'no workers have registered'),
+      stoppedList.length
+        ? el('details', null, el('summary', null, 'Stopped workers (' + s.stoppedWorkers + ')'), workerTable(stoppedList),
+            s.stoppedWorkers > stoppedList.length ? el('div', { class: 'muted' }, 'showing the ' + stoppedList.length + ' most recently seen') : null)
+        : null);
     root.replaceChildren(head, banner(), el('main', null,
       section('Needs you', needs, 'Nothing is waiting on you.'),
       section('In progress', progress, 'No job is running.'),
