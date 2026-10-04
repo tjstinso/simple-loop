@@ -72,6 +72,6 @@ export function conflictFeedback(baseBranch: string, paths: readonly string[]): 
     ...paths.map((p) => `- ${safePath(p)}`),
     '',
     'Resolve every conflict keeping the intent of both sides. Leave no conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) in any file. Do not reformat unrelated code.',
-    'Only edit files: do not run git commands (the factory completes the merge commit itself).',
+    'Only edit files: do not run git commands and do not commit (the factory completes the merge commit itself).',
   ].join('\n');
 }

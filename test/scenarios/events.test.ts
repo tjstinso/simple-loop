@@ -36,6 +36,8 @@ describe('lifecycle events', () => {
       'job.queued', // execute 1
       'job.claimed',
       'labels.changed', // claim: in-progress
+      'commit.fallback', // the agent left its files uncommitted
+      'commit.validated',
       'pr.opened',
       'labels.changed', // execute transition: in-progress
       'job.succeeded',
@@ -47,6 +49,8 @@ describe('lifecycle events', () => {
       'job.queued', // execute 2
       'job.claimed',
       'labels.changed',
+      'commit.fallback',
+      'commit.validated',
       'labels.changed',
       'job.succeeded',
       'job.queued', // review 2

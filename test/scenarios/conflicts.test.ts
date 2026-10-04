@@ -114,7 +114,7 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     expect(h.deadLetters()).toEqual([
       expect.objectContaining({
         reason: 'runner_error',
-        error: "effect 'commit_push' failed: refusing to push: conflict markers remain in README.md",
+        error: 'refusing to push: conflict markers remain in README.md',
       }),
     ]);
     expect(h.remoteHead(BRANCH)).toBe(before);
