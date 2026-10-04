@@ -284,6 +284,46 @@ export function completeWaitingChain(db: Db, chainId: number, engineState: unkno
   return r.changes === 1;
 }
 
+/**
+ * Replaces the engine state of a chain that is still `waiting`, sets its status and queues `newJobs`
+ * (ignoring a (chain, type, attempt) that exists), in one transaction. Returns false (writing
+ * nothing) when the chain is in any other status.
+ */
+export function updateWaitingChain(
+  db: Db,
+  chainId: number,
+  args: { engineState: unknown; chainStatus: 'active' | 'waiting'; newJobs: ResolvedNewJob[]; reason: string },
+  now: number,
+): boolean {
+  return db.transaction(() => {
+    const r = db
+      .prepare(`UPDATE chains SET status = ?, engine_state = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`)
+      .run(args.chainStatus, JSON.stringify(args.engineState), now, chainId);
+    if (r.changes !== 1) return false;
+    const ins = db.prepare(
+      `INSERT OR IGNORE INTO jobs
+         (chain_id, type, attempt, status, policy_id, payload, delivery, created_at, updated_at)
+       VALUES (?, ?, ?, 'queued', ?, ?, 0, ?, ?)`,
+    );
+    recordEvent(db, { at: now, chainId, kind: `chain.${args.chainStatus === 'active' ? 'resumed' : 'updated'}`, engine: 'kernel', detail: { by: 'reconcile', reason: args.reason } });
+    for (const j of args.newJobs) {
+      const added = ins.run(chainId, j.type, j.attempt, j.policyId, json(j.payload), now, now);
+      if (added.changes === 1) {
+        recordEvent(db, {
+          at: now,
+          chainId,
+          jobId: Number(added.lastInsertRowid),
+          delivery: 0,
+          kind: 'job.queued',
+          engine: 'kernel',
+          detail: { type: j.type, attempt: j.attempt },
+        });
+      }
+    }
+    return true;
+  }).immediate();
+}
+
 /** Mark a running job failed. Throws StaleDeliveryError if the fence is stale. */
 export function failJob(db: Db, fence: Fence, error: string): void {
   const r = db

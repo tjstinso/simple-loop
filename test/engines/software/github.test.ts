@@ -285,3 +285,92 @@ describe('gh subprocess timeouts', () => {
     expect(ok.timedOut).toBeFalsy();
   });
 });
+
+describe('getChecks', () => {
+  const run = (name: string, status: string, conclusion: string | null) => ({
+    name, status, conclusion, details_url: `https://ci.example/${name}`,
+  });
+  const many = (n: number, prefix: string) => Array.from({ length: n }, (_, i) => run(`${prefix}${i}`, 'completed', 'success'));
+  /** Answers by endpoint and page. */
+  function host(runs: Record<number, unknown[]>, statuses: Record<number, unknown[]>) {
+    const calls: string[][] = [];
+    const exec: ExecFn = async (_file, args) => {
+      calls.push(args);
+      const page = Number(args.find((a) => a.startsWith('page='))!.slice(5));
+      const isRuns = args[3]!.endsWith('/check-runs');
+      return { stdout: JSON.stringify(isRuns ? { check_runs: runs[page] ?? [] } : { statuses: statuses[page] ?? [] }), stderr: '', exitCode: 0 };
+    };
+    return { gh: new GhCliHost({ exec }), calls };
+  }
+
+  it('reads check runs and legacy statuses of exactly the sha, paging both with page=', async () => {
+    const { gh, calls } = host(
+      { 1: many(100, 'a'), 2: many(2, 'b') },
+      { 1: [{ context: 'ci/legacy', state: 'success', target_url: 'https://legacy.example' }] },
+    );
+    const r = await gh.getChecks(R, 'abc123');
+    expect(r.checks).toHaveLength(103);
+    expect(r.checks.at(-1)).toEqual({ name: 'ci/legacy', status: 'completed', conclusion: 'success', detailsUrl: 'https://legacy.example' });
+    expect(r.state).toBe('passing');
+    expect(calls.map((c) => [c[3], c.filter((a) => a.startsWith('page='))[0]])).toEqual([
+      ['repos/o/r/commits/abc123/check-runs', 'page=1'],
+      ['repos/o/r/commits/abc123/check-runs', 'page=2'],
+      ['repos/o/r/commits/abc123/status', 'page=1'],
+    ]);
+  });
+
+  it('pages the legacy statuses too', async () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({ context: `s${i}`, state: 'success' }));
+    const { gh, calls } = host({}, { 1: full, 2: [{ context: 'last', state: 'pending' }] });
+    const r = await gh.getChecks(R, 'abc');
+    expect(r.checks).toHaveLength(101);
+    expect(r.state).toBe('pending');
+    expect(calls.filter((c) => c[3]!.endsWith('/status'))).toHaveLength(2);
+  });
+
+  it.each([
+    ['passing', [run('a', 'completed', 'success'), run('b', 'completed', 'neutral'), run('c', 'completed', 'skipped')]],
+    ['pending', [run('a', 'completed', 'success'), run('b', 'in_progress', null)]],
+    ['pending', [run('a', 'queued', null)]],
+    ['failing', [run('a', 'completed', 'failure')]],
+    ['failing', [run('a', 'completed', 'timed_out')]],
+    ['failing', [run('a', 'completed', 'cancelled')]],
+    ['failing', [run('a', 'completed', 'action_required')]],
+    ['failing', [run('a', 'completed', 'success'), run('b', 'queued', null), run('c', 'completed', 'failure')]],
+    ['none', []],
+  ])('state %s', async (state, runs) => {
+    const { gh } = host({ 1: runs }, {});
+    expect((await gh.getChecks(R, 'abc')).state).toBe(state);
+  });
+
+  it('maps legacy failure and error to failed checks and pending to unfinished ones', async () => {
+    const { gh } = host({}, { 1: [{ context: 'a', state: 'error' }, { context: 'b', state: 'pending' }] });
+    const r = await gh.getChecks(R, 'abc');
+    expect(r.checks.map((c) => [c.status, c.conclusion])).toEqual([['completed', 'failure'], ['in_progress', null]]);
+  });
+
+  it('maps a failing gh call like the other calls (HTTP status kept)', async () => {
+    const gh = new GhCliHost({ exec: async () => ({ stdout: '', stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 }) });
+    await expect(gh.getChecks(R, 'abc')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('passes the gh timeout', async () => {
+    const seen: Array<number | undefined> = [];
+    const gh = new GhCliHost({ exec: async (_f, _a, o) => (seen.push(o?.timeoutMs), { stdout: '{}', stderr: '', exitCode: 0 }), ghTimeoutMs: 1234 });
+    await gh.getChecks(R, 'abc');
+    expect(seen).toEqual([1234, 1234]);
+  });
+
+  it('getJobLog returns the log, or null when it is gone (4xx)', async () => {
+    expect(await new GhCliHost({ exec: async () => ({ stdout: 'line\n', stderr: '', exitCode: 0 }) }).getJobLog(R, 5)).toBe('line\n');
+    const gone = new GhCliHost({ exec: async () => ({ stdout: '', stderr: 'gone (HTTP 410)', exitCode: 1 }) });
+    expect(await gone.getJobLog(R, 5)).toBeNull();
+  });
+
+  it('FakeGitHost returns the checks set for exactly that sha', async () => {
+    const fake = new FakeGitHost();
+    fake.setChecks('old', [{ name: 'a', status: 'completed', conclusion: 'success' }]);
+    expect((await fake.getChecks(R, 'old')).state).toBe('passing');
+    expect(await fake.getChecks(R, 'new')).toEqual({ state: 'none', checks: [] });
+  });
+});

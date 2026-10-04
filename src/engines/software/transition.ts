@@ -1,5 +1,6 @@
 import { EffectError } from '../../kernel/types.js';
 import type { ChainView, Job, NewJob, Transition } from '../../kernel/types.js';
+import type { CiPolicy } from './ci.js';
 import { PROFILES } from './profiles.js';
 import {
   ExecutionResultSchema,
@@ -17,12 +18,27 @@ function followupEffects(followups: Followup[] | undefined): SoftwareEffect[] {
   return followups && followups.length > 0 ? [{ kind: 'file_followups', followups }] : [];
 }
 
+/** What a review's approval needs besides the result: the CI policy and the head the reviewer saw. */
+export interface ReviewContext {
+  ci?: CiPolicy | undefined;
+  /** The commit the review's worktree was seeded from; null when it cannot be verified. */
+  reviewedSha?: string | null;
+  now?: number;
+}
+
+/** The state without the CI gate's fields (a new attempt starts without them). */
+export function withoutCi(state: SoftwareState): SoftwareState {
+  const { reviewedSha: _s, ci: _c, ciSince: _t, ...rest } = state;
+  return rest;
+}
+
 export function softwareTransition(
   chain: ChainView<SoftwareState>,
   job: Job,
   result: unknown,
+  review: ReviewContext = {},
 ): Transition<SoftwareState> {
-  const state = chain.state;
+  const state = withoutCi(chain.state);
   const labels = [...state.labels];
 
   if (job.type === 'execute') {
@@ -53,6 +69,20 @@ export function softwareTransition(
     const profile = PROFILES[state.profile];
 
     if (v.verdict === 'approve') {
+      let gated: Pick<SoftwareState, 'reviewedSha' | 'ci'> | null = null;
+      if (review.ci) {
+        // Checks are only ever read for the exact commit the reviewer saw.
+        if (!review.reviewedSha) throw new EffectError('cannot verify the reviewed head; the review will be redone', 'runner_error');
+        gated = { reviewedSha: review.reviewedSha, ci: review.ci };
+      }
+      if (gated && profile.onApprove === 'merge') {
+        return {
+          engineState: { ...state, labels, phase: 'awaiting_ci', ...gated, ciSince: review.now ?? 0 },
+          chainStatus: 'waiting',
+          newJobs: [],
+          effects: followups,
+        };
+      }
       if (profile.onApprove === 'merge') {
         return {
           engineState: { ...state, labels, phase: 'merged' },
@@ -66,7 +96,7 @@ export function softwareTransition(
         };
       }
       return {
-        engineState: { ...state, labels, phase: 'awaiting_merge' },
+        engineState: { ...state, labels, phase: 'awaiting_merge', ...gated },
         chainStatus: 'waiting',
         newJobs: [],
         effects: [

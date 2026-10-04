@@ -129,7 +129,14 @@ export interface WorkspaceProvider {
 export type ReconcileOutcome =
   | { outcome: 'none' }
   | { outcome: 'completed'; reason: string }
-  | { outcome: 'cancelled'; reason: string };
+  | { outcome: 'cancelled'; reason: string }
+  /**
+   * The chain stays in the factory's hands: its engine state is replaced, its status becomes `status`
+   * (`waiting` again, or `active` when `newJobs` put it back to work) and the jobs are queued, all in
+   * one transaction that only applies while the chain is still `waiting`. The engine does its own
+   * (idempotent) side effects before returning; `afterReconcile` is not called.
+   */
+  | { outcome: 'update'; state: unknown; status: 'active' | 'waiting'; newJobs: NewJob[]; reason: string };
 
 export interface Engine<S = unknown> {
   id: string;

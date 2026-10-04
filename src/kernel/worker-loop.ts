@@ -4,7 +4,7 @@ import { readProcessStartTime } from '../util/proc.js';
 import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
 import { cancelChain, listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
 import { recordEvent } from './events.js';
-import { claimNext, completeWaitingChain, getChain, getJob, renewLease, requeueJob } from './queue.js';
+import { claimNext, completeWaitingChain, getChain, getJob, renewLease, requeueJob, updateWaitingChain } from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
 import { pruneHistory } from './retention.js';
 import type { ChainView, Fence, Job, KernelDeps } from './types.js';
@@ -104,8 +104,8 @@ export async function runMaintenance(
  * engine whether the subject was settled outside the factory and applies the answer. `completed`
  * completes the chain (engine state through `finalState`), `cancelled` cancels it (`cancelChain`,
  * then `afterCancel`); both only if the chain is still `waiting` at the moment of the write, in one
- * transaction, so concurrent workers and a manual `factory cancel` cannot conflict. `afterReconcile`
- * runs last. Each error goes to `onError` and never stops the other chains.
+ * transaction, so concurrent workers and a manual `factory cancel` cannot conflict; `update` replaces
+ * the engine state and may queue jobs (`updateWaitingChain`). `afterReconcile` runs last for the first two. Each error goes to `onError` and never stops the other chains.
  */
 export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler = defaultOnError): Promise<void> {
   let ids: number[];
@@ -140,6 +140,21 @@ export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler =
         const state = engine.finalState ? engine.finalState(parsed.data) : parsed.data;
         applied = completeWaitingChain(deps.db, id, state, deps.clock());
         finalView = { ...view, status: 'completed', state };
+      } else if (result.outcome === 'update') {
+        const newJobs = result.newJobs.map((n) => ({
+          type: n.type,
+          attempt: n.attempt,
+          policyId: deps.policies.match(n.policyKind, n.labels).id,
+          payload: n.payload,
+        }));
+        updateWaitingChain(
+          deps.db,
+          id,
+          { engineState: result.state, chainStatus: result.status, newJobs, reason: result.reason },
+          deps.clock(),
+        );
+        // No afterReconcile: the engine did its side effects before answering.
+        continue;
       } else {
         try {
           cancelChain(deps.db, id, deps.clock(), { onlyIfStatus: 'waiting' });

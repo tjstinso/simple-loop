@@ -1,5 +1,6 @@
 import type { NewJob } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
+import { parseCiPolicy } from './ci.js';
 import type { GitHost } from './github.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 
@@ -64,7 +65,7 @@ export async function softwareSubmit(
   deps.policies.match('execute', issue.labels);
   // The review job is matched with the same labels later; an ambiguous or missing review policy must
   // fail here, not after the agent ran.
-  deps.policies.match('review', issue.labels);
+  parseCiPolicy(deps.policies.match('review', issue.labels).config);
   const state = SoftwareStateSchema.parse({
     repo,
     issueNumber: number,
