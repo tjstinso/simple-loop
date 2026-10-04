@@ -86,6 +86,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         keptWorktreeMaxAgeMs: config.keptWorktreeMaxAgeMs,
         allowedAuthorAssociations: config.allowedAuthorAssociations,
         maxHumanRounds: config.maxHumanRounds,
+        maxConflictRounds: config.maxConflictRounds,
       },
       now: clock,
       // The secret guard's exact values, read at each push: the model API key, every variable whose

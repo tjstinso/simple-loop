@@ -30,6 +30,7 @@ describe('loadConfig', () => {
       keptWorktreeMaxAgeMs: 604800000,
       allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
       maxHumanRounds: 5,
+      maxConflictRounds: 2,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
     });
   });

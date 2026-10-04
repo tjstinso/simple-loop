@@ -114,6 +114,11 @@ export class FakeGitHost implements GitHost {
     return id;
   }
 
+  /** What GitHub reports for the pull request's mergeability (default `mergeable`). */
+  setMergeable(n: number, mergeable: Pr['mergeable']): void {
+    this.prOrThrow(n).mergeable = mergeable;
+  }
+
   setPrHead(n: number, sha: string): void {
     this.prOrThrow(n).headSha = sha;
   }
@@ -151,7 +156,7 @@ export class FakeGitHost implements GitHost {
   }
 
   private view(pr: StoredPr): Pr {
-    return { number: pr.number, state: pr.state, headSha: this.headOf(pr), baseBranch: pr.baseBranch };
+    return { number: pr.number, state: pr.state, headSha: this.headOf(pr), baseBranch: pr.baseBranch, mergeable: pr.mergeable };
   }
 
   // ---- GitHost ----
@@ -175,7 +180,7 @@ export class FakeGitHost implements GitHost {
     this.enter('openPr', [repo, a]);
     const number = this.nextNumber++;
     const pr: StoredPr = {
-      number, state: 'open', headSha: `fakesha-${number}`, baseBranch: a.base,
+      number, state: 'open', headSha: `fakesha-${number}`, baseBranch: a.base, mergeable: 'mergeable',
       head: a.head, title: a.title, body: a.body,
     };
     this.prs.set(number, pr);

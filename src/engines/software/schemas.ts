@@ -51,5 +51,6 @@ export type SoftwareEffect =
   | { kind: 'set_labels'; target: 'issue' | 'pr'; add: string[]; remove: string[] }
   | { kind: 'merge_pr' }
   | { kind: 'round_summary' }
+  | { kind: 'conflict_summary' }
   | { kind: 'comment'; target: 'issue' | 'pr'; body: string; marker: string }
   | { kind: 'file_followups'; followups: Followup[] };

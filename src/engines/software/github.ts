@@ -9,11 +9,28 @@ export interface Issue {
   state: 'open' | 'closed';
 }
 
+/** Whether GitHub can merge the pull request into its base: `unknown` while GitHub is still computing it. */
+export type Mergeable = 'mergeable' | 'conflicting' | 'unknown';
+
 export interface Pr {
   number: number;
   state: 'open' | 'closed' | 'merged';
   headSha: string;
   baseBranch: string;
+  mergeable: Mergeable;
+}
+
+/** REST `mergeable` and `mergeable_state`: `false` with `dirty` is a conflict, `null` is still computing. */
+export function mergeableFromRest(mergeable: boolean | null | undefined, mergeableState: string | null | undefined): Mergeable {
+  if (mergeable === true) return 'mergeable';
+  if (mergeable === false && mergeableState === 'dirty') return 'conflicting';
+  return 'unknown';
+}
+
+/** `gh pr list --json mergeable`: MERGEABLE, CONFLICTING or UNKNOWN. */
+function mergeableFromCli(v: string | null | undefined): Mergeable {
+  const m = String(v ?? '').toUpperCase();
+  return m === 'MERGEABLE' ? 'mergeable' : m === 'CONFLICTING' ? 'conflicting' : 'unknown';
 }
 
 export type PrReviewState = 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED';
@@ -165,7 +182,7 @@ export const buildGetPrArgs = (repo: string, n: number): string[] => [
 // `owner:branch` head filter, while --head takes a plain branch name.
 export const buildFindPrArgs = (repo: string, branch: string): string[] => [
   'pr', 'list', '--repo', repo, '--head', branch, '--state', 'all',
-  '--json', 'number,state,headRefOid,baseRefName', '--limit', '1',
+  '--json', 'number,state,headRefOid,baseRefName,mergeable', '--limit', '1',
 ];
 
 export const buildOpenPrArgs = (repo: string): string[] => [
@@ -245,6 +262,8 @@ interface RestPr {
   merged_at?: string | null;
   head?: { sha?: string };
   base?: { ref?: string };
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
 }
 
 interface RestUser {
@@ -342,17 +361,29 @@ export class GhCliHost implements GitHost {
   }
 
   async findPrByHead(repo: string, branch: string): Promise<Pr | null> {
-    const list = await this.json<Array<{ number: number; state: string; headRefOid: string; baseRefName: string }>>(
+    const list = await this.json<Array<{ number: number; state: string; headRefOid: string; baseRefName: string; mergeable?: string }>>(
       buildFindPrArgs(repo, branch),
     );
     const p = list[0];
     if (!p) return null;
-    return { number: p.number, state: p.state.toLowerCase() as Pr['state'], headSha: p.headRefOid, baseBranch: p.baseRefName };
+    return {
+      number: p.number,
+      state: p.state.toLowerCase() as Pr['state'],
+      headSha: p.headRefOid,
+      baseBranch: p.baseRefName,
+      mergeable: mergeableFromCli(p.mergeable),
+    };
   }
 
   private mapPr(p: RestPr): Pr {
     const state: Pr['state'] = p.merged || p.merged_at ? 'merged' : p.state === 'closed' ? 'closed' : 'open';
-    return { number: p.number, state, headSha: p.head?.sha ?? '', baseBranch: p.base?.ref ?? '' };
+    return {
+      number: p.number,
+      state,
+      headSha: p.head?.sha ?? '',
+      baseBranch: p.base?.ref ?? '',
+      mergeable: mergeableFromRest(p.mergeable, p.mergeable_state),
+    };
   }
 
   async openPr(repo: string, a: { head: string; base: string; title: string; body: string }): Promise<Pr> {

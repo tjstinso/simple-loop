@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import type { RunHooks, RunInput, Workspace } from '../runner/types.js';
 import { DeadLetterStateError, deadLetter, markDeadLetterSurfaced } from './dlq.js';
 import { commitTransition, getChain, recordResult } from './queue.js';
-import { EffectError, StaleDeliveryError } from './types.js';
+import { EffectError, HandBackError, StaleDeliveryError } from './types.js';
 import type {
   ChainView,
   DeadLetter,
@@ -165,6 +165,17 @@ async function deliver(
   const { db, clock } = deps;
   let result: unknown = job.result;
 
+  // The engine decided the job needs no run: it succeeds and the chain waits again.
+  const handBack = (e: HandBackError): DeliveryOutcome => {
+    try {
+      commitTransition(db, fence, { chainId: view.id, engineState: e.engineState, chainStatus: 'waiting', newJobs: [] }, clock());
+    } catch (err) {
+      if (err instanceof StaleDeliveryError) return 'stale';
+      throw err;
+    }
+    return 'succeeded';
+  };
+
   // Step 2: a recorded result means a previous delivery already ran the runner.
   if (result === null) {
     // Step 3: workspace.
@@ -174,6 +185,7 @@ async function deliver(
     } catch (e) {
       // An abort (worker stopping, lease lost) is not a failure of the job.
       if (signal.aborted) return 'aborted';
+      if (e instanceof HandBackError) return handBack(e);
       return fail('runner_error', `workspace prepare failed: ${message(e)}`);
     }
 
@@ -186,6 +198,7 @@ async function deliver(
       input = { ...(await engine.buildRunInput(view, job, workspace)), config: policy.config };
     } catch (e) {
       if (signal.aborted) return 'aborted';
+      if (e instanceof HandBackError) return handBack(e);
       return fail('runner_error', message(e));
     }
 

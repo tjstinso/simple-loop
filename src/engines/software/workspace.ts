@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import type { ChainView, Job, WorkspaceProvider } from '../../kernel/types.js';
 import type { Workspace } from '../../runner/types.js';
+import { conflictingPaths, looksBinary, MAX_CONFLICT_PATHS, parseUnmerged, structuralConflicts, type ConflictInfo } from './conflict.js';
 import { FACTORY_GIT_EMAIL, FACTORY_GIT_NAME, GIT_LOCAL_TIMEOUT_MS, GIT_NETWORK_TIMEOUT_MS, GIT_SSH_BATCH } from './git-ports.js';
 import { gitAuthEnv, NO_CREDENTIAL_HELPER_ARGS, type CommitIdentity, type GithubAuth } from './identity.js';
 import type { SoftwareState } from './state.js';
@@ -22,6 +23,8 @@ export interface SoftwareWorkspace extends Workspace {
   baseBranch: string;
   /** The shared cache repository (bare) holding `refs/remotes/origin/<baseBranch>`. */
   cacheDir: string;
+  /** Set on a conflict round: the result of merging `origin/<baseBranch>` into the branch (see `mergeBase`). */
+  conflict?: ConflictInfo;
 }
 
 export interface GitWorkspaceOptions {
@@ -147,6 +150,11 @@ function git(
       },
     );
   });
+}
+
+/** The execute job of a conflict round carries `payload.conflictRound`. */
+export function isConflictRound(job: Job): boolean {
+  return typeof (job.payload as { conflictRound?: unknown } | null | undefined)?.conflictRound === 'number';
 }
 
 const attempt = async (p: Promise<unknown>): Promise<void> => {
@@ -373,7 +381,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     const remoteUrl = this.opts.cloneUrlFor(repo);
     const cache = this.cachePath(repo);
 
-    return this.withCache(cache, async () => {
+    const ws: SoftwareWorkspace = await this.withCache(cache, async () => {
       await this.sanitizeLocked(cache);
       await this.ensureCache(repo);
       await this.git(cache, ['fetch', 'origin', '--prune']);
@@ -395,6 +403,46 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
 
       return { repo, path, localBranch, remoteBranch, remoteUrl, remoteHeadSha, seedSha, baseBranch, cacheDir: cache };
     });
+    if (isConflictRound(job)) ws.conflict = await this.mergeBase(ws);
+    return ws;
+  }
+
+  /**
+   * A conflict round: merges `origin/<baseBranch>` into the workspace's branch (a merge, so commits a
+   * person pushed are kept and the later push stays a fast-forward) without committing, leaving the
+   * conflicting files with conflict markers for the agent. The engine completes the merge commit
+   * after the agent ran. A conflict the agent must not get (binary, deleted on one side, more than
+   * MAX_CONFLICT_PATHS paths) is reported as a `refusal`.
+   */
+  async mergeBase(ws: SoftwareWorkspace): Promise<ConflictInfo> {
+    const { baseBranch } = ws;
+    const unmerged = () => this.git(ws.path, ['ls-files', '-u', '-z']).then(parseUnmerged);
+    try {
+      await this.git(ws.path, ['merge', '--no-commit', '--no-ff', '--no-verify', '-q', `refs/remotes/origin/${baseBranch}`]);
+    } catch (e) {
+      // A conflict exits 1 and leaves unmerged entries; a failure without any is a real one.
+      if ((await unmerged().catch(() => [])).length === 0) throw e;
+    }
+    const entries = await unmerged();
+    const paths = conflictingPaths(entries);
+    if (paths.length === 0) return { baseBranch, paths };
+    if (paths.length > MAX_CONFLICT_PATHS) return { baseBranch, paths: paths.slice(0, MAX_CONFLICT_PATHS), refusal: 'too_many' };
+    if (structuralConflicts(entries).length > 0) return { baseBranch, paths, refusal: 'deleted_modified' };
+    for (const p of paths) {
+      if (await this.isBinaryFile(join(ws.path, p))) return { baseBranch, paths, refusal: 'binary' };
+    }
+    return { baseBranch, paths };
+  }
+
+  private async isBinaryFile(file: string): Promise<boolean> {
+    const fh = await open(file, 'r');
+    try {
+      const buf = Buffer.alloc(8000);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+      return looksBinary(buf.subarray(0, bytesRead));
+    } finally {
+      await fh.close();
+    }
   }
 
   async teardown(chain: ChainView<SoftwareState>, job: Job, outcome: 'ok' | 'failed'): Promise<void> {

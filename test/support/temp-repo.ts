@@ -22,7 +22,7 @@ export interface TempRemote {
   url: string;
   path: string;
   cleanup(): void;
-  commit(branch: string, file: string, content: string): string;
+  commit(branch: string, file: string, content: string | Uint8Array): string;
 }
 
 /** A bare repository with an initial `main` commit (README.md). */
