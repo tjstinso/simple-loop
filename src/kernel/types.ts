@@ -150,7 +150,7 @@ export interface EffectOutcome<S> {
  * with their own ports; teardown belongs to `Engine.cleanup`, never the kernel.
  */
 export interface WorkspaceProvider {
-  prepare(chain: ChainView<any>, job: Job): Promise<Workspace>;
+  prepare(chain: ChainView<any>, job: Job, signal?: AbortSignal): Promise<Workspace>;
 }
 
 export type ReconcileOutcome<S = unknown> =
@@ -180,6 +180,21 @@ export interface Engine<S = unknown> {
   workspace: WorkspaceProvider;
   /** Everything the runner needs except `config`, which the kernel fills from the job's policy. */
   buildRunInput(chain: ChainView<S>, job: Job, workspace: Workspace): Promise<Omit<RunInput, 'config'>>;
+  /**
+   * Optional: called after the runner's result was validated and recorded, in the delivery that ran
+   * the runner, before the transition. `rerun(feedback)` runs the runner again in the same workspace
+   * with `feedback` and returns the validated result. Returns the result to carry on with (the same
+   * one, or one from a rerun, which is recorded in its place); throws to fail the job (an
+   * `EffectError` picks the dead-letter reason).
+   */
+  verify?(
+    chain: ChainView<S>,
+    job: Job,
+    workspace: Workspace,
+    result: unknown,
+    rerun: (feedback: string) => Promise<unknown>,
+    signal: AbortSignal,
+  ): Promise<unknown>;
   /** Pure: no I/O. */
   transition(chain: ChainView<S>, job: Job, result: unknown): Transition<S>;
   /**

@@ -13,6 +13,10 @@ import {
 } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildToolEnv, buildVerifyFeedback, runCommand, type RepoToolSettings } from './tool-run.js';
 import { defaultSleep, isTransient, neutralizeSummary, runSoftwareEffect, withHostRetry } from './effects.js';
 import { planFeedbackRound, DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS } from './feedback.js';
 import { postFeedbackReplies } from './replies.js';
@@ -57,7 +61,13 @@ export interface SoftwareEngineDeps {
     maxConflictRounds?: number;
     /** CI rounds (revisions for failing required checks) one chain gets (default 2). */
     maxCiRounds?: number;
+    /** Per repository (`owner/name`): setup and verification commands (a repository without an entry has none). */
+    repos?: Record<string, RepoToolSettings>;
   };
+  /** The environment the tool environment is built from (default `process.env`). */
+  env?: () => NodeJS.ProcessEnv;
+  /** Variable names that never reach a setup or verify command (the GitHub token variable). */
+  withheldEnv?: readonly string[];
   sleep?: (ms: number) => Promise<void>;
   /** Reports an error that does not stop the work (a feedback reply that could not be posted). */
   onError?: (err: unknown, context: string) => void;
@@ -365,8 +375,56 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     });
   }
 
+  const jobEvent = (chain: ChainView<any>, job: Job, kind: string, detail: Record<string, unknown>) =>
+    recordEvent(deps.db, { at: deps.now(), chainId: chain.id, jobId: job.id, delivery: job.delivery, kind, engine: 'software', detail });
+  const show = (argv: readonly string[]) => redact(argv.join(' ')).slice(0, 200);
+
+  /**
+   * Runs `commands` in order in the workspace with the tool environment (an empty per-run HOME that
+   * is removed afterwards). Stops at the first command that does not exit 0.
+   */
+  async function runCommands(
+    ws: Workspace,
+    commands: string[][],
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+  ): Promise<{ failed?: { argv: string[]; exitCode: number | null; output: string; timedOut: boolean; spawnError?: string } }> {
+    const home = await mkdtemp(join(tmpdir(), 'factory-tool-home-'));
+    try {
+      const env = buildToolEnv(deps.env?.() ?? process.env, { home, ...(deps.withheldEnv === undefined ? {} : { withheld: deps.withheldEnv }) });
+      for (const argv of commands) {
+        const r = await runCommand(argv, { cwd: ws.path, env, timeoutMs, ...(signal === undefined ? {} : { signal }) });
+        if (r.exitCode !== 0) return { failed: { argv, exitCode: r.exitCode, output: r.output, timedOut: r.timedOut, ...(r.spawnError === undefined ? {} : { spawnError: r.spawnError }) } };
+      }
+      return {};
+    } finally {
+      await rm(home, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** The repository's `setup` commands; a failure throws an error naming the command, never its output. */
+  async function runSetup(chain: ChainView<SoftwareState>, job: Job, ws: Workspace, signal: AbortSignal | undefined): Promise<void> {
+    const cfg = deps.config.repos?.[chain.state.repo];
+    const commands = cfg?.setup ?? [];
+    if (commands.length === 0) return;
+    const started = Date.now();
+    const r = await runCommands(ws, commands, cfg?.setupTimeoutMs ?? 300_000, signal);
+    const ms = Date.now() - started;
+    jobEvent(chain, job, 'workspace.setup', {
+      commands: commands.map((c) => c[0]),
+      durationMs: ms,
+      ok: r.failed === undefined,
+      ...(r.failed === undefined ? {} : { failed: show(r.failed.argv), exitCode: r.failed.exitCode }),
+    });
+    if (r.failed) {
+      const f = r.failed;
+      const why = f.timedOut ? 'timed out' : f.spawnError !== undefined ? 'could not start' : `exit code ${f.exitCode}`;
+      throw new Error(`setup command failed (${why}): ${show(f.argv)}`);
+    }
+  }
+
   const workspace: WorkspaceProvider = {
-    async prepare(chain: ChainView<any>, job: Job): Promise<Workspace> {
+    async prepare(chain: ChainView<any>, job: Job, signal?: AbortSignal): Promise<Workspace> {
       const ws = await deps.workspaces.prepare(chain, job);
       const conflict = (ws as SoftwareWorkspace).conflict;
       if (conflict && job.type === 'execute') {
@@ -385,6 +443,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         });
         if (conflict.refusal !== undefined || conflict.paths.length === 0) await handBackConflict(chain, job, conflict);
       }
+      await runSetup(chain, job, ws, signal);
       cache.set(key(chain.id, job.id, job.delivery), ws as SoftwareWorkspace);
       return ws;
     },
@@ -419,6 +478,47 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         pr = { number: found.number, baseBranch: (ws as SoftwareWorkspace).baseBranch };
       }
       return buildSoftwareRunInput(chain, job, ws as SoftwareWorkspace, issue, pr);
+    },
+
+    async verify(chain, job, ws, result, rerun, signal) {
+      const cfg = deps.config.repos?.[chain.state.repo];
+      const commands = cfg?.verify ?? [];
+      const first = result as { status?: string; costUsd?: number };
+      if (job.type !== 'execute' || commands.length === 0 || first.status !== 'ok') return result;
+      const maxRounds = Math.max(1, cfg?.maxVerifyRounds ?? 3);
+      const timeoutMs = cfg?.verifyTimeoutMs ?? 600_000;
+      let current = result as Record<string, unknown> & { status?: string; costUsd?: number };
+      let cost: number | undefined = first.costUsd;
+      let verifyMs = 0;
+      let rounds = 0;
+      for (let round = 0; ; round++) {
+        jobEvent(chain, job, 'verify.started', { commands: commands.map((c) => c[0]), round });
+        const started = Date.now();
+        const r = await runCommands(ws, commands, timeoutMs, signal);
+        const ms = Date.now() - started;
+        verifyMs += ms;
+        if (signal.aborted) throw new Error('aborted');
+        if (!r.failed) {
+          jobEvent(chain, job, 'verify.passed', { round, durationMs: ms });
+          break;
+        }
+        const f = r.failed;
+        jobEvent(chain, job, 'verify.failed', { command: show(f.argv), exitCode: f.exitCode, round, durationMs: ms });
+        if (round >= maxRounds) {
+          throw new EffectError(`verification failed after ${round} round(s) of fixes: ${show(f.argv)} (exit code ${f.exitCode ?? 'none'})`, 'runner_error');
+        }
+        const feedback = buildVerifyFeedback(f.argv, f.exitCode, f.spawnError ?? f.output, deps.secretValues?.() ?? []);
+        rounds++;
+        const next = (await rerun(feedback)) as typeof current;
+        if (typeof next.costUsd === 'number') cost = (cost ?? 0) + next.costUsd;
+        // The rerun answers the same attempt: feedbackResponses and followups it leaves out stay as the previous run reported them.
+        const { feedbackResponses, followups } = current;
+        current = { ...next };
+        if (current.feedbackResponses === undefined && feedbackResponses !== undefined) current.feedbackResponses = feedbackResponses;
+        if (current.followups === undefined && followups !== undefined) current.followups = followups;
+        if (next.status !== 'ok') break;
+      }
+      return { ...current, ...(cost === undefined ? {} : { costUsd: cost }), verifyDurationMs: verifyMs, verifyRounds: rounds };
     },
 
     transition(chain, job, result) {

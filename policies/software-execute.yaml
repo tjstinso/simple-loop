@@ -22,7 +22,8 @@ config:
 
     Rules:
     - Read the relevant code first, then make the changes with the editing tools. Run the
-      project's tests or checks where they exist and fix what you break.
+      project's tests or checks where they exist and fix what you break. The project's
+      dependencies are installed, so run the tests before finishing.
     - Do NOT push, open pull requests, change git remotes or git config, or touch anything
       outside this checkout. The factory publishes the result itself.
     - Do not commit; the factory commits for you. If you do commit, leave the tree consistent.

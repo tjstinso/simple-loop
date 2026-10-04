@@ -15,6 +15,20 @@ const GithubSchema = z
     path: ['expectLogin'],
   });
 
+const CommandSchema = z.array(z.string().min(1)).min(1);
+
+/** What one repository needs to be built and tested; commands are argument arrays, never shell strings. */
+export const RepoToolSchema = z
+  .object({
+    setup: z.array(CommandSchema).optional(),
+    verify: z.array(CommandSchema).optional(),
+    setupTimeoutMs: z.number().int().min(1).default(300_000),
+    verifyTimeoutMs: z.number().int().min(1).default(600_000),
+    maxVerifyRounds: z.number().int().min(1).default(3),
+  })
+  .strict();
+export type RepoToolConfig = z.infer<typeof RepoToolSchema>;
+
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
   policiesDir: z.string().min(1).optional(),
@@ -39,6 +53,7 @@ const ConfigSchema = z.object({
   maxTransientRetries: z.number().int().min(1).default(8),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
+  repos: z.record(z.string().regex(/^[^/\s]+\/[^/\s]+$/, 'must be owner/name'), RepoToolSchema).optional(),
 }).superRefine((c, ctx) => {
   for (const [name, override] of Object.entries(c.policyOverrides ?? {})) {
     const bad = forbiddenOverrideKey(override);

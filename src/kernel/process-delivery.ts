@@ -201,7 +201,7 @@ async function deliver(
     // Step 3: workspace.
     let workspace: Workspace;
     try {
-      workspace = await engine.workspace.prepare(view, job);
+      workspace = await engine.workspace.prepare(view, job, signal);
     } catch (e) {
       // An abort (worker stopping, lease lost) is not a failure of the job.
       if (signal.aborted) return 'aborted';
@@ -270,6 +270,31 @@ async function deliver(
     } catch (e) {
       if (e instanceof StaleDeliveryError) return 'stale';
       throw e;
+    }
+
+    // Optional engine verification of the workspace; it may rerun the runner with feedback.
+    if (engine.verify) {
+      const rerun = async (feedback: string): Promise<unknown> => {
+        const again = await runner.run({ ...input, feedback: input.feedback ? `${input.feedback}\n\n${feedback}` : feedback }, signal, hooks);
+        const rechecked = schema.safeParse(again);
+        if (!rechecked.success) {
+          const issues = rechecked.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ');
+          throw new EffectError(`result for job type '${job.type}' failed its schema: ${issues}`, 'runner_error');
+        }
+        return rechecked.data;
+      };
+      try {
+        const verified = await engine.verify(view, job, workspace, result, rerun, signal);
+        if (verified !== result) {
+          result = verified;
+          recordResult(db, fence, result);
+        }
+      } catch (e) {
+        if (e instanceof StaleDeliveryError) return 'stale';
+        if (signal.aborted) return 'aborted';
+        if (isTimeout(e)) return fail('timeout', message(e));
+        return fail(e instanceof EffectError ? e.reason : 'runner_error', message(e));
+      }
     }
   }
 
