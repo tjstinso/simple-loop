@@ -212,12 +212,48 @@ describe('ExecGitPorts', () => {
       expect(c.text.split('\n')).toContain('hidden content');
     });
 
-    it("scans a binary file's content as text", async () => {
-      writeFileSync(join(ws.path, 'blob.bin'), Buffer.from([0, 1, 2, 0, 0x41, 0x42, 0x43, 0x0a]));
+    it("scans a binary file's printable strings (ASCII and UTF-16), not short runs", async () => {
+      writeFileSync(
+        join(ws.path, 'blob.bin'),
+        Buffer.concat([
+          Buffer.from([0, 1, 2, 0]),
+          Buffer.from('ABCDEFGHIJ'),
+          Buffer.from([0, 0xfe]),
+          Buffer.from('short'),
+          Buffer.from([0]),
+          Buffer.from('utf16-little-endian', 'utf16le'),
+          Buffer.from([0, 0, 1]),
+          Buffer.from('\u0000b\u0000i\u0000g\u0000-\u0000e\u0000n\u0000d\u0000i\u0000a\u0000n', 'latin1'),
+          Buffer.from([0xff]),
+        ]),
+      );
       await ports.commitAll(ws, 'bin');
       const c = await ports.addedChanges(ws, await ports.headSha(ws));
       expect(c.paths).toEqual(['blob.bin']);
-      expect(c.text).toContain('ABC');
+      const lines = c.text.split('\n');
+      expect(lines).toContain('ABCDEFGHIJ');
+      expect(lines).toContain('utf16-little-endian');
+      expect(lines).toContain('big-endian');
+      expect(lines).not.toContain('short');
+    });
+
+    it('a random binary larger than the cap is not truncated; its strings are scanned', async () => {
+      // Deterministic pseudo-random bytes (xorshift), so the test is reproducible.
+      let x = 0x12345678;
+      const random = (n: number) => {
+        const b = Buffer.alloc(n);
+        for (let i = 0; i < n; i++) {
+          x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+          b[i] = x & 0xff;
+        }
+        return b;
+      };
+      writeFileSync(join(ws.path, 'asset.bin'), Buffer.concat([random(3000), Buffer.from('\u0000hidden-ascii-marker\u0000'), random(3000)]));
+      const capped = new ExecGitPorts({ scanCapBytes: 4096 });
+      await capped.commitAll(ws, 'asset');
+      const c = await capped.addedChanges(ws, await capped.headSha(ws));
+      expect(c.truncated).toBe(false);
+      expect(c.text.split('\n')).toContain('hidden-ascii-marker');
     });
 
     it('a file marked binary in the shared info/attributes is still scanned', async () => {
@@ -238,6 +274,15 @@ describe('ExecGitPorts', () => {
       const c = await small.addedChanges(ws, await ports.headSha(ws));
       expect(c.truncated).toBe(true);
       expect(Buffer.byteLength(c.text)).toBeLessThanOrEqual(64);
+    });
+
+    it('the text cap counts raw bytes, not decoded characters', async () => {
+      // Invalid UTF-8 decodes to U+FFFD (3 bytes each); the cap must count the 1 raw byte.
+      // No NUL bytes: git treats the file as text, so it goes through the patch scan.
+      writeFileSync(join(ws.path, 'latin.txt'), Buffer.concat([Buffer.alloc(300, 0xe9), Buffer.from('\n')]));
+      const capped = new ExecGitPorts({ scanCapBytes: 900 });
+      await capped.commitAll(ws, 'latin');
+      expect((await capped.addedChanges(ws, await capped.headSha(ws))).truncated).toBe(false);
       expect((await new ExecGitPorts({ scanCapBytes: 4096 }).addedChanges(ws, await ports.headSha(ws))).truncated).toBe(false);
     });
 

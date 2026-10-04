@@ -147,7 +147,7 @@ function stream(
   cwd: string,
   args: string[],
   timeoutMs: number,
-  onData: (chunk: string) => boolean,
+  onData: (chunk: Buffer) => boolean,
   input?: string,
 ): Promise<{ code: number; stderr: string; stopped: boolean }> {
   return new Promise((resolve) => {
@@ -162,9 +162,8 @@ function stream(
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
-    child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
+    child.stdout.on('data', (chunk: Buffer) => {
       if (stopped) return;
       if (!onData(chunk)) {
         stopped = true;
@@ -176,7 +175,7 @@ function stream(
     });
     const finish = (code: number, err?: string) => {
       clearTimeout(timer);
-      if (timedOut && !stopped) return resolve({ code: -1, stderr: `git ${args[0]} timed out after ${timeoutMs} ms`, stopped });
+      if (timedOut && !stopped) return resolve({ code: -1, stderr: `git ${subcommand(args)} timed out after ${timeoutMs} ms`, stopped });
       resolve({ code, stderr: err ?? stderr, stopped });
     };
     child.on('error', (e) => finish(1, e.message));
@@ -185,8 +184,10 @@ function stream(
 }
 
 /**
- * Collects text up to `capBytes` (UTF-8). `add` returns false once the cap is hit; whatever did not
- * fit is dropped and `truncated` is set.
+ * Collects lines up to `capBytes` of RAW bytes (each line's bytes plus its newline, before decoding:
+ * an invalid UTF-8 byte counts as one byte, not as the three of U+FFFD). Lines are decoded as UTF-8
+ * for scanning. `add` returns false once the cap is hit; whatever did not fit is dropped and
+ * `truncated` is set.
  */
 class CappedText {
   private readonly parts: string[] = [];
@@ -195,21 +196,21 @@ class CappedText {
 
   constructor(private readonly capBytes: number) {}
 
-  add(line: string): boolean {
+  add(line: Buffer | string): boolean {
     if (this.truncated) return false;
-    const size = Buffer.byteLength(line, 'utf8') + 1;
+    const size = (typeof line === 'string' ? Buffer.byteLength(line, 'utf8') : line.length) + 1;
     if (this.bytes + size > this.capBytes) {
       this.truncated = true;
       return false;
     }
-    this.parts.push(line);
+    this.parts.push(typeof line === 'string' ? line : line.toString('utf8'));
     this.bytes += size;
     return true;
   }
 
-  /** True when `pending` (an incomplete line) could no longer fit: stop reading. */
-  overflows(pending: string): boolean {
-    if (this.bytes + pending.length > this.capBytes) this.truncated = true;
+  /** True when `pendingBytes` (an incomplete line) could no longer fit: stop reading. */
+  overflows(pendingBytes: number): boolean {
+    if (this.bytes + pendingBytes > this.capBytes) this.truncated = true;
     return this.truncated;
   }
 
@@ -218,28 +219,130 @@ class CappedText {
   }
 }
 
-/** Splits streamed chunks into lines, handing each complete line to `onLine`. */
-function lineSplitter(onLine: (line: string) => boolean, overflows: (pending: string) => boolean) {
-  let rest = '';
+/**
+ * Splits streamed chunks into lines at newline BYTES (a newline never occurs inside a UTF-8
+ * multi-byte sequence), handing each complete line to `onLine` as raw bytes.
+ */
+function lineSplitter(onLine: (line: Buffer) => boolean, overflows: (pendingBytes: number) => boolean) {
+  let rest: Buffer = Buffer.alloc(0);
   return {
-    push(chunk: string): boolean {
-      const lines = (rest + chunk).split('\n');
-      rest = lines.pop() ?? '';
-      for (const l of lines) if (!onLine(l)) return false;
-      return !overflows(rest);
+    push(chunk: Buffer): boolean {
+      const buf = rest.length === 0 ? chunk : Buffer.concat([rest, chunk]);
+      let start = 0;
+      for (let nl = buf.indexOf(0x0a, start); nl !== -1; nl = buf.indexOf(0x0a, start)) {
+        if (!onLine(buf.subarray(start, nl))) return false;
+        start = nl + 1;
+      }
+      rest = Buffer.from(buf.subarray(start));
+      return !overflows(rest.length);
     },
     end(): boolean {
       const last = rest;
-      rest = '';
-      return last === '' || onLine(last);
+      rest = Buffer.alloc(0);
+      return last.length === 0 || onLine(last);
     },
   };
+}
+
+/** Minimum length of a printable run `StringsExtractor` keeps. */
+export const MIN_STRING_RUN = 8;
+const isPrintable = (b: number) => (b >= 0x20 && b <= 0x7e) || b === 0x09;
+
+/**
+ * Extracts printable strings from binary content, like `strings`: runs of at least MIN_STRING_RUN
+ * printable ASCII bytes, and runs of printable characters interleaved with NUL bytes (UTF-16LE and
+ * UTF-16BE, at both byte alignments). Streams: content can arrive in any number of chunks. Each run
+ * is handed to `emit` as one line; `emit` returning false stops the extraction.
+ */
+class StringsExtractor {
+  private ascii: number[] = [];
+  // UTF-16 runs per alignment (index = the parity of the pair's first byte offset).
+  private le: number[][] = [[], []];
+  private be: number[][] = [[], []];
+  private pos = 0;
+  private prev = -1;
+  stopped = false;
+
+  constructor(private readonly emit: (run: string) => boolean) {}
+
+  private flush(run: number[]): void {
+    if (!this.stopped && run.length >= MIN_STRING_RUN && !this.emit(String.fromCharCode(...run))) this.stopped = true;
+    run.length = 0;
+  }
+
+  private grow(run: number[], b: number): void {
+    run.push(b);
+    // One huge run: emit it in pieces so memory stays bounded (the cap still applies to the total).
+    if (run.length >= 64 * 1024) this.flush(run);
+  }
+
+  push(chunk: Buffer): boolean {
+    for (const b of chunk) {
+      if (this.stopped) return false;
+      if (isPrintable(b)) this.grow(this.ascii, b);
+      else this.flush(this.ascii);
+      if (this.prev !== -1) {
+        // (prev, b) is a byte pair whose first byte sits at pos - 1.
+        const parity = (this.pos - 1) & 1;
+        const le = this.le[parity]!;
+        const be = this.be[parity]!;
+        if (isPrintable(this.prev) && b === 0) this.grow(le, this.prev);
+        else this.flush(le);
+        if (this.prev === 0 && isPrintable(b)) this.grow(be, b);
+        else this.flush(be);
+      }
+      this.prev = b;
+      this.pos++;
+    }
+    return !this.stopped;
+  }
+
+  end(): void {
+    this.flush(this.ascii);
+    for (const r of [...this.le, ...this.be]) this.flush(r);
+  }
 }
 
 async function must(cwd: string, args: string[], timeoutMs: number, input?: string, scan = false): Promise<string> {
   const r = await run(cwd, args, timeoutMs, input, scan);
   if (r.code !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
   return r.stdout.trim();
+}
+
+/**
+ * Parses `git log --format=%x01 --raw --numstat --no-abbrev -z`: the changed paths, and the new blob
+ * of every regular file (or symlink) that numstat reports as binary (`-\t-`).
+ */
+function parseChangeListing(out: string): { paths: string[]; binaryBlobs: string[] } {
+  const RAW = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) [A-Z]$/;
+  const NUMSTAT = /^(-|\d+)\t(-|\d+)\t([\s\S]*)$/;
+  const paths = new Set<string>();
+  const binaryBlobs = new Set<string>();
+  let blobOf = new Map<string, string>();
+  const tokens = out.split('\0');
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!.replace(/^\n+/, '');
+    if (t === '') continue;
+    if (t.startsWith('\u0001')) {
+      blobOf = new Map();
+      continue;
+    }
+    const raw = RAW.exec(t);
+    if (raw) {
+      const path = tokens[++i] ?? '';
+      if (path === '') continue;
+      paths.add(path);
+      // Gitlinks (160000) point at commits in other repositories: nothing to read here.
+      if (raw[2] !== '160000' && SHA_RE.test(raw[4]!)) blobOf.set(path, raw[4]!);
+      continue;
+    }
+    const num = NUMSTAT.exec(t);
+    if (num && num[1] === '-' && num[2] === '-') {
+      const blob = blobOf.get(num[3]!);
+      if (blob) binaryBlobs.add(blob);
+    }
+  }
+  return { paths: [...paths], binaryBlobs: [...binaryBlobs] };
 }
 
 export interface ExecGitPortsOptions {
@@ -321,13 +424,20 @@ export class ExecGitPorts implements GitPorts {
     const perCommit = ['--no-color', '--diff-merges=first-parent', range];
 
     // Paths added, modified or type-changed by any commit (renames as delete + add, so a file renamed
-    // to `.env` is listed). NUL-separated: odd names survive.
-    const names = await run(ws.path, ['log', '--format=', '--name-only', '--no-renames', '--diff-filter=AMT', '-z', ...perCommit], this.local, undefined, true);
-    if (names.code !== 0) throw new Error(`git log failed: ${names.stderr.trim() || `exit ${names.code}`}`);
-    const paths = [...new Set(names.stdout.split('\0').filter((p) => p !== ''))];
+    // to `.env` is listed), with their new blob and whether git considers them binary (numstat
+    // `-\t-`). NUL-separated: odd names survive.
+    const listing = await run(
+      ws.path,
+      ['log', '--format=%x01', '--raw', '--numstat', '--no-abbrev', '--no-renames', '--diff-filter=AMT', '-z', ...perCommit],
+      this.local,
+      undefined,
+      true,
+    );
+    if (listing.code !== 0) throw new Error(`git log failed: ${listing.stderr.trim() || `exit ${listing.code}`}`);
+    const { paths, binaryBlobs } = parseChangeListing(listing.stdout);
 
     const out = new CappedText(this.scanCap);
-    const collect = async (args: string[], onLine: (line: string) => boolean, input?: string) => {
+    const collect = async (args: string[], onLine: (line: Buffer) => boolean, input?: string) => {
       if (out.truncated) return;
       const lines = lineSplitter(onLine, (pending) => out.overflows(pending));
       const r = await stream(ws.path, args, this.local, (chunk) => lines.push(chunk), input);
@@ -345,20 +455,34 @@ export class ExecGitPorts implements GitPorts {
     if (shas.length > 0) await collect(['cat-file', '--batch'], (line) => out.add(line), `${shas.join('\n')}\n`);
     await collect(['log', '--format=%B', ...perCommit], (line) => out.add(line));
 
-    // Added lines only (`+` lines inside hunks; the `+++` file header is outside them, so an added
-    // line that itself starts with `++` is kept). `--text` diffs every file as text, so neither real
-    // binary content nor a `-diff`/`binary` attribute (in the change or in the shared repository's
-    // info/attributes) hides lines; no external diff and no textconv.
+    // Added lines of text files only (`+` lines inside hunks; the `+++` file header is outside them,
+    // so an added line that itself starts with `++` is kept). No external diff and no textconv.
     let inHunk = false;
+    const HUNK = Buffer.from('@@');
+    const DIFF = Buffer.from('diff --git ');
     await collect(
-      ['log', '--format=', '-p', '--text', '--unified=0', '--no-ext-diff', '--no-textconv', '-M', ...perCommit],
+      ['log', '--format=', '-p', '--unified=0', '--no-ext-diff', '--no-textconv', '-M', ...perCommit],
       (line) => {
-        if (line.startsWith('diff --git ')) inHunk = false;
-        else if (line.startsWith('@@')) inHunk = true;
-        else if (inHunk && line.startsWith('+')) return out.add(line.slice(1));
+        if (line.subarray(0, DIFF.length).equals(DIFF)) inHunk = false;
+        else if (line.subarray(0, 2).equals(HUNK)) inHunk = true;
+        else if (inHunk && line[0] === 0x2b) return out.add(line.subarray(1));
         return true;
       },
     );
-    return { paths, text: out.text(), truncated: out.truncated };
+
+    // Files git considers binary (real binary content, or a `-diff`/`binary` attribute, from the
+    // change or the shared repository's info/attributes): their printable strings, ASCII and UTF-16,
+    // from the whole new blob, under their own cap. Random-like assets yield few strings.
+    const strings = new CappedText(this.scanCap);
+    for (const blob of binaryBlobs) {
+      if (strings.truncated) break;
+      const extractor = new StringsExtractor((run) => strings.add(run));
+      const r = await stream(ws.path, ['cat-file', 'blob', blob], this.local, (chunk) => extractor.push(chunk));
+      if (r.stopped) break;
+      if (r.code !== 0) throw new Error(`git cat-file failed: ${r.stderr.trim() || `exit ${r.code}`}`);
+      extractor.end();
+    }
+    const text = [out.text(), strings.text()].filter((t) => t !== '').join('\n');
+    return { paths, text, truncated: out.truncated || strings.truncated };
   }
 }

@@ -135,7 +135,7 @@ Recover:
 1. Create an issue whose Goal says: "Create `fixtures/token.txt` containing exactly the text `ghp_` followed by 36 letters `a`." (Describe the token instead of pasting one, so the issue itself holds no token-shaped string.) Submit it and run the worker.
 2. Expected: the execute job is dead-lettered with reason `runner_error` and the error `effect 'commit_push' failed: refusing to push: the change contains a secret (github-token); the matched text is not shown`; the issue gets `factory:dead-letter` and a comment with that message and no token; no branch `factory/issue-<n>` exists on GitHub and no PR was opened; the kept worktree contains `fixtures/token.txt`.
 3. Clean up: `factory dlq discard <job-id>` and delete the kept worktree.
-4. Optional, binary variant: ask instead for `fixtures/data.bin` holding a NUL byte followed by the same token text (for example written with `printf`). Expected: the same refusal; the scan reads binary content as text.
+4. Optional, binary variant: ask instead for `fixtures/data.bin` holding a NUL byte followed by the same token text (for example written with `printf`). Expected: the same refusal; the scan extracts the printable strings of binary files.
 
 ## What only a real run can confirm
 

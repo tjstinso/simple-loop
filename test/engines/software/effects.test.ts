@@ -363,6 +363,42 @@ describe('runSoftwareEffect', () => {
         expect(git(remote.path, ['ls-tree', '-r', '--name-only', remoteHead()])).not.toContain('late.txt');
       });
 
+      describe('binary files at the real 5 MiB cap', () => {
+        let seed = 0x9e3779b9;
+        const random = (n: number) => {
+          const b = Buffer.alloc(n);
+          for (let i = 0; i < n; i++) {
+            seed ^= seed << 13; seed >>>= 0; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0;
+            b[i] = seed & 0xff;
+          }
+          return b;
+        };
+        const MiB = 1024 * 1024;
+
+        for (const size of [4, 6]) {
+          it(`a ${size} MiB random binary passes`, async () => {
+            const ws = await provider.prepare(chain(), job());
+            writeFileSync(join(ws.path, 'asset.bin'), random(size * MiB));
+            await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports, secretValues: secrets }), fence());
+            expect(remoteHead()).toBe(git(ws.path, ['rev-parse', 'HEAD']));
+          }, 60_000);
+        }
+
+        it('a key hidden among random bytes is refused (plain and UTF-16LE)', async () => {
+          for (const encoded of [Buffer.from(API_KEY), Buffer.from(API_KEY, 'utf16le')]) {
+            const ws = await provider.prepare(chain(), job({ id: 42 + encoded.length }));
+            writeFileSync(join(ws.path, 'asset.bin'), Buffer.concat([random(MiB), encoded, random(MiB)]));
+            expect((await refuse(ws)).message).toMatch(/anthropic-key, known-secret-value/);
+          }
+        }, 60_000);
+
+        it('a text file over 5 MiB is still refused as scan-truncated', async () => {
+          const ws = await provider.prepare(chain(), job());
+          writeFileSync(join(ws.path, 'big.txt'), ('t'.repeat(99) + '\n').repeat(Math.ceil((5 * MiB + 1) / 100)));
+          expect((await refuse(ws)).message).toMatch(/\(scan-truncated\)/);
+        }, 60_000);
+      });
+
       it('a scan that hit its cap refuses the push as scan-truncated', async () => {
         const ws = await provider.prepare(chain(), job());
         writeFileSync(join(ws.path, 'big.txt'), 'z'.repeat(500) + '\n');
