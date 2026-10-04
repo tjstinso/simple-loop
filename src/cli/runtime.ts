@@ -49,6 +49,13 @@ export function buildRuntime(config: FactoryConfig): Runtime {
   let lazy: LazyGithubAuth | undefined;
   try {
     migrate(db, [FOLLOWUPS_DDL]);
+    const kernelConfig = {
+      leaseMs: config.leaseMs,
+      heartbeatMs: config.heartbeatMs,
+      maxDeliveries: config.maxDeliveries,
+      ...(config.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: config.maxConcurrentJobs }),
+      historyRetentionDays: config.historyRetentionDays,
+    };
     const effectivePolicies = resolvePolicies({
       policiesDir: config.policiesDir,
       shippedPolicies: config.shippedPolicies,
@@ -111,13 +118,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       policies,
       clock,
       onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),
-      config: {
-        leaseMs: config.leaseMs,
-        heartbeatMs: config.heartbeatMs,
-        maxDeliveries: config.maxDeliveries,
-        ...(config.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: config.maxConcurrentJobs }),
-        historyRetentionDays: config.historyRetentionDays,
-      },
+      config: kernelConfig,
     });
     const expectLogin = gh?.expectLogin;
     return {
