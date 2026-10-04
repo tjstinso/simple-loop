@@ -1,4 +1,6 @@
 import { parseArgs } from 'node:util';
+import { DEFAULT_HOST, DEFAULT_PORT, isLoopback, startDashboard } from '../dashboard/server.js';
+import { openReadOnlyDb } from '../kernel/db.js';
 import { listDeadLetters } from '../kernel/dlq.js';
 import { recentEvents, type EventRow } from '../kernel/events.js';
 import {
@@ -36,6 +38,7 @@ const USAGE = `Usage:
   factory [--config <path>] dlq discard <job-id>
   factory [--config <path>] cancel <chain-id>
   factory [--config <path>] policies
+  factory [--config <path>] dashboard [--port <n>] [--host <addr>]
 Options:
   --config <path>   config file (default ./factory.config.json)
   -h, --help        print this help`;
@@ -306,6 +309,50 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
   }
 }
 
+/** `factory dashboard`: a read-only HTTP server over the database; it never builds the runtime (no GitHub, no writes). */
+async function runDashboard(
+  args: string[],
+  config: string | undefined,
+  cwd: string,
+  deps: Required<Pick<CliDeps, 'stdout' | 'stderr' | 'onSignal'>>,
+): Promise<number> {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { port: { type: 'string' }, host: { type: 'string' } },
+  });
+  if (positionals.length > 0) throw new UsageError('dashboard takes no arguments');
+  let port = DEFAULT_PORT;
+  if (values.port !== undefined) {
+    if (!/^[0-9]+$/.test(values.port) || Number(values.port) > 65535) throw new UsageError('--port must be an integer from 0 to 65535');
+    port = Number(values.port);
+  }
+  const host = values.host ?? DEFAULT_HOST;
+  if (host === '') throw new UsageError('--host needs an address');
+  const db = openReadOnlyDb(loadConfig(config, cwd).dbPath);
+  let dash;
+  try {
+    dash = await startDashboard({ db, host, port });
+  } catch (e) {
+    db.close();
+    throw e;
+  }
+  if (!isLoopback(host)) {
+    deps.stderr(`warning: the dashboard is bound to ${host} and has no authentication; anyone who can reach it can read your factory data`);
+  }
+  deps.stdout(`dashboard listening on http://${host.includes(':') ? `[${host}]` : host}:${dash.port}`);
+  const stopped = new Promise<void>((resolve) => {
+    const stop = () => resolve();
+    deps.onSignal('SIGINT', stop);
+    deps.onSignal('SIGTERM', stop);
+  });
+  await stopped;
+  await dash.close();
+  db.close();
+  deps.stdout('dashboard stopped');
+  return 0;
+}
+
 export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   const cwd = deps.cwd ?? process.cwd();
   const stdout = deps.stdout ?? ((l: string) => console.log(l));
@@ -342,6 +389,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   const built = runtime === undefined;
   try {
     if (command[0] === undefined) return usageError('missing command');
+    if (command[0] === 'dashboard') return await runDashboard(command.slice(1), config, cwd, { stdout, stderr, onSignal });
     if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel', 'policies'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
