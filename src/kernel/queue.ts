@@ -218,6 +218,20 @@ export function commitTransition(
   }).immediate();
 }
 
+/**
+ * Completes a chain that is still `waiting`, storing `engineState`, in one transaction. Returns false
+ * (writing nothing) when the chain is in any other status, so concurrent reconcilers and a manual
+ * cancel cannot overwrite each other.
+ */
+export function completeWaitingChain(db: Db, chainId: number, engineState: unknown, now: number): boolean {
+  const r = db
+    .prepare(
+      `UPDATE chains SET status = 'completed', engine_state = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`,
+    )
+    .run(JSON.stringify(engineState), now, chainId);
+  return r.changes === 1;
+}
+
 /** Mark a running job failed. Throws StaleDeliveryError if the fence is stale. */
 export function failJob(db: Db, fence: Fence, error: string): void {
   const r = db

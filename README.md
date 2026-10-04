@@ -30,7 +30,14 @@ REVIEW   claude reviews the PR branch (read-only tools)
    +-- request_changes ----> attempt < 3: new EXECUTE job with the feedback, same branch
    |                         attempt = 3: PR labeled factory:needs-human
    +-- machinery failure --> dead-letter queue; issue labeled factory:dead-letter
+
+waiting (awaiting_merge / needs_human), checked by every worker's maintenance pass (60 s):
+   +-- PR merged ----------> chain completed, factory labels removed, one comment on the issue
+   +-- PR closed unmerged -> chain cancelled, factory labels removed, one comment on the issue
+   +-- PR still open ------> nothing
 ```
+
+**Reconciling waiting chains.** A chain waiting on a person (`awaiting_merge` or `needs_human`) finishes by itself when the pull request is settled. Every maintenance pass (every 60 seconds in every worker, so the latency is up to a minute plus the time of the pass) looks up the pull request of each `waiting` chain once, by its branch `factory/issue-<n>`. A merged pull request completes the chain (phase `merged`); one closed without merging cancels it, which frees the issue for a new `submit`. Either way the factory removes `factory:ready-for-merge`, `factory:needs-human`, `factory:in-progress` and `factory:dead-letter` from the issue and posts one comment (`Pull request #<n> was merged` or `Pull request #<n> was closed without merging; this chain was cancelled`, hidden marker so it is never posted twice). An open pull request, a missing one and a transient GitHub failure (no HTTP status, 429, 5xx) leave the chain as it is; the next pass retries. A failure to label or comment is printed as an error and does not undo the transition. The change only applies to a chain that is still `waiting`, so a concurrent `factory cancel` or a second worker never conflicts. `dead_lettered` and `active` chains are not reconciled. `factory cancel` keeps working for manual use.
 
 The profile is `supervised` unless the issue carries the label `factory:profile:automatic` at submit time (or `defaultProfile` in the config says otherwise). Both profiles allow 3 attempts. Follow-up items that the agent or reviewer report are filed as new issues labeled `factory:followup`.
 
@@ -187,7 +194,7 @@ discarded job 1
 
 If labelling the issue fails when a job is dead-lettered (for example GitHub answers 502), the dead letter is recorded as not yet surfaced, and every maintenance pass (once a minute, in any running worker) retries the label and comment until they succeed.
 
-**cancel.** Ends a chain by hand, typically a `waiting` one: a supervised PR you merged or closed yourself, a `needs-human` PR you dealt with, or an issue you want to resubmit. It cancels the chain and its queued jobs, resolves its dead letters, frees the subject for a new `submit`, and removes `factory:in-progress`, `factory:needs-human`, `factory:dead-letter` and `factory:ready-for-merge` from the issue (labels on the PR are left alone). It refuses (exit 1) a chain whose job is running (stop that worker, or wait for the delivery to finish) and a chain that is already completed or cancelled; a missing or non-numeric id is a usage error (exit 2).
+**cancel.** Ends a chain by hand, typically a `waiting` one you do not want to wait a maintenance pass for, or an issue you want to resubmit while its PR is still open. It cancels the chain and its queued jobs, resolves its dead letters, frees the subject for a new `submit`, and removes `factory:in-progress`, `factory:needs-human`, `factory:dead-letter` and `factory:ready-for-merge` from the issue (labels on the PR are left alone). It refuses (exit 1) a chain whose job is running (stop that worker, or wait for the delivery to finish) and a chain that is already completed or cancelled; a missing or non-numeric id is a usage error (exit 2).
 
 ```
 $ factory cancel 1
@@ -210,7 +217,7 @@ Labels are set and removed explicitly, never toggled. GitHub creates a label on 
 
 ### needs-human versus dead-letter
 
-`needs-human` means the machinery worked: the agent produced a pull request three times and the reviewer kept requesting changes. A PR exists and a person decides what to do with it. `dead-letter` means the machinery failed (the runner errored or timed out, a GitHub or git effect kept failing, the workspace could not be prepared, or the lease expired on every delivery) and no usable result exists. Look at the issue comment and `factory dlq list`, fix the cause, then `factory dlq retry <job-id>`, or `factory dlq discard <job-id>` to give up. Nothing in the factory watches the PR after `needs-human` or `ready-for-merge`: once you have merged, closed or otherwise handled it, end the chain with `factory cancel <chain-id>`.
+`needs-human` means the machinery worked: the agent produced a pull request three times and the reviewer kept requesting changes. A PR exists and a person decides what to do with it. `dead-letter` means the machinery failed (the runner errored or timed out, a GitHub or git effect kept failing, the workspace could not be prepared, or the lease expired on every delivery) and no usable result exists. Look at the issue comment and `factory dlq list`, fix the cause, then `factory dlq retry <job-id>`, or `factory dlq discard <job-id>` to give up. Once you merge or close the PR of a `needs-human` or `ready-for-merge` chain, the maintenance pass completes or cancels the chain within about a minute (see the lifecycle above); `factory cancel <chain-id>` ends it immediately, and is the way out when the PR is neither merged nor closed.
 
 Closing the issue stops the chain: the next job is dead-lettered (`runner_error`, `issue #<n> is closed`) before the agent runs, and opening a pull request or merging for a closed issue fails as `effect_error`. Discard it or cancel the chain.
 
@@ -257,7 +264,7 @@ Each claim of a job increments its `delivery` counter and takes a lease (5 minut
 
 ## Writing a new engine
 
-1. Implement `Engine<S>` from `src/kernel/types.ts`: `id`, `policyKinds`, `stateSchema`, `resultSchemas` (job type to zod schema), `submit`, `workspace`, `buildRunInput`, a pure `transition`, idempotent `runEffect`, `describe`, `surfaceDeadLetter`, `cleanup`, and optionally `afterRetry`, `afterCancel` and `sweep`.
+1. Implement `Engine<S>` from `src/kernel/types.ts`: `id`, `policyKinds`, `stateSchema`, `resultSchemas` (job type to zod schema), `submit`, `workspace`, `buildRunInput`, a pure `transition`, idempotent `runEffect`, `describe`, `surfaceDeadLetter`, `cleanup`, and optionally `afterRetry`, `afterCancel`, `reconcile` (with `finalState` and `afterReconcile`; called for `waiting` chains on every maintenance pass) and `sweep`.
 2. The smallest working example is the echo engine in `test/support/echo-engine.ts`; `src/engines/software/` is the full-size one.
 3. Register it in `buildRuntime` (`src/cli/runtime.ts`) next to the software engine, and add policies for its kinds.
 4. Route to it with `factory submit <input> --engine <id>` (the label `factory:engine:<id>`). `factory submit` currently passes `{ issueUrl }` as the engine's submit input, so a new engine reading something else needs a CLI change.
@@ -279,7 +286,6 @@ Tests use fakes for GitHub (`test/support/fake-github.ts`) and the model (a stub
 - Linux only (see Prerequisites).
 - Not a sandbox: the agent runs as your OS user (in bare mode with an empty per-run `HOME`, but able to read your files by absolute path), and the shipped execute policy allows unrestricted `Bash`. See "Credentials" for what is isolated and what is not.
 - An execute job whose result was recorded but whose workspace was lost in a crash goes to the dead-letter queue; a human `factory dlq retry` reruns the agent. Review jobs resume cleanly, except one whose `merge_pr` (automatic profile) is still pending when it resumes after a crash or an `effect_error` retry: without the review's workspace the reviewed head cannot be verified, so it dead-letters as `runner_error` (the factory never merges an unpinned head) and `factory dlq retry` redoes the review against the current head. The same holds when the execute job's third effect (adding `factory:in-progress` to the issue) keeps failing: that dead letter is an `effect_error`, its first retry resumes into the missing workspace and dead-letters again as `runner_error`, and the second retry reruns the agent.
-- Nothing observes the PR after the factory is done with it (no poller, no webhook): a `waiting` chain stays open until `factory cancel <chain-id>`.
 - The worktree sweep only recognizes directories named `j<jobId>-d<delivery>`; older naming is left alone. It never removes a delivery that is running or recently dead-lettered (checked again under the cache lock right before removal), nor a delivery directory modified in the last 10 minutes.
 - History tables are pruned by `historyRetentionDays`. The `workers` table is never pruned.
 - There is no migration tooling: tables are created with `CREATE TABLE IF NOT EXISTS`, so columns added since a database was created (`followups.claimed_until`, `dead_letters.surfaced_at`, `workers.current_job_id` and `workers.current_delivery`) are missing from it. Delete the database file when upgrading a prototype database.

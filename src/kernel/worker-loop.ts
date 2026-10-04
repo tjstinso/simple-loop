@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { readProcessStartTime } from '../util/proc.js';
 import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
-import { listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
-import { claimNext, getChain, getJob, renewLease, requeueJob } from './queue.js';
+import { cancelChain, listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
+import { claimNext, completeWaitingChain, getChain, getJob, renewLease, requeueJob } from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
 import { pruneHistory } from './retention.js';
 import type { ChainView, Fence, Job, KernelDeps } from './types.js';
@@ -62,7 +62,7 @@ const defaultOnError: ErrorHandler = (err, job) => {
  * Periodic kernel maintenance: reap expired leases (kill before reclaim,
  * requeue or dead-letter), surface every dead letter not yet surfaced (the
  * reaper's own, and any whose surfacing failed earlier) through its chain's
- * engine, prune aged history, then run every engine's optional `sweep`. Errors are
+ * engine, reconcile waiting chains (`reconcileWaiting`), prune aged history, then run every engine's optional `sweep`. Errors are
  * passed to `onError` and never stop the remaining steps or other jobs.
  */
 export async function runMaintenance(
@@ -81,6 +81,7 @@ export async function runMaintenance(
     onError(e);
   }
   await surfacePending(deps, onError);
+  await reconcileWaiting(deps, onError);
   try {
     pruneHistory(deps.db, deps.clock(), deps.config.historyRetentionDays ?? 30);
   } catch (e) {
@@ -91,6 +92,79 @@ export async function runMaintenance(
     if (!engine.sweep) continue;
     try {
       await engine.sweep(deps.clock());
+    } catch (e) {
+      onError(e);
+    }
+  }
+}
+
+/**
+ * For every `waiting` chain whose engine defines `reconcile`: validates the engine state, asks the
+ * engine whether the subject was settled outside the factory and applies the answer. `completed`
+ * completes the chain (engine state through `finalState`), `cancelled` cancels it (`cancelChain`,
+ * then `afterCancel`); both only if the chain is still `waiting` at the moment of the write, in one
+ * transaction, so concurrent workers and a manual `factory cancel` cannot conflict. `afterReconcile`
+ * runs last. Each error goes to `onError` and never stops the other chains.
+ */
+export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler = defaultOnError): Promise<void> {
+  let ids: number[];
+  try {
+    ids = (deps.db.prepare(`SELECT id FROM chains WHERE status = 'waiting' ORDER BY id`).all() as { id: number }[]).map(
+      (r) => r.id,
+    );
+  } catch (e) {
+    onError(e);
+    return;
+  }
+  for (const id of ids) {
+    try {
+      const chain = getChain(deps.db, id);
+      if (chain.status !== 'waiting') continue;
+      const engine = deps.engines.get(chain.engine);
+      if (!engine.reconcile) continue;
+      const parsed = engine.stateSchema.safeParse(chain.engineState);
+      if (!parsed.success) throw new Error(`invalid engine state for chain ${chain.id}: ${parsed.error.message}`);
+      const view: ChainView<unknown> = {
+        id: chain.id,
+        engine: chain.engine,
+        subjectKey: chain.subjectKey,
+        status: chain.status,
+        state: parsed.data,
+      };
+      const result = await engine.reconcile(view);
+      if (result.outcome === 'none') continue;
+      let applied: boolean;
+      let finalView = view;
+      if (result.outcome === 'completed') {
+        const state = engine.finalState ? engine.finalState(parsed.data) : parsed.data;
+        applied = completeWaitingChain(deps.db, id, state, deps.clock());
+        finalView = { ...view, status: 'completed', state };
+      } else {
+        try {
+          cancelChain(deps.db, id, deps.clock(), { onlyIfStatus: 'waiting' });
+          applied = true;
+        } catch (e) {
+          // Lost a race (someone else completed or cancelled it): not an error.
+          if (getChain(deps.db, id).status === 'waiting') throw e;
+          applied = false;
+        }
+        finalView = { ...view, status: 'cancelled' };
+      }
+      if (!applied) continue;
+      if (result.outcome === 'cancelled' && engine.afterCancel) {
+        try {
+          await engine.afterCancel(finalView);
+        } catch (e) {
+          onError(e);
+        }
+      }
+      if (engine.afterReconcile) {
+        try {
+          await engine.afterReconcile(finalView, result);
+        } catch (e) {
+          onError(e);
+        }
+      }
     } catch (e) {
       onError(e);
     }

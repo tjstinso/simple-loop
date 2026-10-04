@@ -721,4 +721,118 @@ describe('software engine scenarios', () => {
     expect(h.pr(BRANCH)!.labels).toEqual([READY]);
     expect(h.issueLabels(N)).toEqual([]);
   });
+  describe('reconcile of waiting chains', () => {
+    const MERGED_COMMENT = 'Pull request #8 was merged';
+    const CLOSED_COMMENT = 'Pull request #8 was closed without merging; this chain was cancelled';
+
+    async function driveToWaiting(h: Harness, verdicts: 'approve' | 'reject') {
+      const { chain } = await h.submit(N);
+      writesPerAttempt(h);
+      h.scriptReview(
+        verdicts === 'approve'
+          ? [{ verdict: 'approve', feedback: 'lgtm' }]
+          : [1, 2, 3].map((i) => ({ verdict: 'request_changes' as const, feedback: `no ${i}` })),
+      );
+      await h.runUntilIdle();
+      expect(h.chain(chain.id).status).toBe('waiting');
+      // Stale factory labels a human might see on the issue.
+      await h.host.setLabels('o/r', N, [IN_PROGRESS, READY, NEEDS_HUMAN, LABEL_DEAD_LETTER], []);
+      return chain;
+    }
+
+    it('completes a chain whose pull request was merged, once', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'approve');
+      h.host.prs.get(8)!.state = 'merged';
+
+      expect(await h.maintain()).toEqual([]);
+
+      expect(h.chain(chain.id)).toMatchObject({ status: 'completed', state: { phase: 'merged' } });
+      expect(h.issueLabels(N)).toEqual([]);
+      expect(h.comments(N)).toHaveLength(1);
+      expect(h.comments(N)[0]).toContain(MERGED_COMMENT);
+
+      const lookups = h.host.calls.length;
+      expect(await h.maintain()).toEqual([]);
+      expect(h.host.calls.length).toBe(lookups); // a completed chain is not looked at again
+      expect(h.chain(chain.id).status).toBe('completed');
+      expect(h.comments(N)).toHaveLength(1);
+    });
+
+    it('cancels a chain whose pull request was closed without merging', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'approve');
+      h.host.prs.get(8)!.state = 'closed';
+
+      expect(await h.maintain()).toEqual([]);
+
+      expect(h.chain(chain.id).status).toBe('cancelled');
+      expect(h.issueLabels(N)).toEqual([]);
+      expect(h.comments(N)).toHaveLength(1);
+      expect(h.comments(N)[0]).toContain(CLOSED_COMMENT);
+      await h.maintain();
+      expect(h.comments(N)).toHaveLength(1);
+    });
+
+    it('completes a needs_human chain whose pull request was merged', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'reject');
+      expect(h.chain(chain.id).state.phase).toBe('needs_human');
+      h.host.prs.get(8)!.state = 'merged';
+
+      expect(await h.maintain()).toEqual([]);
+
+      expect(h.chain(chain.id)).toMatchObject({ status: 'completed', state: { phase: 'merged' } });
+      expect(h.issueLabels(N)).toEqual([]);
+      expect(h.comments(N)).toHaveLength(1);
+    });
+
+    it('leaves a chain with an open pull request untouched', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'approve');
+      expect(await h.maintain()).toEqual([]);
+      expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
+      expect(h.issueLabels(N)).toContain(READY);
+      expect(h.comments(N)).toEqual([]);
+    });
+
+    it('leaves a chain waiting on a transient host error and settles it on the next pass', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'approve');
+      h.host.prs.get(8)!.state = 'merged';
+      h.host.failNext('findPrByHead', new GitHostError('bad gateway', 502));
+
+      expect(await h.maintain()).toEqual([]);
+      expect(h.chain(chain.id).status).toBe('waiting');
+
+      expect(await h.maintain()).toEqual([]);
+      expect(h.chain(chain.id).status).toBe('completed');
+    });
+
+    it('reports a label failure and keeps the transition', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'approve');
+      h.host.prs.get(8)!.state = 'merged';
+      h.host.failNext('setLabels', new GitHostError('forbidden', 403));
+
+      const errors = await h.maintain();
+
+      expect(errors).toHaveLength(1);
+      expect(h.chain(chain.id).status).toBe('completed');
+      expect(h.comments(N)).toHaveLength(1); // the comment was still attempted
+    });
+
+    it('lets the same issue be submitted again after reconcile completed its chain', async () => {
+      const h = harness();
+      const chain = await driveToWaiting(h, 'approve');
+      await expect(h.submit(N)).rejects.toBeInstanceOf(DuplicateChainError);
+      h.host.prs.get(8)!.state = 'merged';
+      await h.maintain();
+      expect(h.chain(chain.id).status).toBe('completed');
+
+      const again = await h.submit(N);
+      expect(again.chain.id).not.toBe(chain.id);
+      expect(h.chain(again.chain.id).status).toBe('active');
+    });
+  });
 });
