@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { ghAuthEnv, type GithubAuth } from './identity.js';
 
 export interface Issue {
   number: number;
@@ -110,7 +111,7 @@ export const GH_TIMEOUT_MS = 60_000;
 export type ExecFn = (
   file: string,
   args: string[],
-  opts?: { input?: string; timeoutMs?: number },
+  opts?: { input?: string; timeoutMs?: number; env?: Record<string, string> },
 ) => Promise<{ stdout: string; stderr: string; exitCode: number; timedOut?: boolean }>;
 
 export const defaultExec: ExecFn = (file, args, opts) =>
@@ -118,7 +119,12 @@ export const defaultExec: ExecFn = (file, args, opts) =>
     const child = execFile(
       file,
       args,
-      { maxBuffer: 64 * 1024 * 1024, timeout: opts?.timeoutMs ?? 0, killSignal: 'SIGKILL' },
+      {
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: opts?.timeoutMs ?? 0,
+        killSignal: 'SIGKILL',
+        ...(opts?.env === undefined ? {} : { env: { ...process.env, ...opts.env } }),
+      },
       (err, stdout, stderr) => {
         if (!err) return resolve({ stdout, stderr, exitCode: 0 });
         const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string | null };
@@ -144,6 +150,8 @@ export type MergeMethod = 'squash' | 'merge' | 'rebase';
 // issues and PRs share labels/comments endpoints, and failures print "(HTTP nnn)".
 // Request bodies go through `--input -` (JSON on stdin) so arbitrary text never
 // needs shell or flag escaping and nothing is placed on the command line.
+
+export const buildGetUserArgs = (): string[] => ['api', '-X', 'GET', 'user'];
 
 export const buildGetIssueArgs = (repo: string, n: number): string[] => [
   'api', '-X', 'GET', `repos/${repo}/issues/${n}`,
@@ -280,8 +288,12 @@ export class GhCliHost implements GitHost {
   private readonly mergeMethod: MergeMethod;
   private readonly ghTimeoutMs: number;
   private readonly deleteBranch: boolean;
+  private readonly env: Record<string, string> | undefined;
 
-  constructor(opts: { exec?: ExecFn; mergeMethod?: MergeMethod; ghTimeoutMs?: number; deleteBranch?: boolean } = {}) {
+  constructor(
+    opts: { exec?: ExecFn; mergeMethod?: MergeMethod; ghTimeoutMs?: number; deleteBranch?: boolean; auth?: GithubAuth } = {},
+  ) {
+    this.env = opts.auth === undefined ? undefined : ghAuthEnv(opts.auth);
     this.exec = opts.exec ?? defaultExec;
     this.mergeMethod = opts.mergeMethod ?? 'squash';
     this.ghTimeoutMs = opts.ghTimeoutMs ?? GH_TIMEOUT_MS;
@@ -292,6 +304,7 @@ export class GhCliHost implements GitHost {
     const r = await this.exec('gh', args, {
       ...(input === undefined ? {} : { input: JSON.stringify(input) }),
       timeoutMs: this.ghTimeoutMs,
+      ...(this.env === undefined ? {} : { env: this.env }),
     });
     // No status: the effects' classification treats it as transient and retries.
     if (r.timedOut) throw new GitHostError(`gh ${args[0]} timed out after ${this.ghTimeoutMs} ms`);
@@ -309,6 +322,12 @@ export class GhCliHost implements GitHost {
     } catch {
       throw new GitHostError(`gh returned invalid JSON: ${out.slice(0, 200)}`);
     }
+  }
+
+  /** The login the adapter's credentials resolve to (`gh api user`). */
+  async currentLogin(): Promise<string> {
+    const u = await this.json<RestUser>(buildGetUserArgs());
+    return u.login ?? '';
   }
 
   async getIssue(repo: string, n: number): Promise<Issue> {

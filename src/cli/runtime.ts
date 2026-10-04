@@ -1,7 +1,8 @@
 import type Database from 'better-sqlite3';
 import { FOLLOWUPS_DDL } from '../engines/software/followups.js';
-import { ExecGitPorts } from '../engines/software/git-ports.js';
+import { ExecGitPorts, FACTORY_GIT_EMAIL, FACTORY_GIT_NAME } from '../engines/software/git-ports.js';
 import { GhCliHost } from '../engines/software/github.js';
+import { createGithubAuth, readToken, verifyLogin, type GithubAuth } from '../engines/software/identity.js';
 import { createSoftwareEngine } from '../engines/software/index.js';
 import { secretEnvValues } from '../engines/software/secret-scan.js';
 import { GitWorkspaceProvider } from '../engines/software/workspace.js';
@@ -18,6 +19,8 @@ export interface Runtime {
   kernel: Kernel;
   db: Database.Database;
   defaultEngine: string;
+  /** Checks the factory's GitHub identity (the token's login against `github.expectLogin`); run at worker start. */
+  verifyIdentity?(): Promise<void>;
   close(): void;
 }
 
@@ -40,17 +43,32 @@ export function buildRuntime(config: FactoryConfig): Runtime {
     migrate(db, [FOLLOWUPS_DDL]);
     const policies = new PolicyStore(loadPolicies(config.policiesDir));
     const forwarded = passEnvNames(policies.all());
+    const gh = config.github;
+    const tokenEnv = gh?.tokenEnv;
+    let auth: GithubAuth | undefined;
+    if (tokenEnv !== undefined) auth = createGithubAuth(readToken(tokenEnv, process.env));
+    const identity =
+      gh?.commitName !== undefined || gh?.commitEmail !== undefined
+        ? { name: gh.commitName ?? FACTORY_GIT_NAME, email: gh.commitEmail ?? FACTORY_GIT_EMAIL }
+        : undefined;
     const runners = new RunnerRegistry();
-    runners.register(new ClaudeCliRunner());
+    runners.register(new ClaudeCliRunner(tokenEnv === undefined ? {} : { withheldEnv: [tokenEnv] }));
     const workspaces = new GitWorkspaceProvider({
+      ...(auth === undefined ? {} : { auth }),
+      ...(identity === undefined ? {} : { identity }),
       cloneUrlFor: (repo) => config.cloneUrlTemplate.replace('{repo}', repo),
       root: config.workspaceRoot,
       keepOnFailure: config.keepWorktreeOnFailure,
     });
+    const host = new GhCliHost(auth === undefined ? {} : { auth });
     const engine = createSoftwareEngine({
       db,
-      host: new GhCliHost(),
-      git: new ExecGitPorts({ prepareForPush: (ws) => workspaces.sanitizeForPush(ws) }),
+      host,
+      git: new ExecGitPorts({
+        ...(auth === undefined ? {} : { auth }),
+        ...(identity === undefined ? {} : { identity }),
+        prepareForPush: (ws) => workspaces.sanitizeForPush(ws),
+      }),
       workspaces,
       policies,
       config: {
@@ -63,8 +81,8 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       },
       now: clock,
       // The secret guard's exact values, read at each push: the model API key, every variable whose
-      // name looks secret, and the claude-cli policies' passEnv variables.
-      secretValues: () => secretEnvValues(process.env, forwarded),
+      // name looks secret, the claude-cli policies' passEnv variables and the factory's GitHub token.
+      secretValues: () => secretEnvValues(process.env, tokenEnv === undefined ? forwarded : [...forwarded, tokenEnv]),
     });
     const engines = new EngineRegistry();
     engines.register(engine);
@@ -82,7 +100,14 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         historyRetentionDays: config.historyRetentionDays,
       },
     });
-    return { kernel, db, defaultEngine: config.defaultEngine, close: () => db.close() };
+    const expectLogin = gh?.expectLogin;
+    return {
+      kernel,
+      db,
+      defaultEngine: config.defaultEngine,
+      ...(auth !== undefined && expectLogin !== undefined ? { verifyIdentity: () => verifyLogin(host, expectLogin) } : {}),
+      close: () => db.close(),
+    };
   } catch (e) {
     db.close();
     throw e;

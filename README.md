@@ -117,6 +117,42 @@ Limits:
 - It does not replace rotating a key. When the guard fires, the leaked file is still on the worker's disk in the kept worktree; treat the key as exposed and rotate it, and rotate any key that was pushed or leaked otherwise.
 - It can refuse legitimate changes: a test fixture that looks like a token, a `*.key` or `*.pem` file, a change with more than 5 MiB of added text, or a value of a secret-named variable that also appears in the code. Such a change has to be pushed by hand, or the variable removed from the worker's environment. Tests and docs that need a fake token can build it by string concatenation (see `CLAUDE.md`).
 
+### Running as its own GitHub identity
+
+By default the factory acts as you: `gh` uses your login and git your credentials, so every pull request is authored by you, and GitHub does not let an author approve their own pull request. Requiring one approving review on `main` would then block every factory pull request. Giving the factory its own identity (a bot account, a machine user, or a GitHub App installation token) fixes that: your approval counts, and a person's review of a factory pull request becomes a real gate.
+
+Operator setup:
+
+1. Create the bot account (or a GitHub App) in GitHub. The factory does not do this.
+2. Grant it write access to the repositories you submit, and nothing else.
+3. Create a token for it with only the scopes the factory needs: repository **Contents** (read and write: fetch and push `factory/issue-<n>` branches), **Pull requests** (read and write: open, read reviews and comments, enable auto-merge), **Issues** (read and write: read issues, labels, comments, follow-up issues). A fine-grained token limited to those repositories is best; for a classic token that is the `repo` scope. Add **Metadata** (read), which GitHub grants by default.
+4. Set the token in the worker's environment, for example `FACTORY_GH_TOKEN`.
+5. Configure the worker:
+
+```json
+{
+  "github": {
+    "tokenEnv": "FACTORY_GH_TOKEN",
+    "expectLogin": "my-factory-bot",
+    "commitName": "My Factory Bot",
+    "commitEmail": "my-factory-bot@users.noreply.github.com"
+  },
+  "cloneUrlTemplate": "https://github.com/{repo}.git"
+}
+```
+
+What the factory then does:
+
+- Every `gh` call runs with `GH_TOKEN` set to the token, `GH_HOST=github.com` and `GH_CONFIG_DIR` pointing at an empty per-worker directory, so your own `gh` login is never used.
+- Every git command that talks to the remote (clone, fetch, ls-remote, push) uses the HTTPS URL from `cloneUrlTemplate` and a `GIT_ASKPASS` helper script that prints the token from the git process's environment. The credential helper list is reset for those commands, so your helper is not asked first. The token is never written to disk, passed in an argument list, put in a remote URL or `.git/config`, logged or stored in an event. (The helper script, in a per-worker directory under the temp directory, contains no token.)
+- Commits are authored and committed as `commitName <commitEmail>` (the factory's default is `factory <factory@localhost>`). The hardened git environment of the secret scan is unchanged.
+- At worker start the token's login (`gh api user`) must equal `expectLogin` (case-insensitive), otherwise the worker refuses to start and the error names both logins. A missing or empty `tokenEnv` variable is a startup error that names the variable and never its value.
+- The agent never sees the token: the claude-cli runner removes the `tokenEnv` variable, `GH_TOKEN`, `GITHUB_TOKEN` and `GIT_ASKPASS` from the agent's environment in bare and non-bare mode, even if a policy lists them in `passEnv`. The token's value is also registered with the secret guard, so it is redacted from pull request bodies, comments, follow-ups and events, and a push containing it is refused.
+
+With a distinct identity, `main` can require one approving review (administrators included) and your approval counts. Auto-merge, which the automatic profile enables, then waits for that approval as well as the checks; the chain stays `waiting` and completes through the existing reconcile step once GitHub merges the pull request.
+
+The identity must have the minimum rights: write access only to the repositories you submit, no administration, no organization-wide scopes. A token is a secret: keep it only in the worker's environment (or your secret manager), never in `factory.config.json` or a repository, and rotate it if it may have leaked. Rotation, GitHub App JWT exchange and installation-token refresh are not handled: a long-lived token is used as is. Posting the factory reviewer's verdict as a pull request review under the bot identity is not done yet.
+
 ## Install and build
 
 ```
@@ -143,7 +179,8 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | `allowedAuthorAssociations` | `["OWNER", "MEMBER", "COLLABORATOR"]` | Pull request feedback counts only from authors with one of these GitHub `authorAssociation` values. |
 | `maxHumanRounds` | `5` | Integer, at least 1. How many rounds of a person's feedback one chain accepts; beyond it the chain stays `waiting` with phase `needs_human`. |
 | `keptWorktreeMaxAgeMs` | `604800000` (7 days) | Non-negative. A kept worktree whose dead letter is older than this, or resolved, is removed by the periodic sweep. |
-| `cloneUrlTemplate` | `https://github.com/{repo}.git` | Fetch and push URL; `{repo}` is replaced by `owner/name`. |
+| `cloneUrlTemplate` | `https://github.com/{repo}.git` | Fetch and push URL; `{repo}` is replaced by `owner/name`. With `github.tokenEnv` it must be an `https://` URL without credentials. |
+| `github` | absent | Optional object: the factory's own GitHub identity, see "Running as its own GitHub identity". `tokenEnv` (variable holding the token), `expectLogin` (the login it must resolve to; required with `tokenEnv`), `commitName` and `commitEmail` (author and committer of factory commits). Without it nothing changes. |
 
 Not configurable (set in `src/cli/runtime.ts`): lease 300000 ms, heartbeat 30000 ms, `maxDeliveries` 3 (a job whose lease expires on its third delivery is dead-lettered instead of requeued). `delivery` counts every claim of the job, including claims after a worker's own stop handed the job back (SIGINT/SIGTERM), and `dlq retry` keeps the counter, so a job that was stopped twice, or retried after two deliveries, is dead-lettered the next time its lease expires. The squash merge method is the default of `GhCliHost`.
 

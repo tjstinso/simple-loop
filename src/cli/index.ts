@@ -157,6 +157,7 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         if (!/^[0-9]+$/.test(values['poll-ms'])) throw new UsageError('--poll-ms must be a non-negative integer');
         pollMs = Number(values['poll-ms']);
       }
+      await rt.verifyIdentity?.();
       const worker = kernel.startWorker({
         ...(pollMs === undefined ? {} : { pollMs }),
         ...(values.id === undefined ? {} : { id: values.id }),

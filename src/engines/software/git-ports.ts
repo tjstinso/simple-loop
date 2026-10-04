@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { StaleDeliveryError } from '../../kernel/types.js';
+import { gitAuthEnv, NO_CREDENTIAL_HELPER_ARGS, type CommitIdentity, type GithubAuth } from './identity.js';
 import type { SoftwareWorkspace } from './workspace.js';
 
 /** The git side of the software engine's effects. */
@@ -114,12 +115,19 @@ function subcommand(args: string[]): string {
 }
 
 /** Runs git; `scan` isolates it from the worker's git configuration (see SCAN_CONFIG). */
-function run(cwd: string, args: string[], timeoutMs: number, input?: string, scan = false): Promise<GitResult> {
+function run(
+  cwd: string,
+  args: string[],
+  timeoutMs: number,
+  input?: string,
+  scan = false,
+  extraEnv: Record<string, string> = {},
+): Promise<GitResult> {
   return new Promise((resolve) => {
     const child = execFile(
       'git',
       [...SAFE_CONFIG, ...(scan ? SCAN_CONFIG : []), ...args],
-      { cwd, env: scan ? scanEnv(gitEnv()) : gitEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+      { cwd, env: scan ? scanEnv(gitEnv()) : { ...gitEnv(), ...extraEnv }, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
         if (!err) return resolve({ stdout, stderr, code: 0 });
         const e = err as NodeJS.ErrnoException & { code?: unknown; killed?: boolean; signal?: string | null };
@@ -303,8 +311,15 @@ class StringsExtractor {
   }
 }
 
-async function must(cwd: string, args: string[], timeoutMs: number, input?: string, scan = false): Promise<string> {
-  const r = await run(cwd, args, timeoutMs, input, scan);
+async function must(
+  cwd: string,
+  args: string[],
+  timeoutMs: number,
+  input?: string,
+  scan = false,
+  extraEnv: Record<string, string> = {},
+): Promise<string> {
+  const r = await run(cwd, args, timeoutMs, input, scan, extraEnv);
   if (r.code !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
   return r.stdout.trim();
 }
@@ -354,17 +369,33 @@ export interface ExecGitPortsOptions {
   networkTimeoutMs?: number;
   /** Most text `addedChanges` captures (default SECRET_SCAN_CAP_BYTES). */
   scanCapBytes?: number;
+  /** The factory's GitHub identity: `git push` authenticates with its token (HTTPS, GIT_ASKPASS). */
+  auth?: GithubAuth;
+  /** Author and committer of the commits the engine makes (default `factory <factory@localhost>`). */
+  identity?: CommitIdentity;
 }
 
 export class ExecGitPorts implements GitPorts {
   private readonly local: number;
   private readonly network: number;
   private readonly scanCap: number;
+  private readonly commitEnv: Record<string, string>;
+  private readonly pushEnv: Record<string, string>;
+  private readonly pushConfig: string[];
 
   constructor(private readonly opts: ExecGitPortsOptions = {}) {
     this.local = opts.localTimeoutMs ?? GIT_LOCAL_TIMEOUT_MS;
     this.network = opts.networkTimeoutMs ?? GIT_NETWORK_TIMEOUT_MS;
     this.scanCap = opts.scanCapBytes ?? SECRET_SCAN_CAP_BYTES;
+    const id = opts.identity ?? { name: FACTORY_GIT_NAME, email: FACTORY_GIT_EMAIL };
+    this.commitEnv = {
+      GIT_AUTHOR_NAME: id.name,
+      GIT_AUTHOR_EMAIL: id.email,
+      GIT_COMMITTER_NAME: id.name,
+      GIT_COMMITTER_EMAIL: id.email,
+    };
+    this.pushEnv = opts.auth === undefined ? {} : gitAuthEnv(opts.auth);
+    this.pushConfig = opts.auth === undefined ? [] : NO_CREDENTIAL_HELPER_ARGS;
   }
 
   async prepareForPush(ws: SoftwareWorkspace): Promise<void> {
@@ -377,7 +408,7 @@ export class ExecGitPorts implements GitPorts {
     if (diff.code === 0) return false;
     if (diff.code !== 1) throw new Error(`git diff failed: ${diff.stderr.trim()}`);
     // Message on stdin: untrusted text never sits in argv.
-    await must(ws.path, ['commit', '--quiet', '--no-verify', '--cleanup=whitespace', '-F', '-'], this.local, message);
+    await must(ws.path, ['commit', '--quiet', '--no-verify', '--cleanup=whitespace', '-F', '-'], this.local, message, false, this.commitEnv);
     return true;
   }
 
@@ -397,6 +428,7 @@ export class ExecGitPorts implements GitPorts {
     const ref = `refs/heads/${a.remoteBranch}`;
     // The operator's config stays (credentials), but tags are never pushed along with the commit.
     const r = await run(ws.path, [
+      ...this.pushConfig,
       '-c',
       'push.followTags=false',
       'push',
@@ -406,7 +438,7 @@ export class ExecGitPorts implements GitPorts {
       '--',
       ws.remoteUrl,
       `${a.sha}:${ref}`,
-    ], this.network);
+    ], this.network, undefined, false, this.pushEnv);
     if (r.code === 0) return;
     if (r.code === -1) throw new Error(`git push failed: ${r.stderr}`);
     const out = `${r.stdout}\n${r.stderr}`;

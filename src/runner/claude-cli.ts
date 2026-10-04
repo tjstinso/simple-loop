@@ -76,6 +76,8 @@ export interface ClaudeCliRunnerOptions {
    * allow-list and `passEnv` but before the isolation variables (bare mode).
    */
   env?: Record<string, string>;
+  /** Variable names removed from the child environment in every mode, even when in `passEnv` (the GitHub token variable). */
+  withheldEnv?: readonly string[];
   /** Process spawner (default `child_process.spawn`). Tests inject one that throws. */
   spawn?: typeof spawn;
   /** Remover used by `removeScratchDir` (default `fs.rmSync`). Tests inject a failing one. */
@@ -158,6 +160,16 @@ function abortError(): Error {
   return e;
 }
 
+/**
+ * Variables the agent never sees, in every mode and even when listed in `passEnv`: the factory's GitHub
+ * token (and the variable `github.tokenEnv` names) and the askpass helper that serves it.
+ */
+const WITHHELD_VARS = ['GH_TOKEN', 'GITHUB_TOKEN', 'GIT_ASKPASS'];
+
+function withhold(env: Record<string, string>, extra: readonly string[]): void {
+  for (const k of [...WITHHELD_VARS, ...extra]) delete env[k];
+}
+
 /** Variables that hand the agent a way to authenticate as the operator (SSH agent, askpass helpers, ssh commands). */
 const DROPPED_VARS = new Set(['SSH_AUTH_SOCK', 'SSH_ASKPASS', 'GIT_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH']);
 
@@ -173,7 +185,11 @@ const DROPPED_VARS = new Set(['SSH_AUTH_SOCK', 'SSH_ASKPASS', 'GIT_ASKPASS', 'GI
  * still read any file the user can, such as ~/.config/gh/hosts.yml, ~/.ssh or ~/.gitconfig, by
  * its path (see README "Credentials").
  */
-export function childEnv(overrides: Record<string, string> = {}, ghConfigDir?: string): Record<string, string> {
+export function childEnv(
+  overrides: Record<string, string> = {},
+  ghConfigDir?: string,
+  withheld: readonly string[] = [],
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
@@ -185,7 +201,9 @@ export function childEnv(overrides: Record<string, string> = {}, ghConfigDir?: s
   env.GIT_CONFIG_GLOBAL = '/dev/null';
   env.GIT_CONFIG_NOSYSTEM = '1';
   if (ghConfigDir !== undefined) env.GH_CONFIG_DIR = ghConfigDir;
-  return { ...env, ...overrides };
+  const out = { ...env, ...overrides };
+  withhold(out, withheld);
+  return out;
 }
 
 /** Variables bare mode takes from the worker's environment (plus the config's `passEnv`). */
@@ -209,6 +227,8 @@ export interface BareEnvOptions {
   home: string;
   /** Empty per-run directory for `gh`. */
   ghConfigDir: string;
+  /** Extra variable names to remove (the `github.tokenEnv` variable), even when listed in `passEnv`. */
+  withheld?: readonly string[];
 }
 
 /**
@@ -241,6 +261,7 @@ export function bareChildEnv(opts: BareEnvOptions): Record<string, string> {
   env.GIT_CONFIG_GLOBAL = '/dev/null';
   env.GIT_CONFIG_NOSYSTEM = '1';
   env.GH_CONFIG_DIR = opts.ghConfigDir;
+  withhold(env, opts.withheld ?? []);
   return env;
 }
 
@@ -424,12 +445,14 @@ export class ClaudeCliRunner implements Runner {
   readonly configSchema = configSchema;
   private readonly bin: string;
   private readonly env: Record<string, string>;
+  private readonly withheld: readonly string[];
   private readonly spawn: typeof spawn;
   private readonly removeDir: Remover;
 
   constructor(opts: ClaudeCliRunnerOptions = {}) {
     this.bin = opts.bin ?? 'claude';
     this.env = opts.env ?? {};
+    this.withheld = opts.withheldEnv ?? [];
     this.spawn = opts.spawn ?? spawn;
     this.removeDir = opts.removeDir ?? rmSync;
   }
@@ -442,7 +465,7 @@ export class ClaudeCliRunner implements Runner {
     const passEnv = cfg.passEnv ?? [];
     if (cfg.bare) {
       // Check the credential on the allow-listed environment before creating any directory.
-      const probe = bareChildEnv({ parent: process.env, overrides: this.env, passEnv, home: '', ghConfigDir: '' });
+      const probe = bareChildEnv({ parent: process.env, overrides: this.env, passEnv, home: '', ghConfigDir: '', withheld: this.withheld });
       if (!hasProviderCredential(probe, passEnv)) throw new Error(missingCredentialMessage());
     }
     const claudeMdFile = cfg.bare ? worktreeClaudeMd(input.workspace.path) : undefined;
@@ -475,9 +498,9 @@ export class ClaudeCliRunner implements Runner {
           const ghConfigDir = join(scratch, 'gh');
           mkdirSync(home);
           mkdirSync(ghConfigDir);
-          env = bareChildEnv({ parent: process.env, overrides: this.env, passEnv, home, ghConfigDir });
+          env = bareChildEnv({ parent: process.env, overrides: this.env, passEnv, home, ghConfigDir, withheld: this.withheld });
         } else {
-          env = childEnv(this.env, scratch);
+          env = childEnv(this.env, scratch, this.withheld);
         }
         child = this.spawn(this.bin, args, {
           cwd: input.workspace.path,
