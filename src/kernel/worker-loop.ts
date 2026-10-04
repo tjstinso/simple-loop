@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { readProcessStartTime } from '../util/proc.js';
 import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
 import { cancelChain, listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
@@ -56,6 +57,19 @@ export interface WorkerOptions {
   killGroup?: (pgid: number) => void;
   /** Further reaper overrides (liveness probes, worker kill). */
   reap?: ReapOverrides;
+  /**
+   * After a detected suspend or stall the worker skips its reaper for this long, so owners of leases
+   * that expired only because everything was frozen can renew them first
+   * (default `2 * heartbeatMs`, at least 30 s).
+   */
+  resumeGraceMs?: number;
+  /** Monotonic clock in ms (default `performance.now`), compared with the wall clock to detect a gap. */
+  monotonic?: () => number;
+}
+
+/** Between two timer ticks `intervalMs` apart, more than `3 * intervalMs` passed: the process was suspended or stalled. */
+export function detectGap(previousTickMs: number, nowMs: number, intervalMs: number): boolean {
+  return nowMs - previousTickMs > 3 * intervalMs;
 }
 
 export interface Worker {
@@ -72,25 +86,27 @@ const defaultOnError: ErrorHandler = (err, job) => {
 
 /**
  * Periodic kernel maintenance: reap expired leases (kill before reclaim,
- * requeue or dead-letter), surface every dead letter not yet surfaced (the
+ * requeue or dead-letter; skipped with `skipReap`, in the grace after a suspend), surface every dead letter not yet surfaced (the
  * reaper's own, and any whose surfacing failed earlier) through its chain's
  * engine, reconcile waiting chains (`reconcileWaiting`), prune aged history, then run every engine's optional `sweep`. Errors are
  * passed to `onError` and never stop the remaining steps or other jobs.
  */
 export async function runMaintenance(
   deps: KernelDeps,
-  opts: { onError?: ErrorHandler; reap?: ReapOverrides } = {},
+  opts: { onError?: ErrorHandler; reap?: ReapOverrides; skipReap?: boolean } = {},
 ): Promise<void> {
   const onError = opts.onError ?? defaultOnError;
-  try {
-    const report = reapExpired(deps.db, {
-      ...opts.reap,
-      now: deps.clock(),
-      maxDeliveries: deps.config.maxDeliveries,
-    });
-    for (const e of report.errors) onError(new Error(`reaper: job ${e.jobId}: ${e.error}`));
-  } catch (e) {
-    onError(e);
+  if (!opts.skipReap) {
+    try {
+      const report = reapExpired(deps.db, {
+        ...opts.reap,
+        now: deps.clock(),
+        maxDeliveries: deps.config.maxDeliveries,
+      });
+      for (const e of report.errors) onError(new Error(`reaper: job ${e.jobId}: ${e.error}`));
+    } catch (e) {
+      onError(e);
+    }
   }
   await surfacePending(deps, onError);
   await reconcileWaiting(deps, onError);
@@ -277,6 +293,8 @@ interface Delivery {
   /** Resolves 'timeout' stopTimeoutMs after the lease was lost (bounds the wait for a runner ignoring the abort). */
   abandoned: Promise<'timeout'>;
   abandonTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Renews the lease now (see `runJob`); `force` ignores the local deadline. */
+  beat: ((force: boolean) => void) | undefined;
 }
 
 /** Resolves with `p`'s value, or 'timeout' after `ms`. The timer is always cleared. */
@@ -335,9 +353,57 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
   let resolveDone!: () => void;
   const done = new Promise<void>((r) => (resolveDone = r));
 
+  const monotonic = opts.monotonic ?? (() => performance.now());
+  const resumeGraceMs = opts.resumeGraceMs ?? Math.max(2 * config.heartbeatMs, 30_000);
+  let lastWall = clock();
+  let lastMono = monotonic();
+  /** The reaper stays off until then (set by a detected gap). */
+  let reapSkipUntil = 0;
+
+  /**
+   * Called first by every timer tick. If more than three intervals passed since the previous tick on
+   * the wall clock or on the monotonic clock (which stops while some systems are suspended), the
+   * machine was suspended or the process stalled: renew the lease of the running job before anything
+   * else, record `worker.resumed` (once per gap, as the tick times are updated here) and keep this
+   * worker's reaper off for the grace period so lease owners can renew before any peer acts.
+   */
+  const checkGap = (): void => {
+    const wall = clock();
+    const mono = monotonic();
+    const wallGap = wall - lastWall;
+    const monoGap = mono - lastMono;
+    const gapped = detectGap(lastWall, wall, config.heartbeatMs) || detectGap(lastMono, mono, config.heartbeatMs);
+    lastWall = wall;
+    lastMono = mono;
+    if (!gapped || stopping) return;
+    const d = current;
+    d?.beat?.(true);
+    reapSkipUntil = wall + resumeGraceMs;
+    try {
+      recordEvent(db, {
+        at: wall,
+        chainId: d?.job.chainId ?? 0,
+        jobId: d?.job.id ?? null,
+        delivery: d?.job.delivery ?? null,
+        kind: 'worker.resumed',
+        engine: 'kernel',
+        detail: { worker: id, gapMs: Math.max(wallGap, monoGap), graceMs: resumeGraceMs },
+      });
+    } catch (e) {
+      report(e, d?.job);
+    }
+  };
+
+  const gapTimer = setInterval(checkGap, config.heartbeatMs);
+
   const maintenanceTimer = setInterval(() => {
+    checkGap();
     if (stopping || maintenanceRun) return;
-    maintenanceRun = runMaintenance(deps, { onError: report, reap: { killGroup, ...opts.reap } })
+    maintenanceRun = runMaintenance(deps, {
+      onError: report,
+      reap: { killGroup, ...opts.reap },
+      skipReap: clock() < reapSkipUntil,
+    })
       .catch((e) => report(e))
       .finally(() => {
         maintenanceRun = undefined;
@@ -423,6 +489,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       settled: undefined as unknown as Promise<Settled>,
       abandoned: new Promise<'timeout'>((r) => (abandon = () => r('timeout'))),
       abandonTimer: undefined,
+      beat: undefined,
     };
 
     const loseLease = (): void => {
@@ -447,26 +514,32 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
       d.abandonTimer = setTimeout(abandon, stopTimeoutMs);
     };
 
-    d.heartbeat = setInterval(() => {
+    /**
+     * Renew the lease. `force` (right after a detected suspend) renews although the local deadline
+     * passed, as long as the database still names this delivery as the owner: the renewal itself is
+     * fenced, so a job that a peer already reclaimed is lost, not resurrected.
+     */
+    d.beat = (force) => {
       if (d.leaseLost || d.finalized) return;
-      try {
-        touchWorker(db, id, clock());
-      } catch (e) {
-        report(e, job);
-      }
       const now = clock();
-      // Suspended or stalled past our own lease: never renew an expired lease.
-      if (now >= leaseExpiresAt) return loseLease();
-      let renewed: boolean;
+      // Suspended or stalled past our own lease: never renew an expired lease (unless forced).
+      if (!force && now >= leaseExpiresAt) return loseLease();
       try {
-        renewed = renewLease(db, fence, now, config.leaseMs);
+        if (renewLease(db, fence, now, config.leaseMs)) leaseExpiresAt = now + config.leaseMs;
+        else loseLease();
       } catch (e) {
         // E.g. SQLITE_BUSY: retry on the next tick; the local deadline bounds this.
         report(e, job);
-        return;
       }
-      if (renewed) leaseExpiresAt = now + config.leaseMs;
-      else loseLease();
+      try {
+        touchWorker(db, id, now);
+      } catch (e) {
+        report(e, job);
+      }
+    };
+    d.heartbeat = setInterval(() => {
+      checkGap();
+      d.beat?.(false);
     }, config.heartbeatMs);
 
     current = d;
@@ -516,6 +589,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
   const doStop = async (): Promise<void> => {
     stopping = true;
     clearInterval(maintenanceTimer);
+    clearInterval(gapTimer);
     wake?.();
     const d = current;
     if (d) {

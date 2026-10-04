@@ -35,6 +35,8 @@ export interface JobRow {
   lease_expires_at: number | null;
   delivery: number;
   error: string | null;
+  available_at: number | null;
+  transient_retries: number;
   created_at: number;
   updated_at: number;
 }
@@ -63,6 +65,8 @@ export function rowToJob(r: JobRow): Job {
     leaseExpiresAt: r.lease_expires_at,
     delivery: r.delivery,
     error: r.error,
+    availableAt: r.available_at,
+    transientRetries: r.transient_retries,
   };
 }
 
@@ -146,12 +150,13 @@ export function claimNext(db: Db, workerId: string, now: number, leaseMs: number
       .prepare(
         `UPDATE jobs
             SET status = 'running', claimed_by = ?, lease_expires_at = ?,
-                delivery = delivery + 1, updated_at = ?
-          WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1)
+                delivery = delivery + 1, available_at = NULL, updated_at = ?
+          WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND (available_at IS NULL OR available_at <= ?)
+                       ORDER BY id LIMIT 1)
             AND status = 'queued'
           RETURNING *`,
       )
-      .get(workerId, now + leaseMs, now) as JobRow | undefined;
+      .get(workerId, now + leaseMs, now, now) as JobRow | undefined;
     if (!r) return null;
     recordEvent(db, {
       at: now,
@@ -184,9 +189,9 @@ export function recordThrottled(db: Db, now: number, limit: number): boolean {
     .transaction((): boolean => {
       const running = countRunning(db);
       if (running < limit) return false;
-      const next = db.prepare(`SELECT id, chain_id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1`).get() as
-        | { id: number; chain_id: number }
-        | undefined;
+      const next = db
+        .prepare(`SELECT id, chain_id FROM jobs WHERE status = 'queued' AND (available_at IS NULL OR available_at <= ?) ORDER BY id LIMIT 1`)
+        .get(now) as { id: number; chain_id: number } | undefined;
       if (!next) return false;
       const recent = db
         .prepare(`SELECT 1 FROM events WHERE at > ? AND kind = 'job.throttled' LIMIT 1`)
@@ -440,6 +445,55 @@ export function requeueJob(db: Db, jobId: number, opts: { delivery?: number; now
         detail: { why: opts.why ?? 'requeued' },
       });
       return true;
+    })
+    .immediate();
+}
+
+/** First transient retry delay (doubled each time). */
+export const TRANSIENT_RETRY_BASE_MS = 15_000;
+/** Longest transient retry delay. */
+export const TRANSIENT_RETRY_MAX_MS = 300_000;
+
+/** Delay before retry number `retries + 1` (`retries` already scheduled): 15 s, doubled each time, capped at 5 minutes. */
+export function transientRetryDelayMs(retries: number): number {
+  return Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** Math.min(retries, 30), TRANSIENT_RETRY_MAX_MS);
+}
+
+/**
+ * Put a running job back on the queue after a transient failure of the delivery in `fence`: it
+ * becomes claimable again after an exponential backoff (`available_at`), `transient_retries` goes up
+ * and `delivery` is kept, so the next claim is delivery + 1 and this delivery's late writes are
+ * rejected. Fenced; returns null (a no-op) for a stale delivery. Records `job.retry_scheduled`.
+ */
+export function scheduleTransientRetry(
+  db: Db,
+  fence: Fence,
+  now: number,
+  reason: string,
+): { delayMs: number; count: number } | null {
+  return db
+    .transaction((): { delayMs: number; count: number } | null => {
+      const row = db
+        .prepare(`SELECT chain_id, transient_retries FROM jobs WHERE id = ? AND delivery = ? AND status = 'running'`)
+        .get(fence.jobId, fence.delivery) as { chain_id: number; transient_retries: number } | undefined;
+      if (!row) return null;
+      const delayMs = transientRetryDelayMs(row.transient_retries);
+      const count = row.transient_retries + 1;
+      db.prepare(
+        `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL, available_at = ?,
+                transient_retries = ?, updated_at = ?
+          WHERE id = ?`,
+      ).run(now + delayMs, count, now, fence.jobId);
+      recordEvent(db, {
+        at: now,
+        chainId: row.chain_id,
+        jobId: fence.jobId,
+        delivery: fence.delivery,
+        kind: 'job.retry_scheduled',
+        engine: 'kernel',
+        detail: { reason, delayMs, count },
+      });
+      return { delayMs, count };
     })
     .immediate();
 }

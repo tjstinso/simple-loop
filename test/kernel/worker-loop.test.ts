@@ -4,10 +4,11 @@ import { deadLetter, discardDeadLetter, listDeadLetters, retryDeadLetter } from 
 import { EngineRegistry } from '../../src/kernel/engine-registry.js';
 import { processDelivery } from '../../src/kernel/process-delivery.js';
 import { createKernel, type Kernel } from '../../src/kernel/kernel.js';
-import { DuplicateChainError, claimNext, getChain, getJob, listJobsForChain } from '../../src/kernel/queue.js';
+import { recentEvents } from '../../src/kernel/events.js';
+import { DuplicateChainError, claimNext, getChain, getJob, listJobsForChain, requeueJob } from '../../src/kernel/queue.js';
 import type { Engine, Job } from '../../src/kernel/types.js';
 import { liveChildrenFor } from '../../src/kernel/workers.js';
-import { runMaintenance, type WorkerOptions } from '../../src/kernel/worker-loop.js';
+import { detectGap, runMaintenance, type WorkerOptions } from '../../src/kernel/worker-loop.js';
 import { PolicyStore } from '../../src/policy/store.js';
 import { FakeRunner } from '../../src/runner/fake.js';
 import { RunnerRegistry } from '../../src/runner/registry.js';
@@ -182,7 +183,10 @@ describe('worker loop', () => {
     expect(getJob(s.db, job.id)).toMatchObject({ status: 'running', claimedBy: 'other' });
   });
 
-  it('treats an already expired local deadline as lease loss without renewing', async () => {
+  const resumedEvents = (db: ReturnType<typeof setup>['db']) =>
+    recentEvents(db, { limit: 100 }).filter((e) => e.kind === 'worker.resumed');
+
+  it('renews first after a suspend instead of treating the expired local deadline as lease loss', async () => {
     let runSignal: AbortSignal | undefined;
     const s = track(
       setup({
@@ -201,10 +205,91 @@ describe('worker loop', () => {
     vi.setSystemTime(NOW + LEASE + 5_000);
     await tick(HEARTBEAT);
 
-    expect(runSignal?.aborted).toBe(true);
-    expect(getJob(s.db, job.id)).toMatchObject({ status: 'running', leaseExpiresAt: lease, delivery: 1 });
+    expect(runSignal?.aborted).toBe(false);
+    expect(s.leaseOf(job.id)!).toBeGreaterThan(NOW + LEASE + 5_000);
+    expect(s.leaseOf(job.id)!).toBeGreaterThan(lease);
+    expect(getJob(s.db, job.id)).toMatchObject({ status: 'running', delivery: 1 });
+    const resumed = resumedEvents(s.db);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]).toMatchObject({ jobId: job.id, delivery: 1, detail: { worker: w.id } });
+    expect(Number(resumed[0]!.detail.gapMs)).toBeGreaterThanOrEqual(LEASE + 5_000);
+
+    // Once per gap: normal ticks afterwards record nothing more.
+    await tick(5 * HEARTBEAT);
+    expect(resumedEvents(s.db)).toHaveLength(1);
     await w.stop();
-    expect(getJob(s.db, job.id).status).toBe('running'); // left for the reaper
+  });
+
+  it('also detects a gap that only the monotonic clock sees', async () => {
+    let mono = 0;
+    const s = track(setup({ runner: customRunner((_i, signal) => untilAborted(signal)) }));
+    await s.kernel.enqueue('echo', { key: 'a' });
+    const w = s.start({ monotonic: () => mono });
+    await tick();
+    mono += 10 * HEARTBEAT;
+    await tick(HEARTBEAT);
+    expect(resumedEvents(s.db)).toHaveLength(1);
+    await w.stop();
+  });
+
+  it('loses the lease after a suspend when a peer already reclaimed the job', async () => {
+    let runSignal: AbortSignal | undefined;
+    const s = track(
+      setup({
+        runner: customRunner((_input, signal) => {
+          runSignal = signal;
+          return untilAborted(signal);
+        }),
+      }),
+    );
+    const { job } = await s.kernel.enqueue('echo', { key: 'a' });
+    const w = s.start();
+    await tick();
+    vi.setSystemTime(NOW + LEASE + 5_000);
+    requeueJob(s.db, job.id, { delivery: 1, now: Date.now(), why: 'lease expired' });
+    claimNext(s.db, 'other', Date.now(), LEASE);
+    await tick(HEARTBEAT);
+
+    expect(runSignal?.aborted).toBe(true);
+    expect(getJob(s.db, job.id)).toMatchObject({ status: 'running', delivery: 2, claimedBy: 'other' });
+    await w.stop();
+  });
+
+  it('skips the reaper for the grace period after a gap and reaps a lease that is still expired afterwards', async () => {
+    const s = track(setup({ runner: customRunner((_i, signal) => untilAborted(signal)) }));
+    const { job: mine } = await s.kernel.enqueue('echo', { key: 'a' });
+    const { job: peers } = await s.kernel.enqueue('echo', { key: 'b' });
+    const w = s.start({ maintenanceMs: 5_000 });
+    await tick();
+    expect(getJob(s.db, mine.id).claimedBy).toBe(w.id);
+    claimNext(s.db, 'peer', Date.now(), 2_000); // a peer's job whose lease expires during the freeze
+    expect(getJob(s.db, peers.id)).toMatchObject({ status: 'running', claimedBy: 'peer' });
+
+    vi.setSystemTime(Date.now() + 10_000);
+    await tick(HEARTBEAT); // gap detected: grace is max(2 * heartbeat, 30 s) = 30 s
+    await tick(5_000); // a maintenance pass inside the grace
+    expect(getJob(s.db, peers.id).status).toBe('running');
+    expect(getJob(s.db, mine.id)).toMatchObject({ status: 'running', claimedBy: w.id });
+    expect(s.killGroup).not.toHaveBeenCalled();
+
+    await tick(35_000); // grace is over, the expired lease is reaped as before
+    expect(getJob(s.db, peers.id).status).toBe('queued');
+    expect(recentEvents(s.db, { limit: 200 }).some((e) => e.kind === 'job.requeued' && e.jobId === peers.id)).toBe(true);
+    expect(getJob(s.db, mine.id)).toMatchObject({ status: 'running', claimedBy: w.id });
+    await w.stop();
+  });
+
+  it('runMaintenance does not reap with skipReap', async () => {
+    const s = track(setup());
+    await s.kernel.enqueue('echo', { key: 'a' });
+    const j = claimNext(s.db, 'peer', Date.now(), 1_000)!;
+    await runMaintenance(s.kernel.deps, { skipReap: true });
+    expect(getJob(s.db, j.id).status).toBe('running');
+    vi.setSystemTime(Date.now() + 5_000);
+    await runMaintenance(s.kernel.deps, { skipReap: true });
+    expect(getJob(s.db, j.id).status).toBe('running');
+    await runMaintenance(s.kernel.deps);
+    expect(getJob(s.db, j.id).status).toBe('queued');
   });
 
   it('stop() aborts the current run, kills its children and requeues the job immediately', async () => {
@@ -749,5 +834,14 @@ describe('maxConcurrentJobs', () => {
     await tick(5_000);
     expect(s.db.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'job.throttled'`).get()).toEqual({ n: 0 });
     await w.stop();
+  });
+});
+
+describe('detectGap', () => {
+  it('is true only when more than three intervals passed', () => {
+    expect(detectGap(0, 1_000, 1_000)).toBe(false);
+    expect(detectGap(0, 3_000, 1_000)).toBe(false);
+    expect(detectGap(0, 3_001, 1_000)).toBe(true);
+    expect(detectGap(5_000, 5_000 + 6.7 * 3_600_000, 30_000)).toBe(true);
   });
 });

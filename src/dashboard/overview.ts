@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { recentEvents, type EventRow } from '../kernel/events.js';
-import { HEARTBEAT_MS, isWorkerAlive, type LivenessProbe } from '../kernel/inspect.js';
+import { HEARTBEAT_MS, isWorkerAlive, jobStateLabel, type LivenessProbe } from '../kernel/inspect.js';
 import { costOf } from '../kernel/queue.js';
 
 type Db = Database.Database;
@@ -40,6 +40,9 @@ export interface WaitingJob {
   /** When the current delivery was claimed (running jobs). */
   startedAt: number | null;
   createdAt: number;
+  /** A queued job is not claimable before this time (retry delay after a transient failure). */
+  availableAt?: number | null;
+  transientRetries?: number;
 }
 
 export interface WaitingInput {
@@ -99,6 +102,10 @@ export function waitingOn(input: WaitingInput): WaitingOn {
       return { ...base, ...common, kind: 'reviewer', label: 'a reviewer agent', detail: `review job ${queued.id} (attempt ${queued.attempt}) is queued` };
     }
     const live = Object.values(input.workerAlive).some(Boolean);
+    const state = jobStateLabel({ status: 'queued', availableAt: queued.availableAt ?? null, transientRetries: queued.transientRetries ?? 0 }, now);
+    if (state !== 'queued') {
+      return { ...base, ...common, kind: 'worker', label: 'a worker', detail: `${queued.type} job ${queued.id} is ${state}` };
+    }
     const retry = queued.attempt > 1 ? ` (retry, attempt ${queued.attempt})` : '';
     return {
       ...base,
@@ -151,6 +158,8 @@ export interface JobOverview {
   leaseExpiresAt: number | null;
   startedAt: number | null;
   costUsd: number | null;
+  /** `queued`, or `retrying (attempt n, in <time>)` for a job waiting for its retry delay. */
+  state: string;
 }
 
 export interface WorkerOverview {
@@ -199,6 +208,8 @@ interface JobRow {
   claimed_by: string | null;
   lease_expires_at: number | null;
   result: string | null;
+  available_at: number | null;
+  transient_retries: number;
   updated_at: number;
   created_at: number;
 }
@@ -283,6 +294,7 @@ export function buildOverview(
         leaseExpiresAt: j.status === 'running' ? j.lease_expires_at : null,
         startedAt: claimed,
         costUsd: costOf(j.result) ?? null,
+        state: jobStateLabel({ status: j.status, availableAt: j.available_at, transientRetries: j.transient_retries }, now),
       };
     });
     let waiting: WaitingOn | null = null;
@@ -301,6 +313,7 @@ export function buildOverview(
         jobs: jobRows.map((j, i) => ({
           id: j.id, type: j.type, attempt: j.attempt, status: j.status, workerId: j.claimed_by,
           leaseExpiresAt: j.lease_expires_at, startedAt: jobs[i]!.startedAt, createdAt: j.created_at,
+          availableAt: j.available_at, transientRetries: j.transient_retries,
         })),
         workerAlive,
         deadLetter: dl ? { reason: dl.reason, error: dl.error } : null,

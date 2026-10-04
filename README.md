@@ -195,7 +195,8 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | `leaseMs` | `300000` | At least 10000. How long a claim lasts without a heartbeat. |
 | `heartbeatMs` | `30000` | At least 1000, and smaller than half of `leaseMs` (otherwise startup fails). How often a running job's lease is renewed. |
 | `maintenanceMs` | `60000` | At least 5000. Interval of a worker's maintenance (reaper, dead-letter surfacing, reconcile, pruning, sweeps). |
-| `maxDeliveries` | `3` | Integer, at least 1. A job whose lease expires on this delivery is dead-lettered instead of requeued. |
+| `maxDeliveries` | `3` | Integer, at least 1. A job whose lease expires on this delivery is dead-lettered instead of requeued. Deliveries that were retried after a transient failure (see `maxTransientRetries`) are not counted. |
+| `maxTransientRetries` | `8` | Integer, at least 1. How often a job whose delivery failed only because of a transient network problem is requeued with a delay before it is dead-lettered (see [Suspended machine and transient failures](#suspended-machine-and-transient-failures)). Separate from `maxDeliveries`. |
 | `cloneUrlTemplate` | `https://github.com/{repo}.git` | Fetch and push URL; `{repo}` is replaced by `owner/name`. With `github.tokenEnv` it must be an `https://` URL without credentials. |
 | `github` | absent | Optional object: the factory's own GitHub identity, see "Running as its own GitHub identity". `tokenEnv` (variable holding the token), `expectLogin` (the login it must resolve to; required with `tokenEnv`), `commitName` and `commitEmail` (author and committer of factory commits). Without it nothing changes. |
 
@@ -314,7 +315,7 @@ The kernel table `events` is an append-only log of lifecycle transitions: `id`, 
 
 | Recorded by | Kinds |
 | --- | --- |
-| kernel | `chain.created`, `job.queued`, `job.claimed`, `job.lease_lost`, `job.succeeded` (with `costUsd` when the result has one), `job.requeued`, `job.dead_lettered` (with the reason), `dead_letter.retried`, `dead_letter.discarded`, `chain.cancelled`, `chain.completed`, `chain.waiting` |
+| kernel | `chain.created`, `job.queued`, `job.claimed`, `job.lease_lost`, `job.succeeded` (with `costUsd` when the result has one), `job.requeued`, `job.retry_scheduled` (reason, delay in ms, retry count), `worker.resumed` (gap length; recorded after a detected suspend or stall), `job.dead_lettered` (with the reason), `dead_letter.retried`, `dead_letter.discarded`, `chain.cancelled`, `chain.completed`, `chain.waiting` |
 | software engine | `pr.opened`, `labels.changed`, `review.verdict` (verdict and attempt), `merge.requested`, `merge.enabled`, `merge.needs_human`, `followup.filed`, `secret_guard.refused` (kinds only) |
 
 Lease renewals are deliberately not recorded (too noisy).
@@ -410,6 +411,17 @@ config:
 ```
 
 The review policy is read-only by tool restriction: no `Edit`, `Write` or general `Bash`, only the four read-only git subcommands. Its prompt tells the reviewer to pass `--no-ext-diff --no-textconv` to `git diff`, `git show` and `git log -p` and never to use `--output` (a prompt rule, not enforced: the `Bash(git diff:*)` rules cannot express it). The agent must end its final message with one fenced `json` block; the last such block is parsed.
+
+## Suspended machine and transient failures
+
+A suspended machine pauses everything: every process is frozen, including the heartbeat timers, and the wall clock keeps running. The factory does not keep the machine awake or look at the network interface; it makes the resume harmless.
+
+- **Gap detection.** Each worker compares the time between two of its timer ticks on the wall clock and on a monotonic clock (which does not advance while some systems are suspended). When more than three intervals (3 x `heartbeatMs`) passed on either, it first renews the lease of its own running job, even though the lease expired on the wall clock, and records `worker.resumed` with the gap length, once per gap. The renewal is fenced, so a job a peer already reclaimed is lost as before.
+- **Reaper grace.** After a detected gap the worker's maintenance pass skips the reaper for `2 * heartbeatMs` (at least 30 seconds), so owners of leases that expired only because everything was frozen can renew them before a peer requeues the job or kills the worker. Every worker applies this rule to itself. A lease that is still expired after the grace is reaped as before (kill before reclaim, requeue or dead-letter).
+- **Transient failures.** A failure that is clearly a network problem at workspace preparation or in `onJobStart` is not dead-lettered: git output with `Could not resolve host`, `unable to access`, `Connection timed out`, `Connection reset`, `early EOF`, `Failed to connect`, `Network is unreachable` or `Temporary failure in name resolution`, a `gh` error without an HTTP status (`error connecting to api.github.com`), and HTTP 429 and 5xx. The job is requeued with `available_at` set in the future: 15 seconds, doubled each time, at most 5 minutes. `claimNext` skips it until then. The attempt is cleaned up like any failed delivery and its fence rejects late writes. Each retry records `job.retry_scheduled` (reason, delay, count), `factory show` lists these events, and `factory status` and the dashboard show the job as `retrying (attempt n, in <time>)` instead of `queued`.
+- **Budget.** Retries are counted in `transient_retries`, not against `maxDeliveries`; the reaper compares `delivery - transient_retries` with `maxDeliveries`. After `maxTransientRetries` retries the job is dead-lettered (`runner_error`) with `transient_retries_exhausted` and the last error in its message. A dead letter whose surfacing fails because GitHub is unreachable stays unsurfaced and maintenance surfaces it later, as before.
+
+Failures of the agent itself (the model run) are not retried this way, and permanent failures (a bad ref, an invalid result) are dead-lettered immediately. Single machine only.
 
 ## Concurrency and safety
 

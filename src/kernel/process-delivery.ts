@@ -1,7 +1,8 @@
 import type Database from 'better-sqlite3';
 import type { RunHooks, RunInput, Workspace } from '../runner/types.js';
 import { DeadLetterStateError, deadLetter, markDeadLetterSurfaced } from './dlq.js';
-import { commitTransition, getChain, recordResult } from './queue.js';
+import { commitTransition, getChain, recordResult, scheduleTransientRetry } from './queue.js';
+import { isTransientError } from './transient.js';
 import { EffectError, HandBackError, StaleDeliveryError } from './types.js';
 import type {
   ChainView,
@@ -23,12 +24,14 @@ type Db = Database.Database;
  * - `succeeded`: the transition committed.
  * - `dead_lettered`: this delivery dead-lettered the job (and surfaced it).
  * - `stale`: this delivery no longer owns the job; nothing was written.
+ * - `retry_scheduled`: a transient failure (network, 429, 5xx) before the agent started; the job is
+ *   queued again with a delay (see `scheduleTransientRetry`) until `maxTransientRetries` is used up.
  * - `aborted`: the signal fired before the runner resolved (during workspace
  *   prepare, input building, or the run itself); nothing was written and the
  *   job is still `running` at this delivery (the caller decides). Once the
  *   runner has resolved, an abort no longer stops post-processing.
  */
-export type DeliveryOutcome = 'succeeded' | 'dead_lettered' | 'stale' | 'aborted';
+export type DeliveryOutcome = 'succeeded' | 'dead_lettered' | 'stale' | 'retry_scheduled' | 'aborted';
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -130,6 +133,20 @@ export async function processDelivery(
     return 'dead_lettered';
   };
 
+  /**
+   * A transient failure before the agent started: requeue with backoff, or dead-letter once
+   * `maxTransientRetries` retries were used. Anything else is `fail`ed by the caller.
+   */
+  const failOrRetry = async (e: unknown, what: string): Promise<DeliveryOutcome> => {
+    const max = Math.max(1, deps.config.maxTransientRetries ?? 8);
+    const text = `${what}: ${message(e)}`;
+    if ((job.transientRetries ?? 0) >= max) {
+      return fail('runner_error', `transient_retries_exhausted after ${job.transientRetries ?? 0} retries: ${text}`);
+    }
+    const scheduled = scheduleTransientRetry(db, fence, clock(), text);
+    return scheduled === null ? 'stale' : 'retry_scheduled';
+  };
+
   try {
     if (!parsed.success) {
       return await fail('runner_error', `invalid engine state for chain ${chain.id}: ${parsed.error.message}`);
@@ -138,10 +155,12 @@ export async function processDelivery(
       try {
         await engine.onJobStart(view, job);
       } catch (e) {
+        if (signal.aborted) return 'aborted';
+        if (isTransientError(e)) return await failOrRetry(e, 'onJobStart failed');
         report(deps, e, `onJobStart for job ${job.id}`);
       }
     }
-    return await deliver(deps, engine, view, job, fence, workerId, signal, fail);
+    return await deliver(deps, engine, view, job, fence, workerId, signal, fail, failOrRetry);
   } finally {
     try {
       await engine.cleanup(view, job);
@@ -161,6 +180,7 @@ async function deliver(
   workerId: string,
   signal: AbortSignal,
   fail: (reason: DeadLetterReason, error: string) => Promise<DeliveryOutcome>,
+  failOrRetry: (e: unknown, what: string) => Promise<DeliveryOutcome>,
 ): Promise<DeliveryOutcome> {
   const { db, clock } = deps;
   let result: unknown = job.result;
@@ -186,6 +206,7 @@ async function deliver(
       // An abort (worker stopping, lease lost) is not a failure of the job.
       if (signal.aborted) return 'aborted';
       if (e instanceof HandBackError) return handBack(e);
+      if (isTransientError(e)) return failOrRetry(e, 'workspace prepare failed');
       return fail('runner_error', `workspace prepare failed: ${message(e)}`);
     }
 

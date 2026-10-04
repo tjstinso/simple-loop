@@ -16,6 +16,10 @@ export interface JobView {
   /** Milliseconds since the last event of this job (or of its chain when the job has none). */
   sinceLastEventMs: number | null;
   costUsd: number | null;
+  /** A queued job waiting for a retry after a transient failure is not claimable before this time. */
+  availableAt: number | null;
+  /** Retries scheduled after transient failures. */
+  transientRetries: number;
 }
 
 export interface ChainCost {
@@ -32,6 +36,8 @@ interface JobDbRow {
   claimed_by: string | null;
   lease_expires_at: number | null;
   result: string | null;
+  available_at: number | null;
+  transient_retries: number;
   last_at: number | null;
 }
 
@@ -40,7 +46,7 @@ export function chainJobViews(db: Db, chainId: number, now: number): JobView[] {
   const chainLast = (db.prepare('SELECT MAX(at) AS at FROM events WHERE chain_id = ?').get(chainId) as { at: number | null }).at;
   const rows = db
     .prepare(
-      `SELECT j.id, j.type, j.attempt, j.status, j.delivery, j.claimed_by, j.lease_expires_at, j.result,
+      `SELECT j.id, j.type, j.attempt, j.status, j.delivery, j.claimed_by, j.lease_expires_at, j.result, j.available_at, j.transient_retries,
               (SELECT MAX(at) FROM events e WHERE e.job_id = j.id) AS last_at
          FROM jobs j WHERE j.chain_id = ? ORDER BY j.id`,
     )
@@ -57,6 +63,8 @@ export function chainJobViews(db: Db, chainId: number, now: number): JobView[] {
       leaseExpiresAt: r.status === 'running' ? r.lease_expires_at : null,
       sinceLastEventMs: last === null ? null : Math.max(0, now - last),
       costUsd: costOf(r.result) ?? null,
+      availableAt: r.available_at,
+      transientRetries: r.transient_retries,
     };
   });
 }
@@ -206,3 +214,17 @@ export function formatLastCheck(at: number | null, result: string | null, now: n
 }
 
 export const formatCost = (usd: number): string => `$${usd.toFixed(4)}`;
+
+/**
+ * A job's status as shown to people: a queued job waiting for its retry delay after a transient
+ * failure reads `retrying (attempt n, in <time>)` (n = retries scheduled so far) instead of `queued`.
+ */
+export function jobStateLabel(
+  job: { status: string; availableAt: number | null; transientRetries: number },
+  now: number,
+): string {
+  if (job.status === 'queued' && job.availableAt !== null && job.availableAt > now) {
+    return `retrying (attempt ${job.transientRetries}, in ${formatAge(job.availableAt - now)})`;
+  }
+  return job.status;
+}

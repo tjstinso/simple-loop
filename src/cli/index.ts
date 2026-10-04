@@ -8,6 +8,7 @@ import {
   chainTimeline,
   formatAge,
   formatLastCheck,
+  jobStateLabel,
   formatCost,
   listWorkerViews,
   parseDuration,
@@ -118,7 +119,7 @@ function statusLines(chains: StatusChain[], now: number): string[] {
     const checked = c.status === 'waiting' ? ` ${formatLastCheck(c.lastCheckedAt, c.lastCheckResult, now)}` : '';
     lines.push(`${c.id} ${c.engine} ${c.status}${c.description === null ? '' : ` ${c.description}`}${checked}`);
     for (const j of c.jobs) {
-      const parts = [`job ${j.id}`, j.type, `attempt=${j.attempt}`, j.status, `delivery=${j.delivery}`];
+      const parts = [`job ${j.id}`, j.type, `attempt=${j.attempt}`, jobStateLabel(j, now), `delivery=${j.delivery}`];
       if (j.workerId !== null) parts.push(`worker=${j.workerId}`);
       if (j.sinceLastEventMs !== null) parts.push(`last-event=${formatAge(j.sinceLastEventMs)} ago`);
       if (j.leaseExpiresAt !== null) parts.push(`lease-expires=${new Date(j.leaseExpiresAt).toISOString()}`);
