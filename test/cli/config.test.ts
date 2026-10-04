@@ -28,6 +28,8 @@ describe('loadConfig', () => {
       historyRetentionDays: 30,
       keepWorktreeOnFailure: true,
       keptWorktreeMaxAgeMs: 604800000,
+      allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
+      maxHumanRounds: 5,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
     });
   });

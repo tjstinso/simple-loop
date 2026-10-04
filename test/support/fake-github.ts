@@ -1,4 +1,14 @@
-import { AutoMergeRefusedError, GitHostError, type GitHost, type Issue, type Pr } from '../../src/engines/software/github.js';
+import {
+  AutoMergeRefusedError,
+  GitHostError,
+  type GitHost,
+  type Issue,
+  type Pr,
+  type PrConversationComment,
+  type PrFeedback,
+  type PrReview,
+  type PrReviewComment,
+} from '../../src/engines/software/github.js';
 
 interface StoredIssue {
   number: number;
@@ -22,6 +32,8 @@ export class FakeGitHost implements GitHost {
   private nextNumber = 1;
   private failures = new Map<string, Error>();
   private autoMerge = new Set<number>();
+  private feedback = new Map<number, PrFeedback>();
+  private nextFeedbackId = 1;
   /** Like the repository setting "Allow auto-merge": off makes `mergePr` throw AutoMergeRefusedError. */
   autoMergeAllowed = true;
   /** The branch protection's required checks: auto-merge merges only once they pass. */
@@ -68,6 +80,38 @@ export class FakeGitHost implements GitHost {
   markMerged(n: number): void {
     this.prOrThrow(n).state = 'merged';
     this.autoMerge.delete(n);
+  }
+
+  private feedbackOf(n: number): PrFeedback {
+    let f = this.feedback.get(n);
+    if (!f) {
+      f = { reviews: [], reviewComments: [], comments: [] };
+      this.feedback.set(n, f);
+    }
+    return f;
+  }
+
+  /** A review by a person (`author_association` defaults to COLLABORATOR); returns its id. */
+  addReview(n: number, r: Partial<PrReview> & Pick<PrReview, 'state' | 'submittedAt'>): number {
+    const id = r.id ?? this.nextFeedbackId++;
+    this.feedbackOf(n).reviews.push({ id, author: 'alice', authorAssociation: 'COLLABORATOR', body: '', ...r });
+    return id;
+  }
+
+  /** An inline review comment; returns its id. */
+  addReviewComment(n: number, c: Partial<PrReviewComment> & Pick<PrReviewComment, 'createdAt'>): number {
+    const id = c.id ?? this.nextFeedbackId++;
+    this.feedbackOf(n).reviewComments.push({
+      id, author: 'alice', authorAssociation: 'COLLABORATOR', path: 'src/a.ts', line: 1, diffHunk: '@@ -1 +1 @@', body: '', reviewId: null, ...c,
+    });
+    return id;
+  }
+
+  /** A conversation comment on the pull request (not an inline one); returns its id. */
+  addConversationComment(n: number, c: Partial<PrConversationComment> & Pick<PrConversationComment, 'createdAt'>): number {
+    const id = c.id ?? this.nextFeedbackId++;
+    this.feedbackOf(n).comments.push({ id, author: 'alice', authorAssociation: 'COLLABORATOR', body: '', ...c });
+    return id;
   }
 
   setPrHead(n: number, sha: string): void {
@@ -191,5 +235,16 @@ export class FakeGitHost implements GitHost {
     // Like `gh pr merge --auto`: merges now when the required checks already pass, else when they do.
     if (this.requiredChecksPass) pr.state = 'merged';
     else this.autoMerge.add(n);
+  }
+
+  async listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback> {
+    this.enter('listPrFeedback', [repo, prNumber]);
+    this.prOrThrow(prNumber);
+    const f = this.feedbackOf(prNumber);
+    // Factory comments are conversation comments too, as on GitHub.
+    const factory = (this.comments.get(prNumber) ?? []).map((body, i) => ({
+      id: -1 - i, author: 'factory', authorAssociation: 'OWNER', body, createdAt: new Date(0).toISOString(),
+    }));
+    return structuredClone({ reviews: f.reviews, reviewComments: f.reviewComments, comments: [...factory, ...f.comments] });
   }
 }

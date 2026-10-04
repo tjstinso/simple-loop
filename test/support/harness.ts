@@ -36,6 +36,8 @@ export const ISSUE_BODY ='## Goal\nMake the widget work.\n\n## Acceptance criter
 export interface HarnessOptions {
   defaultProfile?: 'supervised' | 'automatic';
   keptWorktreeMaxAgeMs?: number;
+  maxHumanRounds?: number;
+  allowedAuthorAssociations?: string[];
 }
 
 export interface DeliveryRecord {
@@ -187,6 +189,8 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
         defaultProfile: opts.defaultProfile ?? 'supervised',
         requiredSections: ['## Goal', '## Acceptance criteria'],
         ...(opts.keptWorktreeMaxAgeMs === undefined ? {} : { keptWorktreeMaxAgeMs: opts.keptWorktreeMaxAgeMs }),
+        ...(opts.maxHumanRounds === undefined ? {} : { maxHumanRounds: opts.maxHumanRounds }),
+        ...(opts.allowedAuthorAssociations === undefined ? {} : { allowedAuthorAssociations: opts.allowedAuthorAssociations }),
       },
       now: clock,
       sleep: async () => {},

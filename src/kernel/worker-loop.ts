@@ -4,7 +4,16 @@ import { readProcessStartTime } from '../util/proc.js';
 import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
 import { cancelChain, listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
 import { recordEvent } from './events.js';
-import { claimNext, completeWaitingChain, getChain, getJob, renewLease, requeueJob } from './queue.js';
+import {
+  claimNext,
+  completeWaitingChain,
+  getChain,
+  getJob,
+  renewLease,
+  requeueJob,
+  startWaitingChainWork,
+  updateWaitingChainState,
+} from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
 import { pruneHistory } from './retention.js';
 import type { ChainView, Fence, Job, KernelDeps } from './types.js';
@@ -134,6 +143,21 @@ export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler =
       };
       const result = await engine.reconcile(view);
       if (result.outcome === 'none') continue;
+      if (result.outcome === 'update') {
+        updateWaitingChainState(deps.db, id, result.engineState, deps.clock());
+        continue;
+      }
+      if (result.outcome === 'new_work') {
+        const policy = deps.policies.match(result.job.policyKind, result.job.labels);
+        startWaitingChainWork(
+          deps.db,
+          id,
+          result.engineState,
+          { type: result.job.type, attempt: result.job.attempt, policyId: policy.id, payload: result.job.payload },
+          deps.clock(),
+        );
+        continue;
+      }
       let applied: boolean;
       let finalView = view;
       if (result.outcome === 'completed') {

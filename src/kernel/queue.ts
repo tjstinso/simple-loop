@@ -284,6 +284,67 @@ export function completeWaitingChain(db: Db, chainId: number, engineState: unkno
   return r.changes === 1;
 }
 
+/**
+ * Starts new work for a chain that is still `waiting`, in one transaction: creates the job (queued),
+ * sets the chain `active` and stores `engineState`. Returns false (writing nothing) when the chain is
+ * in any other status or the job already exists, so two workers cannot start the same work twice.
+ */
+export function startWaitingChainWork(
+  db: Db,
+  chainId: number,
+  engineState: unknown,
+  job: ResolvedNewJob,
+  now: number,
+): boolean {
+  try {
+    return startWork(db, chainId, engineState, job, now);
+  } catch (e) {
+    if (e instanceof RollbackSignal) return false;
+    throw e;
+  }
+}
+
+class RollbackSignal extends Error {}
+
+function startWork(db: Db, chainId: number, engineState: unknown, job: ResolvedNewJob, now: number): boolean {
+  return db
+    .transaction((): boolean => {
+      const r = db
+        .prepare(`UPDATE chains SET status = 'active', engine_state = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`)
+        .run(JSON.stringify(engineState), now, chainId);
+      if (r.changes !== 1) return false;
+      const added = db
+        .prepare(
+          `INSERT OR IGNORE INTO jobs
+             (chain_id, type, attempt, status, policy_id, payload, delivery, created_at, updated_at)
+           VALUES (?, ?, ?, 'queued', ?, ?, 0, ?, ?)`,
+        )
+        .run(chainId, job.type, job.attempt, job.policyId, json(job.payload), now, now);
+      // The job exists already (a duplicate round): roll the whole change back.
+      if (added.changes !== 1) throw new RollbackSignal();
+      recordEvent(db, { at: now, chainId, kind: 'chain.active', engine: 'kernel', detail: { by: 'reconcile' } });
+      recordEvent(db, {
+        at: now,
+        chainId,
+        jobId: Number(added.lastInsertRowid),
+        delivery: 0,
+        kind: 'job.queued',
+        engine: 'kernel',
+        detail: { type: job.type, attempt: job.attempt },
+      });
+      return true;
+    })
+    .immediate();
+}
+
+/** Stores `engineState` of a chain that is still `waiting` (false, writing nothing, otherwise). */
+export function updateWaitingChainState(db: Db, chainId: number, engineState: unknown, now: number): boolean {
+  const r = db
+    .prepare(`UPDATE chains SET engine_state = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`)
+    .run(JSON.stringify(engineState), now, chainId);
+  return r.changes === 1;
+}
+
 /** Mark a running job failed. Throws StaleDeliveryError if the fence is stale. */
 export function failJob(db: Db, fence: Fence, error: string): void {
   const r = db

@@ -12,6 +12,8 @@ const ConfigSchema = z.object({
   historyRetentionDays: z.number().positive().default(30),
   keepWorktreeOnFailure: z.boolean().default(true),
   keptWorktreeMaxAgeMs: z.number().nonnegative().default(604_800_000),
+  allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
+  maxHumanRounds: z.number().int().min(1).default(5),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
 });
 

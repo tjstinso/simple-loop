@@ -4,7 +4,8 @@ import { fileFollowups, storeFollowups } from './followups.js';
 import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type EffectOutcome, type Job } from '../../kernel/types.js';
 import { AutoMergeRefusedError, GitHostError, type GitHost, type Issue } from './github.js';
 import type { GitPorts } from './git-ports.js';
-import { LABEL_NEEDS_HUMAN, type SoftwareEffect } from './schemas.js';
+import { PROFILES } from './profiles.js';
+import { LABEL_IN_PROGRESS, LABEL_NEEDS_HUMAN, LABEL_READY_FOR_MERGE, type SoftwareEffect } from './schemas.js';
 import { findingsOf, redactSecrets, scanPaths, scanText, SCAN_TRUNCATED_KIND } from './secret-scan.js';
 import type { SoftwareState } from './state.js';
 import type { SoftwareWorkspace } from './workspace.js';
@@ -25,6 +26,8 @@ export interface EffectContext {
    * the commit message and the PR title and body (default: none, so only the patterns apply).
    */
   secretValues?: () => readonly string[];
+  /** Clock (epoch ms); `open_pr` stamps `feedbackHandledAt` with it. */
+  now?: () => number;
   /** Records a lifecycle event for this chain and delivery (detail: structured, never agent text). */
   events?: (kind: string, detail?: Record<string, unknown>) => void;
 }
@@ -38,6 +41,7 @@ const EffectSchemas = {
   open_pr: z.object({ kind: z.literal('open_pr') }),
   set_labels: z.object({ kind: z.literal('set_labels'), target: Target, add: z.array(z.string()), remove: z.array(z.string()) }),
   merge_pr: z.object({ kind: z.literal('merge_pr') }),
+  round_summary: z.object({ kind: z.literal('round_summary') }),
   comment: z.object({ kind: z.literal('comment'), target: Target, body: z.string(), marker: z.string().min(1) }),
 } as const;
 type Supported = Exclude<SoftwareEffect, { kind: 'file_followups' }>;
@@ -197,7 +201,55 @@ function titleOf(ctx: EffectContext, issue: Issue): string {
   return oneLine(redactSecrets(issue.title, secretValuesOf(ctx))) || `#${ctx.chain.state.issueNumber}`;
 }
 
-async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void> {
+/** The number of the human feedback round an execute job works on (absent for the factory's own attempts). */
+function humanRoundOf(job: Job): number | null {
+  const n = (job.payload as { humanRound?: unknown } | null | undefined)?.humanRound;
+  return typeof n === 'number' ? n : null;
+}
+
+/**
+ * A human feedback round whose revision changed nothing: one comment says so (with the agent's
+ * summary, redacted), the chain goes back to `awaiting_merge` and the review is skipped. The same
+ * feedback is not retried: `feedbackHandledAt` was set when the round started.
+ */
+async function handBackUnchanged(ctx: EffectContext, fence: EffectFence, round: number): Promise<EffectOutcome<SoftwareState>> {
+  const { repo, issueNumber } = ctx.chain.state;
+  const n = await prNumber(ctx, 'no PR found for the feedback round');
+  const summary = summaryOf(ctx.job);
+  const why = summary ? neutralizeSummary(redactSecrets(summary, secretValuesOf(ctx))) : 'the agent gave no explanation';
+  await commentOnce(
+    ctx,
+    fence,
+    n,
+    `human-round-${round}-unchanged`,
+    `The factory looked at the feedback but made no change to the branch. The agent said:\n\n${why}`,
+  );
+  fence.assertCurrent();
+  const ready = PROFILES[ctx.chain.state.profile].onApprove === 'merge' ? [] : [LABEL_READY_FOR_MERGE];
+  await ctx.host.setLabels(repo, n, ready, [LABEL_IN_PROGRESS]);
+  await ctx.host.setLabels(repo, issueNumber, [], [LABEL_IN_PROGRESS]);
+  ctx.events?.('feedback.unchanged', { round });
+  return { engineState: { phase: 'awaiting_merge' }, finish: { chainStatus: 'waiting' } };
+}
+
+/** After the factory's review approved a revision for a human round: one summary comment with the new commit. */
+async function roundSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
+  const { repo, humanRounds, lastSummary } = ctx.chain.state;
+  const round = humanRounds ?? 0;
+  const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
+  if (!pr) throw new EffectError('no PR found for the round summary', 'effect_error');
+  const summary = lastSummary ? neutralizeSummary(redactSecrets(lastSummary, secretValuesOf(ctx))) : 'no summary was given';
+  const commit = pr.headSha ? `https://github.com/${repo}/commit/${pr.headSha}` : '(unknown)';
+  await commentOnce(
+    ctx,
+    fence,
+    pr.number,
+    `human-round-${round}`,
+    `The factory revised this pull request after the feedback (round ${round}).\n\n${summary}\n\nNew commit: ${commit}\n\nReview threads are left open for you to resolve.`,
+  );
+}
+
+async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
   const issue = await ctx.host.getIssue(repo, issueNumber);
@@ -210,6 +262,8 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
   if (head === ws.seedSha) {
     // Nothing new in this delivery. If the branch was already published (e.g. a rerun after a
     // crash that followed the push), the work is on the remote: succeed so open_pr can proceed.
+    const round = humanRoundOf(ctx.job);
+    if (round !== null) return handBackUnchanged(ctx, fence, round);
     if (ws.remoteHeadSha !== null) return;
     throw new EffectError('no changes produced', 'runner_error');
   }
@@ -228,7 +282,7 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<void>
   }
 }
 
-async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {
+async function openPr(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
   const issue = await openIssue(ctx);
@@ -242,6 +296,8 @@ async function openPr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   fence.assertCurrent();
   await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: titleOf(ctx, issue), body });
   ctx.events?.('pr.opened', { branch, base: ws.baseBranch });
+  // People's feedback counts from here on.
+  return ctx.now ? { engineState: { feedbackHandledAt: new Date(ctx.now()).toISOString() } } : undefined;
 }
 
 async function setLabels(ctx: EffectContext, fence: EffectFence, e: Extract<Supported, { kind: 'set_labels' }>): Promise<void> {
@@ -367,9 +423,9 @@ async function fileFollowupsEffect(effect: Effect, ctx: EffectContext, fence: Ef
  */
 const WORKSPACE_EFFECTS = new Set(['commit_push', 'open_pr']);
 
-async function asRunnerError(body: () => Promise<void>): Promise<void> {
+async function asRunnerError<T>(body: () => Promise<T>): Promise<T> {
   try {
-    await body();
+    return await body();
   } catch (e) {
     // A closed issue is not something a rerun of the agent can fix (R38): it stays effect_error.
     if (e instanceof StaleDeliveryError || e instanceof IssueClosedError) throw e;
@@ -397,7 +453,7 @@ export async function runSoftwareEffect(
   const e = parse(effect);
   fence.assertCurrent();
   const run = () => runClassified(e, ctx, fence);
-  if (ctx.job.type === 'execute' && WORKSPACE_EFFECTS.has(e.kind)) return asRunnerError(async () => void (await run()));
+  if (ctx.job.type === 'execute' && WORKSPACE_EFFECTS.has(e.kind)) return asRunnerError(run);
   return run();
 }
 
@@ -412,6 +468,8 @@ async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFenc
         return setLabels(ctx, fence, e);
       case 'merge_pr':
         return mergePr(ctx, fence);
+      case 'round_summary':
+        return roundSummary(ctx, fence);
       case 'comment':
         return comment(ctx, fence, e);
     }
