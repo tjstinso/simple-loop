@@ -294,6 +294,33 @@ describe('runSoftwareEffect', () => {
         expect(err.message).not.toContain(API_KEY);
       });
 
+      it('commit_push refuses a secret commit hidden behind a replace ref', async () => {
+        const ws = await provider.prepare(chain(), job());
+        writeFileSync(join(ws.path, 'leak.txt'), `${API_KEY}\n`);
+        git(ws.path, ['add', '.']);
+        git(ws.path, ['commit', '-q', '-m', 'bad']);
+        const bad = git(ws.path, ['rev-parse', 'HEAD']);
+        const seedTree = git(ws.path, ['rev-parse', `${ws.seedSha}^{tree}`]);
+        const clean = git(ws.path, ['commit-tree', seedTree, '-p', ws.seedSha, '-m', 'clean']);
+        git(ws.path, ['replace', bad, clean]);
+        // The worktree and index match the clean replacement, so commitAll adds nothing: HEAD stays BAD.
+        git(ws.path, ['rm', '-q', '-f', 'leak.txt']);
+        const err = await refuse(ws);
+        expect(err.message).toMatch(/known-secret-value/);
+        expect(git(ws.path, ['rev-parse', 'HEAD'])).toBe(bad);
+      });
+
+      it('a clean change with an unrelated replace ref still pushes the pinned sha', async () => {
+        const ws = await provider.prepare(chain(), job());
+        const emptyTree = git(ws.path, ['hash-object', '-t', 'tree', '/dev/null']);
+        const x = git(ws.path, ['commit-tree', emptyTree, '-m', 'x']);
+        const y = git(ws.path, ['commit-tree', emptyTree, '-m', 'y']);
+        git(ws.path, ['replace', x, y]);
+        writeFileSync(join(ws.path, 'clean.txt'), 'clean\n');
+        await runSoftwareEffect({ kind: 'commit_push' }, ctx({ workspace: ws, git: ports, secretValues: secrets }), fence());
+        expect(remoteHead()).toBe(git(ws.path, ['rev-parse', 'HEAD']));
+      });
+
       it('a clean change still pushes', async () => {
         const ws = await provider.prepare(chain(), job());
         writeFileSync(join(ws.path, 'clean.ts'), 'export const answer = 42;\n');
@@ -306,7 +333,7 @@ describe('runSoftwareEffect', () => {
         writeFileSync(join(ws.path, 'leak.txt'), `${API_KEY}\n`);
         git(ws.path, ['add', '.']);
         git(ws.path, ['commit', '-q', '-m', 'agent commit']);
-        git(ws.path, ['rm', '-q', 'leak.txt']);
+        git(ws.path, ['rm', '-q', '-f', 'leak.txt']);
         git(ws.path, ['commit', '-q', '-m', 'agent removes it again']);
         expect((await refuse(ws)).message).toMatch(/known-secret-value/);
       });

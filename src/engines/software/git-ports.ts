@@ -60,11 +60,20 @@ const SAFE_CONFIG = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=fal
  * global attributes file can turn files binary. Scan commands therefore ignore the global and system
  * config and any config passed through the environment, and pin the settings that matter. (The push
  * itself keeps the operator's configuration: it needs the credential helper or ssh setup.)
+ * They also see the real objects: `refs/replace/*` (which the agent can write in the shared cache)
+ * and a graft file would let `log`/`cat-file` show a clean commit in place of the one `git push`
+ * actually sends, since pack-objects ignores replacements.
  */
-const SCAN_CONFIG = ['-c', 'core.attributesFile=/dev/null', '-c', 'log.showRoot=true', '-c', 'core.bigFileThreshold=1g'];
+const SCAN_CONFIG = ['--no-replace-objects', '-c', 'core.attributesFile=/dev/null', '-c', 'log.showRoot=true', '-c', 'core.bigFileThreshold=1g'];
 
 function scanEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = { ...env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  const out: NodeJS.ProcessEnv = {
+    ...env,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_GRAFT_FILE: '/dev/null',
+  };
   for (const k of Object.keys(out)) {
     if (k === 'GIT_CONFIG_PARAMETERS' || k === 'GIT_CONFIG_COUNT' || k === 'GIT_CONFIG' || k.startsWith('GIT_CONFIG_KEY_') || k.startsWith('GIT_CONFIG_VALUE_')) {
       delete out[k];
@@ -93,10 +102,14 @@ function gitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-/** The git subcommand of an argument list (after any leading `-c key=value` pairs), for messages. */
+/** The git subcommand of an argument list (after any leading global options), for messages. */
 function subcommand(args: string[]): string {
   let i = 0;
-  while (args[i] === '-c') i += 2;
+  for (;;) {
+    if (args[i] === '-c') i += 2;
+    else if (args[i] === '--no-replace-objects') i += 1;
+    else break;
+  }
   return args[i] ?? 'command';
 }
 

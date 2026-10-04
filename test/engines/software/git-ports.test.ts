@@ -189,6 +189,21 @@ describe('ExecGitPorts', () => {
       expect(changes.text).toContain('plain message');
     });
 
+    it('a replace ref cannot swap the scanned commit for a clean one', async () => {
+      writeFileSync(join(ws.path, 'leak.txt'), 'replaced-away content\n');
+      git(ws.path, ['add', '.']);
+      git(ws.path, ['commit', '-q', '-m', 'bad']);
+      const bad = git(ws.path, ['rev-parse', 'HEAD']);
+      const seedTree = git(ws.path, ['rev-parse', `${ws.seedSha}^{tree}`]);
+      const clean = git(ws.path, ['commit-tree', seedTree, '-p', ws.seedSha, '-m', 'clean']);
+      git(ws.path, ['replace', bad, clean]);
+      expect(await ports.headSha(ws)).toBe(bad);
+      const c = await ports.addedChanges(ws, bad);
+      expect(c.paths).toEqual(['leak.txt']);
+      expect(c.text.split('\n')).toContain('replaced-away content');
+      expect(c.text.split('\n')).toContain('bad');
+    });
+
     it('a .gitattributes in the change cannot hide a text file from the scan', async () => {
       writeFileSync(join(ws.path, '.gitattributes'), 'hidden.txt -diff\n');
       writeFileSync(join(ws.path, 'hidden.txt'), 'hidden content\n');
