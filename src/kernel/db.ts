@@ -110,17 +110,25 @@ const CHAIN_COLUMNS: [name: string, ddl: string][] = [
   ['last_check_result', 'TEXT'],
 ];
 
-function addMissingChainColumns(db: Database.Database): void {
-  const have = new Set((db.pragma('table_info(chains)') as { name: string }[]).map((c) => c.name));
-  for (const [name, ddl] of CHAIN_COLUMNS) {
-    if (!have.has(name)) db.exec(`ALTER TABLE chains ADD COLUMN ${name} ${ddl}`);
+const JOB_COLUMNS: [name: string, ddl: string][] = [
+  // A queued job is not claimable before this time (epoch ms; NULL: now). Set when a transient failure schedules a retry.
+  ['available_at', 'INTEGER'],
+  // Retries scheduled after transient failures; not part of the `maxDeliveries` budget.
+  ['transient_retries', 'INTEGER NOT NULL DEFAULT 0'],
+];
+
+function addMissingColumns(db: Database.Database, table: string, columns: [string, string][]): void {
+  const have = new Set((db.pragma(`table_info(${table})`) as { name: string }[]).map((c) => c.name));
+  for (const [name, ddl] of columns) {
+    if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`);
   }
 }
 
 export function migrate(db: Database.Database, extra: string[] = []): void {
   db.transaction(() => {
     db.exec(KERNEL_DDL);
-    addMissingChainColumns(db);
+    addMissingColumns(db, 'chains', CHAIN_COLUMNS);
+    addMissingColumns(db, 'jobs', JOB_COLUMNS);
     for (const ddl of extra) db.exec(ddl);
   })();
 }

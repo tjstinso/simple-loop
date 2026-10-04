@@ -36,6 +36,7 @@ describe('loadConfig', () => {
       heartbeatMs: 30000,
       maintenanceMs: 60000,
       maxDeliveries: 3,
+      maxTransientRetries: 8,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
     });
   });
@@ -109,7 +110,7 @@ describe('loadConfig', () => {
     it('rejects values below the minimums, naming the key', () => {
       for (const [key, value] of [
         ['maxConcurrentJobs', 0], ['maxConcurrentJobs', 1.5], ['leaseMs', 9_999], ['heartbeatMs', 999],
-        ['maintenanceMs', 4_999], ['maxDeliveries', 0],
+        ['maintenanceMs', 4_999], ['maxDeliveries', 0], ['maxTransientRetries', 0],
       ] as const) {
         expect(() => load({ [key]: value }), `${key}=${value}`).toThrow(new RegExp(key));
       }

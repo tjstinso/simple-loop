@@ -36,6 +36,7 @@ const ConfigSchema = z.object({
   heartbeatMs: z.number().int().min(1_000).default(30_000),
   maintenanceMs: z.number().int().min(5_000).default(60_000),
   maxDeliveries: z.number().int().min(1).default(3),
+  maxTransientRetries: z.number().int().min(1).default(8),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
 }).superRefine((c, ctx) => {

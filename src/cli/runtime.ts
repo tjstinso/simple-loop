@@ -53,6 +53,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       leaseMs: config.leaseMs,
       heartbeatMs: config.heartbeatMs,
       maxDeliveries: config.maxDeliveries,
+      maxTransientRetries: config.maxTransientRetries,
       ...(config.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: config.maxConcurrentJobs }),
       historyRetentionDays: config.historyRetentionDays,
     };

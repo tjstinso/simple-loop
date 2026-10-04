@@ -15,6 +15,12 @@ describe('waitingOn', () => {
     expect(w.detail).toContain('no live worker');
   });
 
+  it('shows a job waiting for a transient retry as retrying instead of queued', () => {
+    const w = waitingOn({ ...base, jobs: [job({ availableAt: NOW + 30_000, transientRetries: 2 })] });
+    expect(w.detail).toContain('retrying (attempt 2, in 30s)');
+    expect(w.detail).not.toContain('is queued');
+  });
+
   it('names a retry', () => {
     expect(waitingOn({ ...base, jobs: [job({ attempt: 2 })] }).detail).toContain('retry');
   });

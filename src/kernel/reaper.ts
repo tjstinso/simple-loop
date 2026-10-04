@@ -45,7 +45,7 @@ export function killPidDefault(pid: number): void {
  * first kill the live children of its current delivery and the claiming worker
  * (by pid only, and only while that worker's row still names this job delivery
  * as its current one: a worker that moved on to another job is healthy), mark the children exited, and only then requeue the job or
- * dead-letter it once `delivery >= maxDeliveries`. Never signals this process.
+ * dead-letter it once `delivery - transient_retries >= maxDeliveries`. Never signals this process.
  */
 export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
   const isAlive = deps.isAlive ?? isProcessAlive;
@@ -56,12 +56,12 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
 
   const expired = db
     .prepare(
-      `SELECT id, delivery, claimed_by FROM jobs
+      `SELECT id, delivery, claimed_by, transient_retries FROM jobs
         WHERE status = 'running' AND lease_expires_at < ? ORDER BY id`,
     )
-    .all(deps.now) as { id: number; delivery: number; claimed_by: string | null }[];
+    .all(deps.now) as { id: number; delivery: number; claimed_by: string | null; transient_retries: number }[];
 
-  const reapOne = (job: { id: number; delivery: number; claimed_by: string | null }): void => {
+  const reapOne = (job: { id: number; delivery: number; claimed_by: string | null; transient_retries: number }): void => {
     // Re-verify against the live row: the snapshot may be stale (heartbeat, finished, reclaimed).
     const live = db
       .prepare('SELECT status, delivery, claimed_by, lease_expires_at FROM jobs WHERE id = ?')
@@ -119,7 +119,8 @@ export function reapExpired(db: Database.Database, deps: ReapDeps): ReapReport {
       | undefined;
     if (!current || current.status !== 'running' || current.delivery !== job.delivery) return;
 
-    if (job.delivery >= deps.maxDeliveries) {
+    // Deliveries that were retried after a transient failure do not use up the budget.
+    if (job.delivery - job.transient_retries >= deps.maxDeliveries) {
       try {
         deadLetter(
           db,

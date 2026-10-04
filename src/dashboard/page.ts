@@ -95,7 +95,7 @@ const SCRIPT = `
   }
   function jobsTable(jobs) {
     var rows = jobs.map(function (j) {
-      return el('tr', null, el('td', null, j.id), el('td', null, j.type), el('td', null, j.attempt), el('td', null, j.status),
+      return el('tr', null, el('td', null, j.id), el('td', null, j.type), el('td', null, j.attempt), el('td', null, j.state || j.status),
         el('td', null, j.delivery), el('td', null, j.workerId || ''),
         el('td', null, j.leaseExpiresAt ? clock(j.leaseExpiresAt) : ''), el('td', null, money(j.costUsd)));
     });

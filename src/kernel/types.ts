@@ -32,6 +32,10 @@ export interface Job {
   leaseExpiresAt: number | null;
   delivery: number;
   error: string | null;
+  /** A queued job is not claimable before this time (epoch ms); null: claimable now. */
+  availableAt?: number | null;
+  /** Retries scheduled after transient failures (not counted by `maxDeliveries`). */
+  transientRetries?: number;
 }
 
 export interface NewJob {
@@ -243,6 +247,8 @@ export interface KernelDeps {
     leaseMs: number;
     heartbeatMs: number;
     maxDeliveries: number;
+    /** Transient failures (network, 429, 5xx) retried with backoff before dead-lettering (default 8). */
+    maxTransientRetries?: number;
     /** At most this many jobs run at once across all workers on the database (default: no limit). */
     maxConcurrentJobs?: number;
     /** History tables are pruned by age after this many days (default 30). */
