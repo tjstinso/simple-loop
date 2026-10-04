@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
@@ -47,6 +47,12 @@ const configSchema = z.object({
         .refine((n) => !isForbiddenPassEnv(n), 'GH_*, GITHUB_*, SSH_*, GIT_*, DBUS_* and XDG_RUNTIME_DIR cannot be passed'),
     )
     .optional(),
+  /**
+   * Plugin directories, each passed as one `--plugin-dir=<absolute path>` (for example a language
+   * server plugin). Relative entries are resolved against the worktree and must stay inside it;
+   * absolute entries are operator-controlled and taken as given. See `resolvePluginDirs`.
+   */
+  pluginDirs: z.array(z.string().min(1)).default([]),
 });
 
 export type ClaudeCliConfig = z.infer<typeof configSchema>;
@@ -278,6 +284,32 @@ export function worktreeClaudeMd(workspace: string): string | undefined {
   }
 }
 
+/**
+ * The absolute plugin directories for `--plugin-dir`, in configured order. A relative entry is
+ * resolved against the worktree and, after following symlinks, must be a directory inside the
+ * worktree's real path. An absolute entry is operator configuration and only has to be an existing
+ * directory. Throws an error naming the entry when one is missing, not a directory or refused, so
+ * the agent never runs silently without a configured plugin.
+ */
+export function resolvePluginDirs(entries: readonly string[], workspace: string): string[] {
+  return entries.map((entry) => {
+    const abs = isAbsolute(entry) ? resolve(entry) : resolve(workspace, entry);
+    let real: string;
+    let isDir: boolean;
+    try {
+      real = realpathSync(abs);
+      isDir = statSync(real).isDirectory();
+    } catch {
+      throw new Error(`claude-cli pluginDirs: '${entry}' does not exist (looked for ${abs})`);
+    }
+    if (!isDir) throw new Error(`claude-cli pluginDirs: '${entry}' is not a directory`);
+    if (!isAbsolute(entry) && !isInsideDir(realpathSync(workspace), real)) {
+      throw new Error(`claude-cli pluginDirs: '${entry}' resolves outside the worktree and is refused`);
+    }
+    return abs;
+  });
+}
+
 export function buildPrompt(cfg: ClaudeCliConfig, input: RunInput): string {
   const subject = JSON.stringify(input.subject ?? null, null, 2);
   let prompt = `${cfg.prompt}\n\n## Work item\n\n\`\`\`json\n${subject}\n\`\`\``;
@@ -289,9 +321,9 @@ export function buildPrompt(cfg: ClaudeCliConfig, input: RunInput): string {
  * The claude CLI arguments. In bare mode, `--bare` skips hooks, plugins, auto-memory, keychain
  * reads and CLAUDE.md auto-discovery (per `claude --help`); `claudeMdFile`, when given, is passed
  * as `--append-system-prompt-file=<file>`, one of the options the help lists for supplying context
- * in bare mode. No `--add-dir`: the worktree is already the child's working directory.
+ * in bare mode. `pluginDirs` (already resolved) become `--plugin-dir` flags. No `--add-dir`: the worktree is already the child's working directory.
  */
-export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdFile?: string): string[] {
+export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdFile?: string, pluginDirs: readonly string[] = []): string[] {
   const args = [
     '-p',
     '--output-format',
@@ -312,6 +344,8 @@ export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdFile?: s
     // One argv element (`=` form), so a path can never be read as a separate option or argument.
     if (claudeMdFile !== undefined) args.push(`--append-system-prompt-file=${claudeMdFile}`);
   }
+  // One argv element per plugin directory (`=` form, so the flag cannot swallow the prompt), in both modes.
+  for (const dir of pluginDirs) args.push(`--plugin-dir=${dir}`);
   // `--allowedTools` is variadic; the `=` form stops it from swallowing the
   // positional prompt. Entries may contain spaces (e.g. `Bash(git *)`).
   if (cfg.allowedTools.length > 0) args.push(`--allowedTools=${cfg.allowedTools.join(',')}`);
@@ -409,7 +443,8 @@ export class ClaudeCliRunner implements Runner {
       if (!hasProviderCredential(probe, passEnv)) throw new Error(missingCredentialMessage());
     }
     const claudeMdFile = cfg.bare ? worktreeClaudeMd(input.workspace.path) : undefined;
-    const args = buildArgs(cfg, buildPrompt(cfg, input), claudeMdFile);
+    const pluginDirs = resolvePluginDirs(cfg.pluginDirs, input.workspace.path);
+    const args = buildArgs(cfg, buildPrompt(cfg, input), claudeMdFile, pluginDirs);
 
     return new Promise<unknown>((resolve, reject) => {
       const collector = new StreamCollector();
