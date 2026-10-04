@@ -2,7 +2,6 @@ import { hostname } from 'node:os';
 import type Database from 'better-sqlite3';
 import { chainEvents, type EventRow } from './events.js';
 import { costOf } from './queue.js';
-import { isProcessAlive } from './workers.js';
 
 type Db = Database.Database;
 
@@ -93,28 +92,54 @@ export function chainTimeline(db: Db, chainId: number): ChainTimeline | null {
   };
 }
 
+/** The kernel's heartbeat interval (see the runtime); a worker on another host is alive within twice this. */
+export const HEARTBEAT_MS = 30_000;
+
+/** True when a process with this id exists; a permission error means it exists but is not ours. */
+function pidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export interface LivenessProbe {
+  /** This host's name (default: the machine's). */
+  host?: string;
+  heartbeatMs?: number;
+  pidExists?: (pid: number) => boolean;
+}
+
+/**
+ * The one rule for worker liveness. On this host a worker is alive while its process exists, however
+ * long it has been idle (an idle worker stamps no heartbeat). A worker on another host cannot be
+ * probed, so it is alive while its heartbeat is younger than twice the heartbeat interval.
+ */
+export function isWorkerAlive(
+  w: { pid: number; host: string; last_seen_at: number },
+  now: number,
+  probe: LivenessProbe = {},
+): boolean {
+  if (w.host === (probe.host ?? hostname())) return (probe.pidExists ?? pidExists)(w.pid);
+  return now - w.last_seen_at < 2 * (probe.heartbeatMs ?? HEARTBEAT_MS);
+}
+
 export interface WorkerView {
   id: string;
   pid: number;
   host: string;
-  /** Null when the worker runs on another host and cannot be probed from here. */
-  alive: boolean | null;
+  alive: boolean;
   currentJobId: number | null;
   currentDelivery: number | null;
   heartbeatAgeMs: number;
 }
 
-export function listWorkerViews(
-  db: Db,
-  now: number,
-  probe: { host?: string; isAlive?: typeof isProcessAlive } = {},
-): WorkerView[] {
-  const here = probe.host ?? hostname();
-  const isAlive = probe.isAlive ?? isProcessAlive;
+export function listWorkerViews(db: Db, now: number, probe: LivenessProbe = {}): WorkerView[] {
   const rows = db.prepare('SELECT * FROM workers ORDER BY id').all() as {
     id: string;
     pid: number;
-    process_start_time: string | null;
     host: string;
     last_seen_at: number;
     current_job_id: number | null;
@@ -124,7 +149,7 @@ export function listWorkerViews(
     id: r.id,
     pid: r.pid,
     host: r.host,
-    alive: r.host === here ? isAlive(r.pid, r.process_start_time === null ? 0 : Number(r.process_start_time)) : null,
+    alive: isWorkerAlive(r, now, probe),
     currentJobId: r.current_job_id,
     currentDelivery: r.current_delivery,
     heartbeatAgeMs: Math.max(0, now - r.last_seen_at),
