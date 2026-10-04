@@ -25,6 +25,9 @@ afterEach(() => {
   for (const h of harnesses.splice(0)) h.cleanup();
 });
 
+/** The issue's comments without the queued / started notices every chain gets. */
+const outcomeComments = (h: Harness): string[] => h.comments(N).filter((c) => !/event=(queued|started) -->/.test(c));
+
 const ws = (input: RunInput) => input.workspace as SoftwareWorkspace;
 
 /** Delivery directories still on disk under the workspace root for a chain. */
@@ -343,7 +346,7 @@ describe('software engine scenarios', () => {
 
     expect(h.issueLabels(N)).toEqual([LABEL_DEAD_LETTER]);
     const marker = `<!-- factory:chain=${chain.id} job=${job!.id} event=dead-letter -->`;
-    const comments = h.comments(N);
+    const comments = outcomeComments(h);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain(marker);
     expect(comments[0]).toContain('runner_error');
@@ -391,8 +394,8 @@ describe('software engine scenarios', () => {
     const row = h.db.prepare('SELECT * FROM dead_letters').all();
     expect(JSON.stringify(row)).not.toContain(FAKE_API_KEY);
     expect(JSON.stringify(dls)).not.toContain(FAKE_API_KEY);
-    expect(h.comments(N).join('\n')).not.toContain(FAKE_API_KEY);
-    expect(h.comments(N).join('\n')).toContain('known-secret-value');
+    expect(outcomeComments(h).join('\n')).not.toContain(FAKE_API_KEY);
+    expect(outcomeComments(h).join('\n')).toContain('known-secret-value');
     expect(JSON.stringify(h.host.calls)).not.toContain(FAKE_API_KEY);
   });
 
@@ -404,7 +407,7 @@ describe('software engine scenarios', () => {
     expect(h.deadLetters()).toEqual([
       expect.objectContaining({ reason: 'runner_error', error: 'transition failed: could not authenticate with [redacted]' }),
     ]);
-    expect(h.comments(N).join('\n')).toContain('could not authenticate with [redacted]');
+    expect(outcomeComments(h).join('\n')).toContain('could not authenticate with [redacted]');
     expect(JSON.stringify(h.db.prepare('SELECT * FROM dead_letters').all())).not.toContain(FAKE_API_KEY);
     expect(JSON.stringify(h.host.calls)).not.toContain(FAKE_API_KEY);
   });
@@ -492,7 +495,6 @@ describe('software engine scenarios', () => {
         chainId: chain.id,
         reason: 'max_deliveries',
         error: `job ${job.id} lease expired on delivery 3 (max 3)`,
-        stepLogPath: null,
         createdAt: deadAt,
         resolvedAt: null,
         surfacedAt: deadAt,
@@ -503,7 +505,7 @@ describe('software engine scenarios', () => {
     expect(h.claim()).toBeNull();
     expect(h.runner.calls).toHaveLength(0);
     expect(h.issueLabels(N)).toEqual([LABEL_DEAD_LETTER]);
-    const comments = h.comments(N);
+    const comments = outcomeComments(h);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain(`<!-- factory:chain=${chain.id} job=${job.id} event=dead-letter -->`);
     expect(comments[0]).toContain('max_deliveries');
@@ -749,14 +751,14 @@ describe('software engine scenarios', () => {
 
       expect(h.chain(chain.id)).toMatchObject({ status: 'completed', state: { phase: 'merged' } });
       expect(h.issueLabels(N)).toEqual([]);
-      expect(h.comments(N)).toHaveLength(1);
-      expect(h.comments(N)[0]).toContain(MERGED_COMMENT);
+      expect(outcomeComments(h)).toHaveLength(1);
+      expect(outcomeComments(h)[0]).toContain(MERGED_COMMENT);
 
       const lookups = h.host.calls.length;
       expect(await h.maintain()).toEqual([]);
       expect(h.host.calls.length).toBe(lookups); // a completed chain is not looked at again
       expect(h.chain(chain.id).status).toBe('completed');
-      expect(h.comments(N)).toHaveLength(1);
+      expect(outcomeComments(h)).toHaveLength(1);
     });
 
     it('cancels a chain whose pull request was closed without merging', async () => {
@@ -768,10 +770,10 @@ describe('software engine scenarios', () => {
 
       expect(h.chain(chain.id).status).toBe('cancelled');
       expect(h.issueLabels(N)).toEqual([]);
-      expect(h.comments(N)).toHaveLength(1);
-      expect(h.comments(N)[0]).toContain(CLOSED_COMMENT);
+      expect(outcomeComments(h)).toHaveLength(1);
+      expect(outcomeComments(h)[0]).toContain(CLOSED_COMMENT);
       await h.maintain();
-      expect(h.comments(N)).toHaveLength(1);
+      expect(outcomeComments(h)).toHaveLength(1);
     });
 
     it('completes a needs_human chain whose pull request was merged', async () => {
@@ -784,7 +786,7 @@ describe('software engine scenarios', () => {
 
       expect(h.chain(chain.id)).toMatchObject({ status: 'completed', state: { phase: 'merged' } });
       expect(h.issueLabels(N)).toEqual([]);
-      expect(h.comments(N)).toHaveLength(1);
+      expect(outcomeComments(h)).toHaveLength(1);
     });
 
     it('leaves a chain with an open pull request untouched', async () => {
@@ -793,7 +795,7 @@ describe('software engine scenarios', () => {
       expect(await h.maintain()).toEqual([]);
       expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
       expect(h.issueLabels(N)).toContain(READY);
-      expect(h.comments(N)).toEqual([]);
+      expect(outcomeComments(h)).toEqual([]);
     });
 
     it('leaves a chain waiting on a transient host error and settles it on the next pass', async () => {
@@ -819,7 +821,7 @@ describe('software engine scenarios', () => {
 
       expect(errors).toHaveLength(1);
       expect(h.chain(chain.id).status).toBe('completed');
-      expect(h.comments(N)).toHaveLength(1); // the comment was still attempted
+      expect(outcomeComments(h)).toHaveLength(1); // the comment was still attempted
     });
 
     it('lets the same issue be submitted again after reconcile completed its chain', async () => {

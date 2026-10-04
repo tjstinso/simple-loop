@@ -30,10 +30,10 @@ describe('dead-letter queue', () => {
   it('moves the job to failed and the chain to dead_lettered', () => {
     const db = mk();
     const { chain, job } = setup(db);
-    const dl = deadLetter(db, { jobId: job.id, reason: 'runner_error', error: 'boom', stepLogPath: '/l' }, 200);
+    const dl = deadLetter(db, { jobId: job.id, reason: 'runner_error', error: 'boom' }, 200);
     expect(dl).toMatchObject({
       jobId: job.id, chainId: chain.id, reason: 'runner_error', error: 'boom',
-      stepLogPath: '/l', createdAt: 200, resolvedAt: null,
+      createdAt: 200, resolvedAt: null,
     });
     expect(getJob(db, job.id)).toMatchObject({ status: 'failed', error: 'boom' });
     expect(getChain(db, chain.id).status).toBe('dead_lettered');
@@ -42,7 +42,7 @@ describe('dead-letter queue', () => {
   it('works on a queued job and rejects an unknown job', () => {
     const db = mk();
     const { job } = createChain(db, { engine: 'e', subjectKey: 'q', engineState: {}, firstJob: first }, 1);
-    expect(deadLetter(db, { jobId: job.id, reason: 'max_deliveries', error: 'x' }, 2).stepLogPath).toBeNull();
+    expect(deadLetter(db, { jobId: job.id, reason: 'max_deliveries', error: 'x' }, 2).jobId).toBe(job.id);
     expect(() => deadLetter(db, { jobId: 999, reason: 'timeout', error: 'x' }, 2)).toThrow(/not found/);
   });
 

@@ -1,5 +1,14 @@
 import { parseArgs } from 'node:util';
 import { listDeadLetters } from '../kernel/dlq.js';
+import { recentEvents, type EventRow } from '../kernel/events.js';
+import {
+  chainJobViews,
+  chainTimeline,
+  formatAge,
+  formatCost,
+  listWorkerViews,
+  parseDuration,
+} from '../kernel/inspect.js';
 import type { Kernel } from '../kernel/kernel.js';
 import type { ChainView } from '../kernel/types.js';
 import { routeEngine } from '../router/router.js';
@@ -17,7 +26,10 @@ export interface CliDeps {
 const USAGE = `Usage:
   factory [--config <path>] submit <issue-url> [--label <l>]... [--engine <id>]
   factory [--config <path>] worker [--poll-ms <n>] [--id <name>]
-  factory [--config <path>] status
+  factory [--config <path>] status [--json]
+  factory [--config <path>] show <chain-id> [--json]
+  factory [--config <path>] events [--since <duration>] [--chain <id>] [--limit <n>] [--json]
+  factory [--config <path>] workers [--json]
   factory [--config <path>] dlq list
   factory [--config <path>] dlq retry <job-id>
   factory [--config <path>] dlq discard <job-id>
@@ -37,11 +49,21 @@ function parseId(raw: string | undefined, what: 'job' | 'chain'): number {
   return id;
 }
 
-function statusLines(kernel: Kernel, db: Runtime['db']): string[] {
+interface StatusChain {
+  id: number;
+  engine: string;
+  status: string;
+  /** The engine's one-line description (absent when the state does not validate). */
+  description: string | null;
+  jobs: ReturnType<typeof chainJobViews>;
+}
+
+function statusChains(kernel: Kernel, db: Runtime['db']): StatusChain[] {
   const rows = db
     .prepare(`SELECT id FROM chains WHERE status NOT IN ('completed', 'cancelled') ORDER BY id`)
     .all() as Array<{ id: number }>;
-  const lines: string[] = [];
+  const now = kernel.deps.clock();
+  const chains: StatusChain[] = [];
   for (const { id } of rows) {
     const chain = db.prepare('SELECT * FROM chains WHERE id = ?').get(id) as {
       id: number;
@@ -50,7 +72,7 @@ function statusLines(kernel: Kernel, db: Runtime['db']): string[] {
       subject_key: string;
       engine_state: string;
     };
-    const head = `${chain.id} ${chain.engine} ${chain.status}`;
+    let description: string | null = null;
     try {
       const engine = kernel.deps.engines.get(chain.engine);
       const parsed = engine.stateSchema.parse(JSON.parse(chain.engine_state));
@@ -61,12 +83,41 @@ function statusLines(kernel: Kernel, db: Runtime['db']): string[] {
         status: chain.status,
         state: parsed,
       };
-      lines.push(`${head} ${engine.describe(view)}`);
+      description = engine.describe(view);
     } catch {
-      lines.push(head);
+      // An unknown engine or invalid state: the chain is still listed.
+    }
+    chains.push({ id: chain.id, engine: chain.engine, status: chain.status, description, jobs: chainJobViews(db, id, now) });
+  }
+  return chains;
+}
+
+function statusLines(chains: StatusChain[]): string[] {
+  const lines: string[] = [];
+  for (const c of chains) {
+    lines.push(`${c.id} ${c.engine} ${c.status}${c.description === null ? '' : ` ${c.description}`}`);
+    for (const j of c.jobs) {
+      const parts = [`job ${j.id}`, j.type, `attempt=${j.attempt}`, j.status, `delivery=${j.delivery}`];
+      if (j.workerId !== null) parts.push(`worker=${j.workerId}`);
+      if (j.sinceLastEventMs !== null) parts.push(`last-event=${formatAge(j.sinceLastEventMs)} ago`);
+      if (j.leaseExpiresAt !== null) parts.push(`lease-expires=${new Date(j.leaseExpiresAt).toISOString()}`);
+      lines.push(`  ${parts.join(' ')}`);
     }
   }
   return lines;
+}
+
+function eventLine(e: EventRow, withChain: boolean): string {
+  const detail = Object.keys(e.detail).length === 0 ? '' : ` ${JSON.stringify(e.detail)}`;
+  const where = [withChain ? `chain=${e.chainId}` : '', e.jobId === null ? '' : `job=${e.jobId}`, e.delivery === null ? '' : `delivery=${e.delivery}`]
+    .filter(Boolean)
+    .join(' ');
+  return `${new Date(e.at).toISOString()} ${e.kind}${where ? ` ${where}` : ''}${detail}`;
+}
+
+function parseCount(raw: string, what: string): number {
+  if (!/^[0-9]+$/.test(raw) || Number(raw) < 1) throw new UsageError(`${what} must be a positive integer`);
+  return Number(raw);
 }
 
 async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps, 'stdout' | 'stderr' | 'onSignal'>>): Promise<number> {
@@ -122,10 +173,77 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       return 0;
     }
     case 'status': {
-      if (rest.length > 0) throw new UsageError('status takes no arguments');
-      const lines = statusLines(kernel, rt.db);
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { json: { type: 'boolean' } } });
+      if (positionals.length > 0) throw new UsageError('status takes no arguments');
+      const chains = statusChains(kernel, rt.db);
+      if (values.json) {
+        stdout(JSON.stringify(chains));
+        return 0;
+      }
+      const lines = statusLines(chains);
       if (lines.length === 0) stdout('no open chains');
       for (const l of lines) stdout(l);
+      return 0;
+    }
+    case 'show': {
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { json: { type: 'boolean' } } });
+      if (positionals.length !== 1) throw new UsageError('show takes exactly one chain id');
+      const id = parseId(positionals[0], 'chain');
+      const t = chainTimeline(rt.db, id);
+      if (!t) {
+        stderr(`error: chain ${id} not found`);
+        return 1;
+      }
+      if (values.json) {
+        stdout(JSON.stringify(t));
+        return 0;
+      }
+      stdout(`chain ${t.chain.id} ${t.chain.engine} ${t.chain.status} ${t.chain.subjectKey}`);
+      for (const e of t.events) stdout(eventLine(e, false));
+      for (const j of t.cost.jobs) {
+        stdout(`cost job ${j.jobId} ${j.type} attempt=${j.attempt} ${j.costUsd === null ? 'unknown' : formatCost(j.costUsd)}`);
+      }
+      stdout(`cost total ${formatCost(t.cost.totalUsd)}`);
+      return 0;
+    }
+    case 'events': {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { since: { type: 'string' }, chain: { type: 'string' }, limit: { type: 'string' }, json: { type: 'boolean' } },
+      });
+      if (positionals.length > 0) throw new UsageError('events takes no arguments');
+      const filter: { since?: number; chainId?: number; limit?: number } = {};
+      if (values.since !== undefined) {
+        const ms = parseDuration(values.since);
+        if (ms === null) throw new UsageError('--since must look like 30s, 15m, 2h or 7d');
+        filter.since = kernel.deps.clock() - ms;
+      }
+      if (values.chain !== undefined) filter.chainId = parseId(values.chain, 'chain');
+      if (values.limit !== undefined) filter.limit = parseCount(values.limit, '--limit');
+      const events = recentEvents(rt.db, filter);
+      if (values.json) {
+        stdout(JSON.stringify(events));
+        return 0;
+      }
+      if (events.length === 0) stdout('no events');
+      for (const e of events) stdout(eventLine(e, true));
+      return 0;
+    }
+    case 'workers': {
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { json: { type: 'boolean' } } });
+      if (positionals.length > 0) throw new UsageError('workers takes no arguments');
+      const workers = listWorkerViews(rt.db, kernel.deps.clock());
+      if (values.json) {
+        stdout(JSON.stringify(workers));
+        return 0;
+      }
+      if (workers.length === 0) stdout('no workers');
+      for (const w of workers) {
+        const alive = w.alive === null ? 'unknown' : w.alive ? 'alive' : 'dead';
+        const job = w.currentJobId === null ? 'idle' : `job=${w.currentJobId} delivery=${w.currentDelivery}`;
+        stdout(`${w.id} pid=${w.pid} host=${w.host} ${alive} ${job} heartbeat=${formatAge(w.heartbeatAgeMs)} ago`);
+      }
       return 0;
     }
     case 'dlq': {
@@ -212,7 +330,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   const built = runtime === undefined;
   try {
     if (command[0] === undefined) return usageError('missing command');
-    if (!['submit', 'worker', 'status', 'dlq', 'cancel'].includes(command[0])) {
+    if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));

@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { recordEvent } from './events.js';
 import { StaleDeliveryError } from './types.js';
 import type { Chain, ChainStatus, Fence, Job, JobStatus, ResolvedNewJob } from './types.js';
 
@@ -111,7 +112,10 @@ export function createChain(
           now,
           now,
         );
-      return { chain: getChain(db, chainId), job: getJob(db, Number(r.lastInsertRowid)) };
+      const jobId = Number(r.lastInsertRowid);
+      recordEvent(db, { at: now, chainId, kind: 'chain.created', engine: 'kernel', detail: { subject: args.subjectKey, engine: args.engine } });
+      recordEvent(db, { at: now, chainId, jobId, delivery: 0, kind: 'job.queued', engine: 'kernel', detail: { type: j.type, attempt: j.attempt } });
+      return { chain: getChain(db, chainId), job: getJob(db, jobId) };
     })();
   } catch (e) {
     if (
@@ -145,7 +149,17 @@ export function claimNext(db: Db, workerId: string, now: number, leaseMs: number
           RETURNING *`,
       )
       .get(workerId, now + leaseMs, now) as JobRow | undefined;
-    return r ? rowToJob(r) : null;
+    if (!r) return null;
+    recordEvent(db, {
+      at: now,
+      chainId: r.chain_id,
+      jobId: r.id,
+      delivery: r.delivery,
+      kind: 'job.claimed',
+      engine: 'kernel',
+      detail: { worker: workerId, type: r.type, attempt: r.attempt },
+    });
+    return rowToJob(r);
   });
   return claim.immediate();
 }
@@ -172,6 +186,17 @@ export function recordResult(db: Db, fence: Fence, result: unknown): void {
   if (r.changes !== 1) throw new StaleDeliveryError();
 }
 
+/** The `costUsd` a job result carries, if any. */
+export function costOf(result: string | null): number | undefined {
+  if (result === null) return undefined;
+  try {
+    const c = (JSON.parse(result) as { costUsd?: unknown } | null)?.costUsd;
+    return typeof c === 'number' && Number.isFinite(c) ? c : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * In one transaction: mark the fenced job succeeded, update its chain's state
  * and status, and enqueue follow-on jobs. Follow-ons that collide with an
@@ -196,9 +221,11 @@ export function commitTransition(
       .prepare(
         `UPDATE jobs SET status = 'succeeded', lease_expires_at = NULL, updated_at = ?
           WHERE id = ? AND delivery = ? AND status = 'running'
-          RETURNING chain_id`,
+          RETURNING chain_id, type, attempt, result`,
       )
-      .get(now, fence.jobId, fence.delivery) as { chain_id: number } | undefined;
+      .get(now, fence.jobId, fence.delivery) as
+      | { chain_id: number; type: string; attempt: number; result: string | null }
+      | undefined;
     if (!done) throw new StaleDeliveryError();
     if (done.chain_id !== args.chainId) {
       throw new Error(`job ${fence.jobId} belongs to chain ${done.chain_id}, not ${args.chainId}`);
@@ -212,8 +239,32 @@ export function commitTransition(
          (chain_id, type, attempt, status, policy_id, payload, delivery, created_at, updated_at)
        VALUES (?, ?, ?, 'queued', ?, ?, 0, ?, ?)`,
     );
+    const cost = costOf(done.result);
+    recordEvent(db, {
+      at: now,
+      chainId: args.chainId,
+      jobId: fence.jobId,
+      delivery: fence.delivery,
+      kind: 'job.succeeded',
+      engine: 'kernel',
+      detail: { type: done.type, attempt: done.attempt, ...(cost === undefined ? {} : { costUsd: cost }) },
+    });
     for (const j of args.newJobs) {
-      ins.run(args.chainId, j.type, j.attempt, j.policyId, json(j.payload), now, now);
+      const added = ins.run(args.chainId, j.type, j.attempt, j.policyId, json(j.payload), now, now);
+      if (added.changes === 1) {
+        recordEvent(db, {
+          at: now,
+          chainId: args.chainId,
+          jobId: Number(added.lastInsertRowid),
+          delivery: 0,
+          kind: 'job.queued',
+          engine: 'kernel',
+          detail: { type: j.type, attempt: j.attempt },
+        });
+      }
+    }
+    if (args.chainStatus === 'completed' || args.chainStatus === 'waiting') {
+      recordEvent(db, { at: now, chainId: args.chainId, kind: `chain.${args.chainStatus}`, engine: 'kernel' });
     }
   }).immediate();
 }
@@ -229,6 +280,7 @@ export function completeWaitingChain(db: Db, chainId: number, engineState: unkno
       `UPDATE chains SET status = 'completed', engine_state = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`,
     )
     .run(JSON.stringify(engineState), now, chainId);
+  if (r.changes === 1) recordEvent(db, { at: now, chainId, kind: 'chain.completed', engine: 'kernel', detail: { by: 'reconcile' } });
   return r.changes === 1;
 }
 
@@ -252,12 +304,27 @@ export function failJob(db: Db, fence: Fence, error: string): void {
  * delivery + 1 and any write from the previous holder is rejected.
  * `updated_at` is left unchanged because no clock value is passed in.
  */
-export function requeueJob(db: Db, jobId: number, opts: { delivery?: number } = {}): boolean {
+export function requeueJob(db: Db, jobId: number, opts: { delivery?: number; now?: number; why?: string } = {}): boolean {
   const sql = `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL
                 WHERE id = ? AND status = 'running'`;
-  const r =
-    opts.delivery === undefined
-      ? db.prepare(sql).run(jobId)
-      : db.prepare(`${sql} AND delivery = ?`).run(jobId, opts.delivery);
-  return r.changes === 1;
+  return db
+    .transaction((): boolean => {
+      const r = (
+        opts.delivery === undefined
+          ? db.prepare(`${sql} RETURNING chain_id, delivery`).get(jobId)
+          : db.prepare(`${sql} AND delivery = ? RETURNING chain_id, delivery`).get(jobId, opts.delivery)
+      ) as { chain_id: number; delivery: number } | undefined;
+      if (!r) return false;
+      recordEvent(db, {
+        at: opts.now ?? Date.now(),
+        chainId: r.chain_id,
+        jobId,
+        delivery: r.delivery,
+        kind: 'job.requeued',
+        engine: 'kernel',
+        detail: { why: opts.why ?? 'requeued' },
+      });
+      return true;
+    })
+    .immediate();
 }

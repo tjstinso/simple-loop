@@ -195,6 +195,15 @@ describe('ClaudeCliRunner', () => {
     expect(steps[3]).toContain('echo step 4');
   });
 
+  it('adds the stream cost to a json-format result', async () => {
+    const text = '```json\n{"verdict":"approve","feedback":"ok"}\n```';
+    const res = await runner('steps', { STUB_STEPS: '0', STUB_RESULT_TEXT: text }).run(
+      input({ config: config({ resultFormat: 'json' }) }),
+      signal(),
+    );
+    expect(res).toEqual({ verdict: 'approve', feedback: 'ok', costUsd: 0.42 });
+  });
+
   it('uses the final assistant text as summary when there is no json block', async () => {
     const res = await runner('steps', { STUB_STEPS: '1', STUB_RESULT_TEXT: 'plain final words' }).run(input(), signal());
     expect(res).toMatchObject({ status: 'ok', summary: 'plain final words', costUsd: 0.42 });

@@ -144,7 +144,10 @@ Not configurable (set in `src/cli/runtime.ts`): lease 300000 ms, heartbeat 30000
 ```
 factory [--config <path>] submit <issue-url> [--label <l>]... [--engine <id>]
 factory [--config <path>] worker [--poll-ms <n>] [--id <name>]
-factory [--config <path>] status
+factory [--config <path>] status [--json]
+factory [--config <path>] show <chain-id> [--json]
+factory [--config <path>] events [--since <duration>] [--chain <id>] [--limit <n>] [--json]
+factory [--config <path>] workers [--json]
 factory [--config <path>] dlq list
 factory [--config <path>] dlq retry <job-id>
 factory [--config <path>] dlq discard <job-id>
@@ -170,14 +173,22 @@ worker w1 started
 worker w1 stopped
 ```
 
-**status.** One line per chain that is not completed or cancelled: `<chain-id> <engine> <chain-status> <engine description>`.
+**status.** One line per chain that is not completed or cancelled: `<chain-id> <engine> <chain-status> <engine description>`, followed by one indented line per job of the chain: job id, type, attempt, status, delivery number, the worker holding it (running jobs), the time since the job's last event and, for a running job, the lease expiry. `--json` prints the same data as one JSON array.
 
 ```
 $ factory status
 1 software active acme/sandbox#12 phase=reviewing attempt=1 profile=supervised
+  job 1 execute attempt=1 succeeded delivery=1 last-event=4m ago
+  job 2 review attempt=1 running delivery=1 worker=w1 last-event=12s ago lease-expires=2026-10-03T21:09:40.000Z
 ```
 
 With nothing open it prints `no open chains`.
+
+**show.** `factory show <chain-id>` prints the chain's events oldest first (timestamp, kind, `job=`/`delivery=`, detail), so the path to the current state, the dead-letter reason and the review verdicts are readable without SQL, then the cost of each job that reported one and the chain total (`cost total $0.8750`). `--json` prints `{chain, events, cost}`. An unknown chain exits 1.
+
+**events.** `factory events` prints the newest events across chains, oldest first. `--since <duration>` (`30s`, `15m`, `2h`, `7d`), `--chain <id>` and `--limit <n>` (default 50) narrow it; `--json` prints the rows.
+
+**workers.** `factory workers` prints each registered worker: id, pid, host, whether its process is alive (`unknown` when it runs on another host), the job and delivery it is on (or `idle`) and the age of its last heartbeat.
 
 **dlq.** `list` prints unresolved dead letters, newest first: `job <job-id> chain <chain-id> <reason> <first line of the error, at most 120 characters>`. The reason is one of `runner_error`, `timeout`, `max_deliveries`, `effect_error`. Empty output is `no dead letters`.
 
@@ -200,6 +211,23 @@ If labelling the issue fails when a job is dead-lettered (for example GitHub ans
 $ factory cancel 1
 cancelled chain 1
 ```
+
+## Events
+
+The kernel table `events` is an append-only log of lifecycle transitions: `id`, `at` (epoch milliseconds), `chain_id`, `job_id` (nullable), `delivery` (nullable), `kind`, `engine` (`kernel` or the recording engine's id) and `detail` (small JSON). The helper `recordEvent(db, event)` in `src/kernel/events.ts` is its only writer; the kernel's events are written in the same transaction as the state change they describe. Every string in `detail` is cut to 200 characters, and only structured values (reasons, verdicts, label names, secret-guard kinds) are recorded: never issue bodies, agent output or matched secret text.
+
+| Recorded by | Kinds |
+| --- | --- |
+| kernel | `chain.created`, `job.queued`, `job.claimed`, `job.lease_lost`, `job.succeeded` (with `costUsd` when the result has one), `job.requeued`, `job.dead_lettered` (with the reason), `dead_letter.retried`, `dead_letter.discarded`, `chain.cancelled`, `chain.completed`, `chain.waiting` |
+| software engine | `pr.opened`, `labels.changed`, `review.verdict` (verdict and attempt), `merge.requested`, `followup.filed`, `secret_guard.refused` (kinds only) |
+
+Lease renewals are deliberately not recorded (too noisy).
+
+Costs: the model's cost is stored as `costUsd` on the job result for execute and review jobs, and `factory show` sums it per chain. The unused `dead_letters.step_log_path` column was removed from the schema (existing databases keep the column; nothing reads or writes it).
+
+### Issue comments
+
+When a chain is queued the software engine posts one short comment on the issue, and another when the chain's first execute job starts; each carries a hidden marker (`<!-- factory:chain=<id> event=queued -->`, `event=started`) and is never posted twice. `factory:in-progress` is set when a job is claimed, not only after the first pull request opens.
 
 ## Labels
 

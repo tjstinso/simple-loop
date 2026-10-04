@@ -88,7 +88,7 @@ export function createKernel(
       const engine = deps.engines.get(engineId);
       const { subjectKey, state, firstJob } = await engine.submit(input);
       const policy = deps.policies.match(firstJob.policyKind, firstJob.labels);
-      return createChain(
+      const created = createChain(
         db,
         {
           engine: engine.id,
@@ -103,6 +103,13 @@ export function createKernel(
         },
         deps.clock(),
       );
+      try {
+        const { view } = viewOf(created.chain.id);
+        if (engine.afterEnqueue) await engine.afterEnqueue(view, created.job);
+      } catch (e) {
+        report(deps, e, `afterEnqueue for chain ${created.chain.id}`);
+      }
+      return created;
     },
     async retryDeadLetter(jobId) {
       const job = retryDeadLetter(db, jobId, deps.clock());

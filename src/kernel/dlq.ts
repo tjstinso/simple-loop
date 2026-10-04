@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { recordEvent } from './events.js';
 import { getChain, getJob } from './queue.js';
 import type { Chain, ChainStatus, DeadLetter, DeadLetterReason, Job } from './types.js';
 
@@ -10,7 +11,6 @@ interface DeadLetterRow {
   chain_id: number;
   reason: string;
   error: string;
-  step_log_path: string | null;
   created_at: number;
   resolved_at: number | null;
   surfaced_at: number | null;
@@ -31,7 +31,6 @@ function rowToDeadLetter(r: DeadLetterRow): DeadLetter {
     chainId: r.chain_id,
     reason: r.reason as DeadLetterReason,
     error: r.error,
-    stepLogPath: r.step_log_path,
     createdAt: r.created_at,
     resolvedAt: r.resolved_at,
     surfacedAt: r.surfaced_at,
@@ -52,7 +51,7 @@ function findUnresolved(db: Db, jobId: number): DeadLetterRow | undefined {
  */
 export function deadLetter(
   db: Db,
-  args: { jobId: number; reason: DeadLetterReason; error: string; stepLogPath?: string },
+  args: { jobId: number; reason: DeadLetterReason; error: string },
   now: number,
 ): DeadLetter {
   return db
@@ -83,10 +82,18 @@ export function deadLetter(
       );
       const r = db
         .prepare(
-          `INSERT INTO dead_letters (job_id, chain_id, reason, error, step_log_path, created_at)
-           VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
+          `INSERT INTO dead_letters (job_id, chain_id, reason, error, created_at)
+           VALUES (?, ?, ?, ?, ?) RETURNING *`,
         )
-        .get(args.jobId, job.chain_id, args.reason, args.error, args.stepLogPath ?? null, now) as DeadLetterRow;
+        .get(args.jobId, job.chain_id, args.reason, args.error, now) as DeadLetterRow;
+      recordEvent(db, {
+        at: now,
+        chainId: job.chain_id,
+        jobId: args.jobId,
+        kind: 'job.dead_lettered',
+        engine: 'kernel',
+        detail: { reason: args.reason },
+      });
       return rowToDeadLetter(r);
     })
     .immediate();
@@ -144,6 +151,7 @@ export function retryDeadLetter(db: Db, jobId: number, now: number): Job {
       ).run(dl.reason, now, jobId);
       db.prepare(`UPDATE chains SET status = 'active', updated_at = ? WHERE id = ?`).run(now, dl.chain_id);
       db.prepare('UPDATE dead_letters SET resolved_at = ? WHERE id = ?').run(now, dl.id);
+      recordEvent(db, { at: now, chainId: dl.chain_id, jobId, kind: 'dead_letter.retried', engine: 'kernel', detail: { reason: dl.reason } });
       return getJob(db, jobId);
     })
     .immediate();
@@ -160,6 +168,8 @@ export function discardDeadLetter(db: Db, jobId: number, now: number): Job {
       if (!dl) throw new Error(`no unresolved dead letter for job ${jobId}`);
       db.prepare(`UPDATE chains SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, dl.chain_id);
       db.prepare('UPDATE dead_letters SET resolved_at = ? WHERE id = ?').run(now, dl.id);
+      recordEvent(db, { at: now, chainId: dl.chain_id, jobId, kind: 'dead_letter.discarded', engine: 'kernel', detail: { reason: dl.reason } });
+      recordEvent(db, { at: now, chainId: dl.chain_id, kind: 'chain.cancelled', engine: 'kernel', detail: { by: 'discard' } });
       return getJob(db, jobId);
     })
     .immediate();
@@ -192,6 +202,7 @@ export function cancelChain(db: Db, chainId: number, now: number, opts: { onlyIf
       db.prepare(`UPDATE jobs SET status = 'cancelled', updated_at = ? WHERE chain_id = ? AND status = 'queued'`).run(now, chainId);
       db.prepare(`UPDATE chains SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, chainId);
       db.prepare('UPDATE dead_letters SET resolved_at = ? WHERE chain_id = ? AND resolved_at IS NULL').run(now, chainId);
+      recordEvent(db, { at: now, chainId, kind: 'chain.cancelled', engine: 'kernel', detail: { from: chain.status } });
       return getChain(db, chainId);
     })
     .immediate();

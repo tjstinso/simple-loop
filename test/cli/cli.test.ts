@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run, type CliDeps } from '../../src/cli/index.js';
@@ -96,7 +96,78 @@ describe('factory cli', () => {
     out.length = 0;
     const { chain } = await h.submit(5);
     expect(await run(['status'], deps)).toBe(0);
-    expect(out).toEqual([`${chain.id} software active ${h.engine.describe(h.chain(chain.id))}`]);
+    expect(out[0]).toBe(`${chain.id} software active ${h.engine.describe(h.chain(chain.id))}`);
+    expect(out).toHaveLength(2);
+    expect(out[1]).toMatch(/^ {2}job \d+ execute attempt=1 queued delivery=0 last-event=\d+s ago$/);
+  });
+
+  it('status shows the worker and lease of a running job, and --json prints the same data', async () => {
+    const { h, out, deps } = setup();
+    const { chain } = await h.submit(5);
+    const job = h.claim()!;
+    expect(await run(['status'], deps)).toBe(0);
+    expect(out[1]).toContain(`job ${job.id} execute attempt=1 running delivery=1 worker=w1`);
+    expect(out[1]).toContain(`lease-expires=${new Date(job.leaseExpiresAt!).toISOString()}`);
+    out.length = 0;
+    expect(await run(['status', '--json'], deps)).toBe(0);
+    const parsed = JSON.parse(out[0]!);
+    expect(parsed[0]).toMatchObject({ id: chain.id, status: 'active' });
+    expect(parsed[0].jobs[0]).toMatchObject({
+      id: job.id, type: 'execute', attempt: 1, status: 'running', delivery: 1, workerId: 'w1', leaseExpiresAt: job.leaseExpiresAt,
+    });
+  });
+
+  it('show prints the chain timeline with the dead-letter reason and the cost', async () => {
+    const { h, out, err, deps } = setup();
+    const chain = await deadLetter(h, 8);
+    expect(await run(['show', String(chain.id)], deps)).toBe(0);
+    const text = out.join('\n');
+    expect(text).toMatch(/chain\.created[\s\S]*job\.queued[\s\S]*job\.claimed[\s\S]*job\.dead_lettered .*"reason":"runner_error"/);
+    expect(text).toContain('cost total $0.0000');
+    out.length = 0;
+    expect(await run(['show', String(chain.id), '--json'], deps)).toBe(0);
+    const t = JSON.parse(out[0]!);
+    expect(t.events.map((e: { kind: string }) => e.kind)).toContain('job.dead_lettered');
+    expect(t.cost.totalUsd).toBe(0);
+    expect(await run(['show', '999'], deps)).toBe(1);
+    expect(err.join('\n')).toContain('chain 999 not found');
+    expect(await run(['show'], deps)).toBe(2);
+  });
+
+  it('events filters by chain, duration and limit', async () => {
+    const { h, out, deps } = setup();
+    const a = await h.submit(5);
+    const b = await h.submit(6);
+    expect(await run(['events', '--chain', String(a.chain.id)], deps)).toBe(0);
+    expect(out).toHaveLength(2);
+    expect(out.every((l) => l.includes(`chain=${a.chain.id}`))).toBe(true);
+    out.length = 0;
+    expect(await run(['events', '--limit', '1', '--json'], deps)).toBe(0);
+    const last = JSON.parse(out[0]!);
+    expect(last).toHaveLength(1);
+    expect(last[0]).toMatchObject({ chainId: b.chain.id, kind: 'job.queued' });
+    out.length = 0;
+    h.advance(2 * 3_600_000);
+    expect(await run(['events', '--since', '1h'], deps)).toBe(0);
+    expect(out).toEqual(['no events']);
+    expect(await run(['events', '--since', 'soon'], deps)).toBe(2);
+    expect(await run(['events', '--limit', '0'], deps)).toBe(2);
+  });
+
+  it('workers lists registered workers with liveness, job and heartbeat age', async () => {
+    const { h, out, deps } = setup();
+    h.db
+      .prepare(`INSERT INTO workers (id, pid, pgid, host, started_at, last_seen_at, current_job_id, current_delivery)
+                VALUES ('w-here', ?, ?, ?, ?, ?, 4, 2), ('w-away', 1, 1, 'elsewhere', ?, ?, NULL, NULL)`)
+      .run(process.pid, process.pid, hostname(), h.clock() - 5000, h.clock() - 5000, h.clock() - 90_000, h.clock() - 90_000);
+    expect(await run(['workers'], deps)).toBe(0);
+    expect(out).toEqual([
+      `w-away pid=1 host=elsewhere unknown idle heartbeat=1m ago`,
+      `w-here pid=${process.pid} host=${hostname()} alive job=4 delivery=2 heartbeat=5s ago`,
+    ]);
+    out.length = 0;
+    expect(await run(['workers', '--json'], deps)).toBe(0);
+    expect(JSON.parse(out[0]!)[1]).toMatchObject({ id: 'w-here', alive: true, currentJobId: 4, heartbeatAgeMs: 5000 });
   });
 
   it('dlq list prints unresolved dead letters and no dead letters when empty', async () => {

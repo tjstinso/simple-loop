@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { recordEvent } from '../../kernel/events.js';
 import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
 import { EffectError, type ChainView, type DeadLetter, type Engine, type Job, type WorkspaceProvider } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
@@ -85,6 +86,15 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     };
   }
 
+  /** Posts `text` plus the hidden `marker` unless a comment with the marker exists. */
+  async function commentOnce(repo: string, issueNumber: number, marker: string, text: string): Promise<void> {
+    const sleep = deps.sleep ?? defaultSleep;
+    await withHostRetry(async () => {
+      if (await deps.host.findComment(repo, issueNumber, marker)) return;
+      await deps.host.comment(repo, issueNumber, `${text}\n\n${marker}`);
+    }, sleep);
+  }
+
   const workspace: WorkspaceProvider = {
     async prepare(chain: ChainView<any>, job: Job): Promise<Workspace> {
       const ws = await deps.workspaces.prepare(chain, job);
@@ -126,7 +136,25 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     transition(chain, job, result) {
       try {
-        return softwareTransition(chain, job, result);
+        const t = softwareTransition(chain, job, result);
+        // The one event the pure transition cannot carry as an effect: recorded once per job (a
+        // retry that keeps the result computes the same verdict again).
+        if (job.type === 'review') {
+          const v = (result as { verdict?: unknown }).verdict;
+          const seen = deps.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'review.verdict'`).get(job.id);
+          if (!seen && typeof v === 'string') {
+            recordEvent(deps.db, {
+              at: deps.now(),
+              chainId: chain.id,
+              jobId: job.id,
+              delivery: job.delivery,
+              kind: 'review.verdict',
+              engine: 'software',
+              detail: { verdict: v, attempt: job.attempt },
+            });
+          }
+        }
+        return t;
       } catch (e) {
         // An execute result with status `error` carries the agent's summary as the message.
         if (e instanceof EffectError) throw new EffectError(redact(e.message), e.reason);
@@ -146,9 +174,61 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
           sleep: deps.sleep,
           followups: { db: deps.db, now: deps.now },
           secretValues: deps.secretValues,
+          events: (kind, detail) =>
+            recordEvent(deps.db, {
+              at: deps.now(),
+              chainId: ctx.chain.id,
+              jobId: ctx.job.id,
+              delivery: ctx.job.delivery,
+              kind,
+              engine: 'software',
+              detail,
+            }),
         },
         ctx.fence,
       );
+    },
+
+    async afterEnqueue(chain: ChainView<SoftwareState>, job: Job) {
+      const s = chain.state;
+      await commentOnce(
+        s.repo,
+        s.issueNumber,
+        `<!-- factory:chain=${chain.id} event=queued -->`,
+        `The factory queued this issue (chain ${chain.id}, job ${job.id}).`,
+      );
+    },
+
+    async onJobStart(chain: ChainView<SoftwareState>, job: Job) {
+      const s = chain.state;
+      const errors: unknown[] = [];
+      try {
+        await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_IN_PROGRESS], [LABEL_DEAD_LETTER]);
+        recordEvent(deps.db, {
+          at: deps.now(),
+          chainId: chain.id,
+          jobId: job.id,
+          delivery: job.delivery,
+          kind: 'labels.changed',
+          engine: 'software',
+          detail: { target: 'issue', add: [LABEL_IN_PROGRESS], remove: [LABEL_DEAD_LETTER], at: 'claim' },
+        });
+      } catch (e) {
+        errors.push(e);
+      }
+      if (job.type === 'execute' && job.attempt === 1) {
+        try {
+          await commentOnce(
+            s.repo,
+            s.issueNumber,
+            `<!-- factory:chain=${chain.id} event=started -->`,
+            `The factory started work on this issue (chain ${chain.id}).`,
+          );
+        } catch (e) {
+          errors.push(e);
+        }
+      }
+      if (errors.length > 0) throw errors[0];
     },
 
     describe(chain) {

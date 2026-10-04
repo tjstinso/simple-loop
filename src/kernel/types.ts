@@ -75,7 +75,6 @@ export interface DeadLetter {
   chainId: number;
   reason: DeadLetterReason;
   error: string;
-  stepLogPath: string | null;
   createdAt: number;
   resolvedAt: number | null;
   /** When the engine surfaced it (null: not yet, or every attempt so far failed). */
@@ -164,6 +163,16 @@ export interface Engine<S = unknown> {
    * markers on the subject). Errors go to `KernelDeps.onError`; the cancellation stands.
    */
   afterCancel?(chain: ChainView<S>, job?: Job): Promise<void>;
+  /**
+   * Optional: called by `Kernel.enqueue` after the chain and its first job were created, with the
+   * chain view and that job (for example to comment on the subject). Errors go to `onError`.
+   */
+  afterEnqueue?(chain: ChainView<S>, job: Job): Promise<void>;
+  /**
+   * Optional: called at the start of every delivery, once the job is claimed and before the runner
+   * runs (for example to mark the subject in progress). Errors go to `onError`; the delivery continues.
+   */
+  onJobStart?(chain: ChainView<S>, job: Job): Promise<void>;
   /** Called after every delivery, whatever its outcome. */
   cleanup(chain: ChainView<S>, job: Job): Promise<void>;
   /**

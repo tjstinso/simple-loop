@@ -3,6 +3,7 @@ import { hostname } from 'node:os';
 import { readProcessStartTime } from '../util/proc.js';
 import { processDelivery, type DeliveryOutcome } from './process-delivery.js';
 import { cancelChain, listUnsurfacedDeadLetters, markDeadLetterSurfaced } from './dlq.js';
+import { recordEvent } from './events.js';
 import { claimNext, completeWaitingChain, getChain, getJob, renewLease, requeueJob } from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
 import { pruneHistory } from './retention.js';
@@ -348,7 +349,7 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
     // delivery is left running for the reaper; nothing else is recorded.
     if (d.stopRequested && !d.leaseLost && (outcome === 'aborted' || outcome === 'timeout')) {
       try {
-        requeueJob(db, d.job.id, { delivery: d.job.delivery });
+        requeueJob(db, d.job.id, { delivery: d.job.delivery, now: clock(), why: 'worker stopping' });
       } catch (e) {
         report(e, d.job);
       }
@@ -373,6 +374,19 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
 
     const loseLease = (): void => {
       d.leaseLost = true;
+      try {
+        recordEvent(db, {
+          at: clock(),
+          chainId: job.chainId,
+          jobId: job.id,
+          delivery: job.delivery,
+          kind: 'job.lease_lost',
+          engine: 'kernel',
+          detail: { worker: id },
+        });
+      } catch (e) {
+        report(e, job);
+      }
       stopHeartbeat(d);
       clearCurrent();
       d.ac.abort(new Error(`lease lost for job ${job.id} delivery ${job.delivery}`));

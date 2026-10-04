@@ -283,6 +283,9 @@ describe('worker loop', () => {
     expect(first).toBe(a.job.id);
     s.db.prepare("UPDATE jobs SET delivery = delivery + 1, claimed_by = 'other' WHERE id = ?").run(a.job.id);
     await tick(HEARTBEAT); // lease lost
+    expect(
+      s.db.prepare(`SELECT kind FROM events WHERE job_id = ? AND kind = 'job.lease_lost'`).all(a.job.id),
+    ).toHaveLength(1);
     await tick(1_000);
     expect(getJob(s.db, b.job.id).status).toBe('queued'); // still waiting for the hung delivery
     expect(s.killGroup).not.toHaveBeenCalled();
