@@ -1,5 +1,8 @@
 import {
   AutoMergeRefusedError,
+  summarizeChecks,
+  type CheckInfo,
+  type ChecksStatus,
   GitHostError,
   type GitHost,
   type Issue,
@@ -36,6 +39,8 @@ export class FakeGitHost implements GitHost {
   private feedback = new Map<number, PrFeedback>();
   private nextFeedbackId = 1;
   private resolvedThreads = new Set<string>();
+  private checks = new Map<string, CheckInfo[]>();
+  private failedLogs = new Map<number, string>();
   /** Clock (epoch ms) for the `createdAt` of replies the factory posts; the harness points it at its own. */
   now: () => number = Date.now;
   /** Like the repository setting "Allow auto-merge": off makes `mergePr` throw AutoMergeRefusedError. */
@@ -140,6 +145,16 @@ export class FakeGitHost implements GitHost {
 
   setPrHead(n: number, sha: string): void {
     this.prOrThrow(n).headSha = sha;
+  }
+
+  /** Sets the checks GitHub reports for a commit (replacing earlier ones); the state is derived like the real adapter's. */
+  setChecks(sha: string, checks: CheckInfo[]): void {
+    this.checks.set(sha, checks.map((c) => ({ ...c })));
+  }
+
+  /** Sets what the failing log of a workflow run contains. */
+  setFailedLog(runId: number, log: string): void {
+    this.failedLogs.set(runId, log);
   }
 
   failNext(method: keyof GitHost, error: Error): void {
@@ -259,6 +274,19 @@ export class FakeGitHost implements GitHost {
     // Like `gh pr merge --auto`: merges now when the required checks already pass, else when they do.
     if (this.requiredChecksPass) pr.state = 'merged';
     else this.autoMerge.add(n);
+  }
+
+  async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
+    this.enter('getChecks', [repo, sha]);
+    const checks = (this.checks.get(sha) ?? []).map((c) => ({ ...c }));
+    return { state: summarizeChecks(checks), checks };
+  }
+
+  async getFailedLogExcerpt(repo: string, runId: number, maxLines: number): Promise<string> {
+    this.enter('getFailedLogExcerpt', [repo, runId, maxLines]);
+    const log = this.failedLogs.get(runId);
+    if (log === undefined) throw new GitHostError('Not Found', 404);
+    return log.split('\n').slice(-maxLines).join('\n');
   }
 
   async listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback> {

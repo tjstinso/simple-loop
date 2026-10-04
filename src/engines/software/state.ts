@@ -40,6 +40,12 @@ export const SoftwareStateSchema = z.object({
   conflictActive: z.boolean().optional(),
   /** True once the factory handed the conflict to a person (limit reached or not resolvable by the agent). */
   conflictGaveUp: z.boolean().optional(),
+  /** The commit the chain last pushed to its branch; CI is read for exactly this head. */
+  lastPushedSha: z.string().optional(),
+  /** CI rounds started for this chain (absent: 0); counted apart from review attempts, human and conflict rounds. */
+  ciRounds: z.number().int().min(0).optional(),
+  /** True while the round being worked (or reviewed) fixes failing CI checks. */
+  ciActive: z.boolean().optional(),
   /** The agent's summary of the latest execute (capped), for the human round's summary comment. */
   lastSummary: z.string().optional(),
   /** Answers to a round's feedback items not posted yet (a failed reply is retried by maintenance). */

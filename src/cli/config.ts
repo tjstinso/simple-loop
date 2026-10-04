@@ -30,6 +30,7 @@ const ConfigSchema = z.object({
   allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
   maxHumanRounds: z.number().int().min(1).default(5),
   maxConflictRounds: z.number().int().min(1).default(2),
+  maxCiRounds: z.number().int().min(1).default(2),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
 }).superRefine((c, ctx) => {
