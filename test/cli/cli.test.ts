@@ -119,12 +119,11 @@ describe('factory cli', () => {
   it('status prints one engine-described line per open chain and no open chains when empty', async () => {
     const { h, out, deps } = setup();
     expect(await run(['status'], deps)).toBe(0);
-    expect(out).toEqual(['slots: 0 (no limit)', 'no open chains']);
+    expect(out).toEqual(['no open chains', 'slots: 0 (no limit)']);
     out.length = 0;
     const { chain } = await h.submit(5);
     expect(await run(['status'], deps)).toBe(0);
-    expect(out[0]).toBe('slots: 0 (no limit)');
-    out.shift();
+    expect(out.pop()).toBe('slots: 0 (no limit)');
     expect(out[0]).toBe(`${chain.id} software active ${h.engine.describe(h.chain(chain.id))}`);
     expect(out).toHaveLength(2);
     expect(out[1]).toMatch(/^ {2}job \d+ execute attempt=1 queued delivery=0 last-event=\d+s ago$/);
@@ -136,7 +135,7 @@ describe('factory cli', () => {
     await h.submit(5);
     h.claim();
     expect(await run(['status'], deps)).toBe(0);
-    expect(out[0]).toBe('slots: 1 of 3');
+    expect(out[out.length - 1]).toBe('slots: 1 of 3');
   });
 
   it('show and status print when a waiting chain was last checked, or that it never was', async () => {

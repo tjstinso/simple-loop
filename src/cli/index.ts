@@ -207,10 +207,10 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       }
       const max = kernel.deps.config.maxConcurrentJobs;
       const running = countRunning(rt.db);
-      stdout(`slots: ${running}${max === undefined ? ' (no limit)' : ` of ${max}`}`);
       const lines = statusLines(chains, kernel.deps.clock());
       if (lines.length === 0) stdout('no open chains');
       for (const l of lines) stdout(l);
+      stdout(`slots: ${running}${max === undefined ? ' (no limit)' : ` of ${max}`}`);
       return 0;
     }
     case 'show': {
