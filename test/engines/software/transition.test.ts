@@ -51,7 +51,7 @@ describe('softwareTransition', () => {
   it('execute ok -> reviewing with commit_push, open_pr, in-progress label and a review job', () => {
     const t = softwareTransition(chainOf(baseState({ attempt: 2 })), jobOf('execute', 2), { status: 'ok', summary: 's' });
     expect(t).toEqual({
-      engineState: baseState({ attempt: 2, phase: 'reviewing' }),
+      engineState: baseState({ attempt: 2, phase: 'reviewing', lastSummary: 's' }),
       chainStatus: 'active',
       effects: [
         { kind: 'commit_push' },

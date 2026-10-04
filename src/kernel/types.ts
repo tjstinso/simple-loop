@@ -121,6 +121,11 @@ export interface RunEffectContext<S> {
 /** What an effect may hand back: a patch merged into the transition's engine state before it commits. */
 export interface EffectOutcome<S> {
   engineState?: Partial<S>;
+  /**
+   * Stop here: the remaining effects are skipped and the transition commits with this chain status
+   * and no new jobs (for example a feedback round that changed nothing returns the chain to `waiting`).
+   */
+  finish?: { chainStatus: 'waiting' };
 }
 
 /**
@@ -131,10 +136,17 @@ export interface WorkspaceProvider {
   prepare(chain: ChainView<any>, job: Job): Promise<Workspace>;
 }
 
-export type ReconcileOutcome =
+export type ReconcileOutcome<S = unknown> =
   | { outcome: 'none' }
   | { outcome: 'completed'; reason: string }
-  | { outcome: 'cancelled'; reason: string };
+  | { outcome: 'cancelled'; reason: string }
+  /**
+   * New work for the waiting chain: the kernel creates `job`, sets the chain `active` and stores
+   * `engineState`, in one transaction that only applies while the chain is still `waiting`.
+   */
+  | { outcome: 'new_work'; reason: string; engineState: S; job: NewJob }
+  /** The chain stays `waiting` but its engine state changes (applied only while it is still `waiting`). */
+  | { outcome: 'update'; reason: string; engineState: S };
 
 export interface Engine<S = unknown> {
   id: string;
@@ -186,10 +198,10 @@ export interface Engine<S = unknown> {
    * learn whether the subject was settled outside the factory (for example a person merged or closed
    * the pull request). `completed` finishes the chain (its engine state becomes `finalState(state)`
    * when defined), `cancelled` cancels it like `Kernel.cancelChain`, `none` leaves it. Must be cheap
-   * (at most one lookup) and return `none` on a transient failure so the next pass retries; a thrown
+   * and return `none` on a transient failure so the next pass retries; a thrown
    * error goes to `onError` and leaves the chain untouched.
    */
-  reconcile?(chain: ChainView<S>): Promise<ReconcileOutcome>;
+  reconcile?(chain: ChainView<S>): Promise<ReconcileOutcome<S>>;
   /** Optional: the engine state of a chain that `reconcile` completed (default: unchanged). Pure. */
   finalState?(state: S): S;
   /**

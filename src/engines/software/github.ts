@@ -15,6 +15,46 @@ export interface Pr {
   baseBranch: string;
 }
 
+export type PrReviewState = 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED';
+
+export interface PrReview {
+  id: number;
+  author: string;
+  authorAssociation: string;
+  state: PrReviewState;
+  body: string;
+  submittedAt: string;
+}
+
+export interface PrReviewComment {
+  id: number;
+  author: string;
+  authorAssociation: string;
+  path: string;
+  /** The line the comment is on (null when the comment is outdated or on a whole file). */
+  line: number | null;
+  diffHunk: string;
+  body: string;
+  createdAt: string;
+  /** The review the comment belongs to (null when unknown). */
+  reviewId: number | null;
+}
+
+export interface PrConversationComment {
+  id: number;
+  author: string;
+  authorAssociation: string;
+  body: string;
+  createdAt: string;
+}
+
+/** What people said on a pull request: untrusted text, every item carries its `authorAssociation`. */
+export interface PrFeedback {
+  reviews: PrReview[];
+  reviewComments: PrReviewComment[];
+  comments: PrConversationComment[];
+}
+
 export interface GitHost {
   getIssue(repo: string, n: number): Promise<Issue>;
   findPrByHead(repo: string, branch: string): Promise<Pr | null>;
@@ -31,6 +71,8 @@ export interface GitHost {
    * when the branch protection's required checks pass. Throws AutoMergeRefusedError when GitHub refuses.
    */
   mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void>;
+  /** The reviews, inline review comments and conversation comments of a pull request, all pages. */
+  listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback>;
 }
 
 export class GitHostError extends Error {
@@ -134,6 +176,14 @@ export const buildListCommentsArgs = (repo: string, n: number, page: number): st
   'api', '-X', 'GET', `repos/${repo}/issues/${n}/comments`, '-f', 'per_page=100', '-f', `page=${page}`,
 ];
 
+export const buildListReviewsArgs = (repo: string, n: number, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/pulls/${n}/reviews`, '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
+export const buildListReviewCommentsArgs = (repo: string, n: number, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/pulls/${n}/comments`, '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
 export const buildCommentArgs = (repo: string, n: number): string[] => [
   'api', '-X', 'POST', `repos/${repo}/issues/${n}/comments`, '--input', '-',
 ];
@@ -188,6 +238,42 @@ interface RestPr {
   head?: { sha?: string };
   base?: { ref?: string };
 }
+
+interface RestUser {
+  login?: string | null;
+}
+
+interface RestReview {
+  id: number;
+  user?: RestUser | null;
+  author_association?: string | null;
+  state?: string | null;
+  body?: string | null;
+  submitted_at?: string | null;
+}
+
+interface RestReviewComment {
+  id: number;
+  user?: RestUser | null;
+  author_association?: string | null;
+  path?: string | null;
+  line?: number | null;
+  original_line?: number | null;
+  diff_hunk?: string | null;
+  body?: string | null;
+  created_at?: string | null;
+  pull_request_review_id?: number | null;
+}
+
+interface RestIssueComment {
+  id: number;
+  user?: RestUser | null;
+  author_association?: string | null;
+  body?: string | null;
+  created_at?: string | null;
+}
+
+const REVIEW_STATES: readonly PrReviewState[] = ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'];
 
 export class GhCliHost implements GitHost {
   private readonly exec: ExecFn;
@@ -281,6 +367,54 @@ export class GhCliHost implements GitHost {
 
   async comment(repo: string, n: number, body: string): Promise<void> {
     await this.run(buildCommentArgs(repo, n), { body });
+  }
+
+  /** Every page of a REST list (100 per page, a short page is the last). */
+  private async pages<T>(build: (page: number) => string[]): Promise<T[]> {
+    const all: T[] = [];
+    for (let page = 1; ; page++) {
+      const items = await this.json<T[]>(build(page));
+      all.push(...items);
+      if (items.length < 100) return all;
+    }
+  }
+
+  async listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback> {
+    const reviews = await this.pages<RestReview>((p) => buildListReviewsArgs(repo, prNumber, p));
+    const reviewComments = await this.pages<RestReviewComment>((p) => buildListReviewCommentsArgs(repo, prNumber, p));
+    const comments = await this.pages<RestIssueComment>((p) => buildListCommentsArgs(repo, prNumber, p));
+    return {
+      reviews: reviews.map((r) => {
+        const state = String(r.state ?? '').toUpperCase();
+        return {
+          id: r.id,
+          author: r.user?.login ?? '',
+          authorAssociation: r.author_association ?? 'NONE',
+          // Pending reviews are never listed to others; anything unknown is a plain comment.
+          state: (REVIEW_STATES as readonly string[]).includes(state) ? (state as PrReviewState) : 'COMMENTED',
+          body: r.body ?? '',
+          submittedAt: r.submitted_at ?? '',
+        };
+      }),
+      reviewComments: reviewComments.map((c) => ({
+        id: c.id,
+        author: c.user?.login ?? '',
+        authorAssociation: c.author_association ?? 'NONE',
+        path: c.path ?? '',
+        line: c.line ?? c.original_line ?? null,
+        diffHunk: c.diff_hunk ?? '',
+        body: c.body ?? '',
+        createdAt: c.created_at ?? '',
+        reviewId: c.pull_request_review_id ?? null,
+      })),
+      comments: comments.map((c) => ({
+        id: c.id,
+        author: c.user?.login ?? '',
+        authorAssociation: c.author_association ?? 'NONE',
+        body: c.body ?? '',
+        createdAt: c.created_at ?? '',
+      })),
+    };
   }
 
   async findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null> {

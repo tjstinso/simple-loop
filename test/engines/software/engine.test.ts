@@ -420,12 +420,12 @@ describe('software engine', () => {
       });
     });
 
-    it('leaves an open pull request and a missing one alone, with one lookup each', async () => {
+    it('leaves an open pull request without feedback and a missing one alone', async () => {
       const { engine, host } = make();
       expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
       open(host, 'open');
       expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
-      expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead', 'findPrByHead']);
+      expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead', 'findPrByHead', 'listPrFeedback']);
     });
 
     it.each([undefined, 429, 503])('treats host error status %s as transient', async (status) => {

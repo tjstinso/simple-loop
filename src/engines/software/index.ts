@@ -1,10 +1,19 @@
 import type Database from 'better-sqlite3';
 import { recordEvent } from '../../kernel/events.js';
 import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
-import { EffectError, type ChainView, type DeadLetter, type Engine, type Job, type WorkspaceProvider } from '../../kernel/types.js';
+import {
+  EffectError,
+  type ChainView,
+  type DeadLetter,
+  type Engine,
+  type Job,
+  type ReconcileOutcome,
+  type WorkspaceProvider,
+} from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
 import { defaultSleep, isTransient, runSoftwareEffect, withHostRetry } from './effects.js';
+import { planFeedbackRound, DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS } from './feedback.js';
 import { GitHostError, type GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
@@ -35,6 +44,10 @@ export interface SoftwareEngineDeps {
     historyRetentionDays?: number;
     /** Kept (dead-lettered) worktrees older than this are swept (default 7 days). */
     keptWorktreeMaxAgeMs?: number;
+    /** Whose pull request feedback counts (default OWNER, MEMBER, COLLABORATOR). */
+    allowedAuthorAssociations?: string[];
+    /** Human feedback rounds one chain accepts (default 5). */
+    maxHumanRounds?: number;
   };
   sleep?: (ms: number) => Promise<void>;
   /** Clock for stored rows (epoch ms); injected by the composition root. */
@@ -58,6 +71,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   // `delivery` restarts at 1 for every job, so a delivery is identified by (chain, job, delivery).
   const key = (chainId: number, jobId: number, delivery: number) => `${chainId}:${jobId}:${delivery}`;
   const forget = (chainId: number, jobId: number, delivery: number) => void cache.delete(key(chainId, jobId, delivery));
+  const allowedAuthorAssociations = deps.config.allowedAuthorAssociations ?? [...DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS];
+  const maxHumanRounds = Math.max(1, deps.config.maxHumanRounds ?? 5);
   const historyRetentionDays = deps.config.historyRetentionDays ?? 30;
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
   /** Agent-written text on its way to GitHub (or a dead letter): named patterns and known values redacted. */
@@ -93,6 +108,53 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       if (await deps.host.findComment(repo, issueNumber, marker)) return;
       await deps.host.comment(repo, issueNumber, `${text}\n\n${marker}`);
     }, sleep);
+  }
+
+  /**
+   * The factory's pull request is open and waiting: starts a revision when a person left feedback
+   * since `feedbackHandledAt`, or hands over (`needs_human`) when the chain used its human rounds.
+   */
+  async function reconcileFeedback(s: SoftwareState, chainId: number, prNumber: number): Promise<ReconcileOutcome<SoftwareState>> {
+    let feedback;
+    try {
+      feedback = await deps.host.listPrFeedback(s.repo, prNumber);
+    } catch (e) {
+      // Transient host failure: the next maintenance pass retries.
+      if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none' };
+      throw e;
+    }
+    const plan = planFeedbackRound(feedback, s, { allowedAuthorAssociations });
+    if (!plan.round) return { outcome: 'none' };
+    const rounds = s.humanRounds ?? 0;
+    if (rounds >= maxHumanRounds) {
+      await commentOnce(
+        s.repo,
+        prNumber,
+        `<!-- factory:chain=${chainId} event=human-round-limit -->`,
+        `The factory has already revised this pull request for ${rounds} round(s) of feedback, the most it accepts for one chain, so it will not act on newer feedback. A person has to take over.`,
+      );
+      await deps.host.setLabels(s.repo, prNumber, [LABEL_NEEDS_HUMAN], []);
+      return {
+        outcome: 'update',
+        reason: `human feedback rounds exhausted (${maxHumanRounds})`,
+        engineState: { ...s, phase: 'needs_human', feedbackHandledAt: plan.newestAt },
+      };
+    }
+    const attempt = s.attempt + 1;
+    const round = rounds + 1;
+    return {
+      outcome: 'new_work',
+      reason: `feedback round ${round}`,
+      engineState: {
+        ...s,
+        phase: 'executing',
+        attempt,
+        attemptBase: s.attempt,
+        humanRounds: round,
+        feedbackHandledAt: plan.newestAt,
+      },
+      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: round } },
+    };
   }
 
   const workspace: WorkspaceProvider = {
@@ -173,6 +235,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
           git: deps.git,
           sleep: deps.sleep,
           followups: { db: deps.db, now: deps.now },
+          now: deps.now,
           secretValues: deps.secretValues,
           events: (kind, detail) =>
             recordEvent(deps.db, {
@@ -215,6 +278,16 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         });
       } catch (e) {
         errors.push(e);
+      }
+      const humanRound = (job.payload as { humanRound?: unknown } | null | undefined)?.humanRound;
+      if (job.type === 'execute' && typeof humanRound === 'number') {
+        // A person's feedback is being worked: the pull request is no longer ready for merge.
+        try {
+          const pr = await deps.host.findPrByHead(s.repo, s.branch);
+          if (pr) await deps.host.setLabels(s.repo, pr.number, [], [LABEL_READY_FOR_MERGE, LABEL_NEEDS_HUMAN]);
+        } catch (e) {
+          errors.push(e);
+        }
       }
       if (job.type === 'execute' && job.attempt === 1) {
         try {
@@ -282,7 +355,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none' };
         throw e;
       }
-      if (!pr || pr.state === 'open') return { outcome: 'none' };
+      if (!pr) return { outcome: 'none' };
+      if (pr.state === 'open') return reconcileFeedback(s, chain.id, pr.number);
       if (pr.state === 'merged') return { outcome: 'completed', reason: `Pull request #${pr.number} was merged` };
       return {
         outcome: 'cancelled',

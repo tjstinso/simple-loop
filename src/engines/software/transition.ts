@@ -13,6 +13,9 @@ import {
 } from './schemas.js';
 import type { SoftwareState } from './state.js';
 
+/** How much of the agent's summary the state keeps for the human round's summary comment. */
+const SUMMARY_KEPT = 2000;
+
 function followupEffects(followups: Followup[] | undefined): SoftwareEffect[] {
   return followups && followups.length > 0 ? [{ kind: 'file_followups', followups }] : [];
 }
@@ -31,8 +34,9 @@ export function softwareTransition(
     const r = parsed.data;
     if (r.status === 'error') throw new EffectError(r.summary, 'runner_error');
     const review: NewJob = { type: 'review', attempt: state.attempt, policyKind: 'review', labels, payload: undefined };
+    const lastSummary = r.summary.trim().slice(0, SUMMARY_KEPT);
     return {
-      engineState: { ...state, labels, phase: 'reviewing' },
+      engineState: { ...state, labels, phase: 'reviewing', lastSummary },
       chainStatus: 'active',
       newJobs: [review],
       effects: [
@@ -51,6 +55,8 @@ export function softwareTransition(
     const v = parsed.data;
     const followups = followupEffects(v.followups);
     const profile = PROFILES[state.profile];
+    // After a person's feedback, the approved revision is reported on the pull request (once per round).
+    const roundSummary: SoftwareEffect[] = (state.humanRounds ?? 0) > 0 ? [{ kind: 'round_summary' }] : [];
 
     if (v.verdict === 'approve') {
       if (profile.onApprove === 'merge') {
@@ -62,6 +68,7 @@ export function softwareTransition(
           effects: [
             { kind: 'merge_pr' },
             { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
+            ...roundSummary,
             ...followups,
           ],
         };
@@ -74,12 +81,14 @@ export function softwareTransition(
           { kind: 'set_labels', target: 'pr', add: [LABEL_READY_FOR_MERGE], remove: [LABEL_IN_PROGRESS] },
           // in-progress lives on the issue (set by the execute transition).
           { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
+          ...roundSummary,
           ...followups,
         ],
       };
     }
 
-    if (state.attempt < profile.maxAttempts) {
+    // The factory's own attempts are counted from the start of the current human round.
+    if (state.attempt - (state.attemptBase ?? 0) < profile.maxAttempts) {
       const attempt = state.attempt + 1;
       return {
         engineState: { ...state, labels, attempt, phase: 'executing' },

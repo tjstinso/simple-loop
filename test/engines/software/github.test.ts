@@ -105,6 +105,22 @@ describe('FakeGitHost', () => {
   });
 });
 
+describe('FakeGitHost listPrFeedback', () => {
+  it('returns the added reviews and comments, with the factory comments as conversation comments', async () => {
+    const gh = new FakeGitHost();
+    const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
+    const reviewId = gh.addReview(pr.number, { state: 'CHANGES_REQUESTED', submittedAt: '2026-01-01T00:00:00Z', body: 'fix' });
+    gh.addReviewComment(pr.number, { createdAt: '2026-01-01T00:00:01Z', reviewId, path: 'a.ts', line: 3, body: 'here' });
+    gh.addConversationComment(pr.number, { createdAt: '2026-01-01T00:00:02Z', body: 'hi', authorAssociation: 'NONE' });
+    await gh.comment(R, pr.number, 'ours <!-- factory: -->');
+    const f = await gh.listPrFeedback(R, pr.number);
+    expect(f.reviews).toMatchObject([{ id: reviewId, state: 'CHANGES_REQUESTED', author: 'alice', authorAssociation: 'COLLABORATOR' }]);
+    expect(f.reviewComments).toMatchObject([{ reviewId, path: 'a.ts', line: 3, body: 'here' }]);
+    expect(f.comments.map((c) => c.body)).toEqual(['ours <!-- factory: -->', 'hi']);
+    await expect(gh.listPrFeedback(R, 99)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
 type Call = [string, string[]];
 function stub(responses: Array<{ stdout?: string; stderr?: string; exitCode?: number }>) {
   const calls: Call[] = [];
@@ -215,6 +231,67 @@ describe('GhCliHost', () => {
       ['api', '-X', 'GET', 'repos/o/r/issues/4/comments', '-f', 'per_page=100', '-f', 'page=1'],
       ['api', '-X', 'GET', 'repos/o/r/issues/4/comments', '-f', 'per_page=100', '-f', 'page=2'],
     ]);
+  });
+
+  describe('listPrFeedback', () => {
+    const page = (n: number, make: (i: number) => object) => JSON.stringify(Array.from({ length: n }, (_, i) => make(i)));
+
+    it('maps reviews, inline review comments and conversation comments with manual paging', async () => {
+      const review = (i: number) => ({
+        id: i + 1, user: { login: 'bob' }, author_association: 'MEMBER', state: 'CHANGES_REQUESTED', body: 'b', submitted_at: '2026-01-01T00:00:00Z',
+      });
+      const { exec, calls } = stub([
+        { stdout: page(100, review) },
+        { stdout: JSON.stringify([{ ...review(100), state: 'APPROVED' }]) },
+        {
+          stdout: JSON.stringify([
+            {
+              id: 50, user: { login: 'carol' }, author_association: 'OWNER', path: 'src/a.ts', line: 12, original_line: 9,
+              diff_hunk: '@@ -1 +1 @@', body: 'rename', created_at: '2026-01-02T00:00:00Z', pull_request_review_id: 7,
+            },
+            { id: 51, user: null, path: 'b.ts', line: null, original_line: 4, body: null, created_at: '2026-01-02T00:00:01Z' },
+          ]),
+        },
+        { stdout: page(100, (i) => ({ id: 100 + i, user: { login: 'dan' }, author_association: 'NONE', body: 'x', created_at: '2026-01-03T00:00:00Z' })) },
+        { stdout: JSON.stringify([{ id: 300, user: { login: 'erin' }, author_association: 'COLLABORATOR', body: 'last', created_at: '2026-01-04T00:00:00Z' }]) },
+      ]);
+      const f = await new GhCliHost({ exec }).listPrFeedback(R, 9);
+      expect(calls.map((c) => c[1])).toEqual([
+        ['api', '-X', 'GET', 'repos/o/r/pulls/9/reviews', '-f', 'per_page=100', '-f', 'page=1'],
+        ['api', '-X', 'GET', 'repos/o/r/pulls/9/reviews', '-f', 'per_page=100', '-f', 'page=2'],
+        ['api', '-X', 'GET', 'repos/o/r/pulls/9/comments', '-f', 'per_page=100', '-f', 'page=1'],
+        ['api', '-X', 'GET', 'repos/o/r/issues/9/comments', '-f', 'per_page=100', '-f', 'page=1'],
+        ['api', '-X', 'GET', 'repos/o/r/issues/9/comments', '-f', 'per_page=100', '-f', 'page=2'],
+      ]);
+      expect(f.reviews).toHaveLength(101);
+      expect(f.reviews[0]).toEqual({
+        id: 1, author: 'bob', authorAssociation: 'MEMBER', state: 'CHANGES_REQUESTED', body: 'b', submittedAt: '2026-01-01T00:00:00Z',
+      });
+      expect(f.reviews[100]!.state).toBe('APPROVED');
+      expect(f.reviewComments).toEqual([
+        {
+          id: 50, author: 'carol', authorAssociation: 'OWNER', path: 'src/a.ts', line: 12, diffHunk: '@@ -1 +1 @@', body: 'rename',
+          createdAt: '2026-01-02T00:00:00Z', reviewId: 7,
+        },
+        {
+          id: 51, author: '', authorAssociation: 'NONE', path: 'b.ts', line: 4, diffHunk: '', body: '',
+          createdAt: '2026-01-02T00:00:01Z', reviewId: null,
+        },
+      ]);
+      expect(f.comments).toHaveLength(101);
+      expect(f.comments[100]).toEqual({ id: 300, author: 'erin', authorAssociation: 'COLLABORATOR', body: 'last', createdAt: '2026-01-04T00:00:00Z' });
+    });
+
+    it('treats an unknown review state as a comment and maps errors like the other calls', async () => {
+      const ok = stub([
+        { stdout: JSON.stringify([{ id: 1, user: { login: 'a' }, state: 'PENDING', body: 'x', submitted_at: 't' }]) },
+        { stdout: '[]' },
+        { stdout: '[]' },
+      ]);
+      expect((await new GhCliHost({ exec: ok.exec }).listPrFeedback(R, 1)).reviews[0]!.state).toBe('COMMENTED');
+      const bad = stub([{ stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 }]);
+      await expect(new GhCliHost({ exec: bad.exec }).listPrFeedback(R, 1)).rejects.toMatchObject({ status: 404 });
+    });
   });
 
   it('findIssueByMarker returns the lowest matching number', async () => {
