@@ -62,6 +62,8 @@ export interface ExecuteResult {
   status: 'ok' | 'error';
   summary: string;
   followups?: Followup[];
+  /** Left untyped on purpose: tests also script malformed responses. */
+  feedbackResponses?: unknown;
 }
 
 export interface ReviewResult {
@@ -78,6 +80,8 @@ export interface Harness {
   kernel: Kernel;
   engine: SoftwareEngine;
   host: FakeGitHost;
+  /** Errors the engine reported through `onError` without failing (for example a reply that could not be posted). */
+  engineErrors: string[];
   runner: FakeRunner;
   remote: TempRemote;
   workspaceRoot: string;
@@ -150,6 +154,8 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     const clock = () => now;
 
     const host = new FakeGitHost();
+    host.now = clock;
+    const engineErrors: string[] = [];
     // sweepGraceMs 0: the harness clock is fake (START_TIME), so file mtimes cannot be compared with it.
     const workspaces = new GitWorkspaceProvider({ cloneUrlFor: () => r.url, root: workspaceRoot, keepOnFailure: true, sweepGraceMs: 0 });
     // Wired as in the production composition root (src/cli/runtime.ts).
@@ -196,6 +202,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
       },
       now: clock,
       sleep: async () => {},
+      onError: (err, context) => engineErrors.push(`${context}: ${err instanceof Error ? err.message : String(err)}`),
       secretValues: () => [FAKE_API_KEY],
     });
     const runEffect = engine.runEffect.bind(engine);
@@ -218,6 +225,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
       kernel,
       engine,
       host,
+      engineErrors,
       runner,
       remote: r,
       workspaceRoot,

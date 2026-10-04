@@ -1,5 +1,6 @@
 import { EffectError } from '../../kernel/types.js';
 import type { ChainView, Job, NewJob, Transition } from '../../kernel/types.js';
+import { refsFromPayload } from './feedback.js';
 import { PROFILES } from './profiles.js';
 import {
   ExecutionResultSchema,
@@ -44,6 +45,8 @@ export function softwareTransition(
         { kind: 'open_pr' },
         // Also clears a dead-letter label a resubmit after `dlq discard` may have left behind.
         { kind: 'set_labels', target: 'issue', add: [LABEL_IN_PROGRESS], remove: [LABEL_DEAD_LETTER] },
+        // Answers a person's feedback items (a no-op when the job has none).
+        ...(refsFromPayload(job.payload).length > 0 ? [{ kind: 'post_feedback_replies' } as const] : []),
         ...followupEffects(r.followups),
       ],
     };

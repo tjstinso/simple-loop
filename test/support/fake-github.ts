@@ -8,6 +8,7 @@ import {
   type PrFeedback,
   type PrReview,
   type PrReviewComment,
+  type PrReviewThread,
 } from '../../src/engines/software/github.js';
 
 interface StoredIssue {
@@ -34,6 +35,9 @@ export class FakeGitHost implements GitHost {
   private autoMerge = new Set<number>();
   private feedback = new Map<number, PrFeedback>();
   private nextFeedbackId = 1;
+  private resolvedThreads = new Set<string>();
+  /** Clock (epoch ms) for the `createdAt` of replies the factory posts; the harness points it at its own. */
+  now: () => number = Date.now;
   /** Like the repository setting "Allow auto-merge": off makes `mergePr` throw AutoMergeRefusedError. */
   autoMergeAllowed = true;
   /** The branch protection's required checks: auto-merge merges only once they pass. */
@@ -102,9 +106,24 @@ export class FakeGitHost implements GitHost {
   addReviewComment(n: number, c: Partial<PrReviewComment> & Pick<PrReviewComment, 'createdAt'>): number {
     const id = c.id ?? this.nextFeedbackId++;
     this.feedbackOf(n).reviewComments.push({
-      id, author: 'alice', authorAssociation: 'COLLABORATOR', path: 'src/a.ts', line: 1, diffHunk: '@@ -1 +1 @@', body: '', reviewId: null, ...c,
+      id, author: 'alice', authorAssociation: 'COLLABORATOR', path: 'src/a.ts', line: 1, diffHunk: '@@ -1 +1 @@', body: '', reviewId: null,
+      threadId: `thread-${id}`, ...c,
     });
     return id;
+  }
+
+  /** Marks a review thread resolved, as a person would. */
+  resolveThread(threadId: string): void {
+    this.resolvedThreads.add(threadId);
+  }
+
+  isThreadResolved(threadId: string): boolean {
+    return this.resolvedThreads.has(threadId);
+  }
+
+  /** The thread an inline comment belongs to. */
+  threadOf(n: number, commentId: number): string | null {
+    return this.feedbackOf(n).reviewComments.find((c) => c.id === commentId)?.threadId ?? null;
   }
 
   /** A conversation comment on the pull request (not an inline one); returns its id. */
@@ -250,6 +269,33 @@ export class FakeGitHost implements GitHost {
     const factory = (this.comments.get(prNumber) ?? []).map((body, i) => ({
       id: -1 - i, author: 'factory', authorAssociation: 'OWNER', body, createdAt: new Date(0).toISOString(),
     }));
-    return structuredClone({ reviews: f.reviews, reviewComments: f.reviewComments, comments: [...factory, ...f.comments] });
+    const reviewComments = f.reviewComments.map((c) => ({ ...c, threadResolved: c.threadId != null && this.resolvedThreads.has(c.threadId) }));
+    return structuredClone({ reviews: f.reviews, reviewComments, comments: [...factory, ...f.comments] });
+  }
+
+  async listReviewThreads(repo: string, prNumber: number): Promise<PrReviewThread[]> {
+    this.enter('listReviewThreads', [repo, prNumber]);
+    this.prOrThrow(prNumber);
+    const byThread = new Map<string, number[]>();
+    for (const c of this.feedbackOf(prNumber).reviewComments) {
+      if (c.threadId != null) byThread.set(c.threadId, [...(byThread.get(c.threadId) ?? []), c.id]);
+    }
+    return [...byThread].map(([id, commentIds]) => ({ id, resolved: this.resolvedThreads.has(id), commentIds }));
+  }
+
+  async replyToReviewComment(repo: string, prNumber: number, commentId: number, body: string): Promise<void> {
+    this.enter('replyToReviewComment', [repo, prNumber, commentId, body]);
+    this.prOrThrow(prNumber);
+    const original = this.feedbackOf(prNumber).reviewComments.find((c) => c.id === commentId);
+    if (!original) throw new GitHostError('Not Found', 404);
+    this.addReviewComment(prNumber, {
+      author: 'factory', authorAssociation: 'OWNER', path: original.path, line: original.line, diffHunk: original.diffHunk, body,
+      threadId: original.threadId ?? null, reviewId: original.reviewId, createdAt: new Date(this.now()).toISOString(),
+    });
+  }
+
+  async resolveReviewThread(repo: string, threadId: string): Promise<void> {
+    this.enter('resolveReviewThread', [repo, threadId]);
+    this.resolvedThreads.add(threadId);
   }
 }

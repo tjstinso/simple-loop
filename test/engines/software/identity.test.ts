@@ -43,6 +43,9 @@ describe('GhCliHost with a GitHub identity', () => {
     calls.push({ args, env: opts?.env });
     if (args[0] === 'pr' && args[1] === 'list') return { stdout: '[]', stderr: '', exitCode: 0 };
     if (args.join(' ') === 'api -X GET user') return { stdout: '{"login":"factory-bot"}', stderr: '', exitCode: 0 };
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      return { stdout: '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}', stderr: '', exitCode: 0 };
+    }
     return { stdout: '[]', stderr: '', exitCode: 0 };
   };
   beforeEach(() => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FEEDBACK_MAX_CHARS, planFeedbackRound } from '../../../src/engines/software/feedback.js';
+import { FEEDBACK_MAX_CHARS, planFeedbackRound, refsFromPayload, validateResponses } from '../../../src/engines/software/feedback.js';
 import type { PrFeedback } from '../../../src/engines/software/github.js';
 
 const config = { allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'] };
@@ -132,5 +132,89 @@ describe('planFeedbackRound', () => {
   it('does not mark a text under the cap as truncated', () => {
     const r = planFeedbackRound({ ...empty(), comments: [convo()] }, state, config);
     expect(r.round && r.text).not.toMatch(/Truncated/);
+  });
+});
+
+describe('feedback item ids', () => {
+  it('lists every item with a stable id and returns the refs to answer', () => {
+    const plan = planFeedbackRound(
+      { reviews: [review({ id: 11, body: 'overall\nsecond line' })], reviewComments: [inline({ id: 22, body: 'rename this\nplease' })], comments: [convo({ id: 33 })] },
+      state,
+      config,
+    );
+    if (!plan.round) throw new Error('expected a round');
+    expect(plan.text).toContain('(review 11)');
+    expect(plan.text).toContain('(comment 22)');
+    expect(plan.text).toContain('(comment 33)');
+    expect(plan.text).toContain('feedbackResponses');
+    expect(plan.refs).toEqual([
+      { id: 'review 11', kind: 'review', numId: 11, quote: 'overall' },
+      { id: 'comment 22', kind: 'inline', numId: 22, quote: 'rename this' },
+      { id: 'comment 33', kind: 'conversation', numId: 33, quote: 'also add a test' },
+    ]);
+    expect(refsFromPayload({ feedbackItems: [...plan.refs, { id: 5 }, 'x'] })).toEqual(plan.refs);
+    expect(refsFromPayload(undefined)).toEqual([]);
+  });
+
+  it('asks for no answer to an approval or a review without text', () => {
+    const plan = planFeedbackRound(
+      { reviews: [review({ id: 1, state: 'APPROVED', body: 'lgtm' }), review({ id: 2, body: '' })], reviewComments: [inline({ id: 3 })], comments: [] },
+      state,
+      config,
+    );
+    if (!plan.round) throw new Error('expected a round');
+    expect(plan.refs.map((r) => r.id)).toEqual(['comment 3']);
+  });
+});
+
+describe('resolved threads', () => {
+  const answered = (over: Partial<PrFeedback['reviewComments'][number]> = {}) =>
+    inline({ id: 50, threadId: 'T', threadResolved: true, createdAt: T(20), ...over });
+  const factoryReply = (at: number) => inline({ id: 51, author: 'factory', body: 'done <!-- factory:reply comment=50 -->', threadId: 'T', threadResolved: true, createdAt: T(at) });
+
+  it('ignores a comment in a resolved thread', () => {
+    expect(planFeedbackRound({ ...empty(), reviewComments: [answered()] }, state, config)).toEqual({ round: false });
+    expect(planFeedbackRound({ ...empty(), reviewComments: [answered(), factoryReply(21)] }, state, config)).toEqual({ round: false });
+  });
+
+  it('feeds back a person’s comment added after the factory answered and the thread was resolved', () => {
+    const newer = inline({ id: 52, threadId: 'T', threadResolved: true, createdAt: T(30), body: 'still wrong' });
+    const plan = planFeedbackRound({ ...empty(), reviewComments: [answered(), factoryReply(21), newer] }, state, config);
+    if (!plan.round) throw new Error('expected a round');
+    expect(plan.refs.map((r) => r.id)).toEqual(['comment 52']);
+  });
+
+  it('still feeds back comments of an unresolved thread', () => {
+    const plan = planFeedbackRound({ ...empty(), reviewComments: [answered({ threadResolved: false })] }, state, config);
+    expect(plan.round).toBe(true);
+  });
+});
+
+describe('validateResponses', () => {
+  const refs = [
+    { id: 'comment 1', kind: 'inline' as const, numId: 1, quote: 'a' },
+    { id: 'comment 2', kind: 'conversation' as const, numId: 2, quote: 'b' },
+    { id: 'review 3', kind: 'review' as const, numId: 3, quote: 'c' },
+  ];
+  it('drops unknown ids, keeps the first of duplicates and lists items without a response', () => {
+    const v = validateResponses(
+      [
+        { id: 'comment 99', action: 'changed', reply: 'not in the round' },
+        { id: 'comment 1', action: 'changed', reply: 'first' },
+        { id: 'comment 1', action: 'declined', reply: 'second' },
+        { id: 'review 3', action: 'explained', reply: 'because' },
+      ],
+      refs,
+    );
+    expect(v.replies.map((r) => [r.id, r.action, r.reply])).toEqual([
+      ['comment 1', 'changed', 'first'],
+      ['review 3', 'explained', 'because'],
+    ]);
+    expect(v.unanswered).toEqual(['comment 2']);
+    expect(v.counts).toEqual({ changed: 1, explained: 1, declined: 0 });
+  });
+
+  it('treats absent responses as every item unanswered', () => {
+    expect(validateResponses(undefined, refs).unanswered).toEqual(['comment 1', 'comment 2', 'review 3']);
   });
 });
