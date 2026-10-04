@@ -62,11 +62,14 @@ export function softwareTransition(
     // pull request (once per round).
     const roundSummary: SoftwareEffect[] = state.conflictActive
       ? [{ kind: 'conflict_summary' }]
-      : (state.humanRounds ?? 0) > 0
+      : state.ciActive
+        ? [{ kind: 'ci_summary' }]
+        : (state.humanRounds ?? 0) > 0
         ? [{ kind: 'round_summary' }]
         : [];
     const settled = { ...state, labels, phase: 'awaiting_merge' as const };
     delete settled.conflictActive;
+    delete settled.ciActive;
 
     if (v.verdict === 'approve') {
       if (profile.onApprove === 'merge') {
@@ -109,6 +112,7 @@ export function softwareTransition(
     }
     const stuck = { ...state, labels, phase: 'needs_human' as const };
     delete stuck.conflictActive;
+    delete stuck.ciActive;
     return {
       engineState: stuck,
       chainStatus: 'waiting',

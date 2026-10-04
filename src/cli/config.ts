@@ -30,6 +30,7 @@ const ConfigSchema = z.object({
   allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
   maxHumanRounds: z.number().int().min(1).default(5),
   maxConflictRounds: z.number().int().min(1).default(2),
+  maxCiRounds: z.number().int().min(1).default(2),
   maxConcurrentJobs: z.number().int().min(1).optional(),
   leaseMs: z.number().int().min(10_000).default(300_000),
   heartbeatMs: z.number().int().min(1_000).default(30_000),

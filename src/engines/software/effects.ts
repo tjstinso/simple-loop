@@ -51,6 +51,7 @@ const EffectSchemas = {
   round_summary: z.object({ kind: z.literal('round_summary') }),
   post_feedback_replies: z.object({ kind: z.literal('post_feedback_replies') }),
   conflict_summary: z.object({ kind: z.literal('conflict_summary') }),
+  ci_summary: z.object({ kind: z.literal('ci_summary') }),
   comment: z.object({ kind: z.literal('comment'), target: Target, body: z.string(), marker: z.string().min(1) }),
 } as const;
 type Supported = Exclude<SoftwareEffect, { kind: 'file_followups' }>;
@@ -365,6 +366,17 @@ async function conflictSummary(ctx: EffectContext, fence: EffectFence): Promise<
   ctx.events?.('conflict.resolved', { sha, round });
 }
 
+/** After the factory's review approved a CI fix: one comment per round with the new commit. */
+async function ciSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
+  const { repo, ciRounds } = ctx.chain.state;
+  const round = ciRounds ?? 0;
+  const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
+  if (!pr) throw new EffectError('no PR found for the CI summary', 'effect_error');
+  const sha = pr.headSha.slice(0, 7);
+  await commentOnce(ctx, fence, pr.number, `ci-round-${round}`, `Fixed failing checks in ${sha === '' ? '(unknown)' : sha}`);
+  ctx.events?.('ci.fixed', { sha, round });
+}
+
 async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
@@ -402,6 +414,7 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<Effec
     fence.assertCurrent();
     throw new EffectError('remote branch moved by someone else', 'runner_error');
   }
+  return { engineState: { lastPushedSha: head } };
 }
 
 async function openPr(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
@@ -596,6 +609,8 @@ async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFenc
         return postFeedbackRepliesEffect(ctx, fence);
       case 'conflict_summary':
         return conflictSummary(ctx, fence);
+      case 'ci_summary':
+        return ciSummary(ctx, fence);
       case 'comment':
         return comment(ctx, fence, e);
     }

@@ -84,6 +84,36 @@ export interface PrFeedback {
   comments: PrConversationComment[];
 }
 
+/** One check of a commit: a check run, or a status of the legacy status API. */
+export interface CheckInfo {
+  name: string;
+  status: 'queued' | 'in_progress' | 'completed';
+  /** `success`, `failure`, `timed_out`, ... once completed, else null. */
+  conclusion: string | null;
+  detailsUrl?: string;
+  /** The Actions workflow run the check belongs to (parsed from its details url), when it has one. */
+  runId?: number;
+}
+
+export interface ChecksStatus {
+  state: 'passing' | 'pending' | 'failing' | 'none';
+  checks: CheckInfo[];
+}
+
+const FAILING_CONCLUSIONS = new Set(['failure', 'timed_out', 'cancelled', 'action_required']);
+const PASSING_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
+
+/** Whether a completed check counts as a failure (an unknown conclusion counts as neither passing nor failing). */
+export const isFailingCheck = (c: CheckInfo): boolean => c.status === 'completed' && FAILING_CONCLUSIONS.has(c.conclusion ?? '');
+
+/** The overall state: any failure wins, then any unfinished check, then all passing; no checks is `none`. */
+export function summarizeChecks(checks: readonly CheckInfo[]): ChecksStatus['state'] {
+  if (checks.length === 0) return 'none';
+  if (checks.some(isFailingCheck)) return 'failing';
+  if (checks.some((c) => c.status !== 'completed')) return 'pending';
+  return checks.every((c) => PASSING_CONCLUSIONS.has(c.conclusion ?? '')) ? 'passing' : 'pending';
+}
+
 export interface GitHost {
   getIssue(repo: string, n: number): Promise<Issue>;
   findPrByHead(repo: string, branch: string): Promise<Pr | null>;
@@ -100,6 +130,10 @@ export interface GitHost {
    * when the branch protection's required checks pass. Throws AutoMergeRefusedError when GitHub refuses.
    */
   mergePr(repo: string, n: number, opts?: { expectHeadSha?: string }): Promise<void>;
+  /** The checks of a commit (check runs and legacy statuses, all pages) and their overall state. */
+  getChecks(repo: string, sha: string): Promise<ChecksStatus>;
+  /** The last `maxLines` lines of the failing jobs' log of an Actions workflow run (untrusted text). */
+  getFailedLogExcerpt(repo: string, runId: number, maxLines: number): Promise<string>;
   /** The reviews, inline review comments and conversation comments of a pull request, all pages. */
   listPrFeedback(repo: string, prNumber: number): Promise<PrFeedback>;
   /** The review threads of a pull request with their comment ids (GraphQL, all pages). */
@@ -226,6 +260,18 @@ export const buildListReviewCommentsArgs = (repo: string, n: number, page: numbe
   'api', '-X', 'GET', `repos/${repo}/pulls/${n}/comments`, '-f', 'per_page=100', '-f', `page=${page}`,
 ];
 
+export const buildListCheckRunsArgs = (repo: string, sha: string, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/commits/${sha}/check-runs`, '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
+export const buildListStatusesArgs = (repo: string, sha: string, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/commits/${sha}/status`, '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
+export const buildFailedLogArgs = (repo: string, runId: number): string[] => [
+  'run', 'view', String(runId), '--repo', repo, '--log-failed',
+];
+
 export const buildCommentArgs = (repo: string, n: number): string[] => [
   'api', '-X', 'POST', `repos/${repo}/issues/${n}/comments`, '--input', '-',
 ];
@@ -343,6 +389,57 @@ interface RestIssueComment {
   author_association?: string | null;
   body?: string | null;
   created_at?: string | null;
+}
+
+interface RestCheckRun {
+  name?: string | null;
+  status?: string | null;
+  conclusion?: string | null;
+  details_url?: string | null;
+  html_url?: string | null;
+}
+
+interface RestCommitStatus {
+  context?: string | null;
+  state?: string | null;
+  target_url?: string | null;
+}
+
+const WORKFLOW_RUN_URL = /\/actions\/runs\/(\d+)/;
+
+/** The workflow run id in a check's details url (`.../actions/runs/<id>/job/<job>`), when it has one. */
+export function runIdFromUrl(url: string | undefined): number | undefined {
+  const m = url === undefined ? null : WORKFLOW_RUN_URL.exec(url);
+  return m ? Number(m[1]) : undefined;
+}
+
+/** A check run: GitHub's `queued`, `in_progress` and `completed`; anything else counts as not finished. */
+export function checkFromRun(r: RestCheckRun): CheckInfo {
+  const status = r.status === 'completed' ? 'completed' : r.status === 'in_progress' ? 'in_progress' : 'queued';
+  const detailsUrl = r.details_url ?? r.html_url ?? undefined;
+  const runId = runIdFromUrl(detailsUrl);
+  return {
+    name: r.name ?? '(unnamed)',
+    status,
+    conclusion: status === 'completed' ? (r.conclusion ?? null) : null,
+    ...(detailsUrl ? { detailsUrl } : {}),
+    ...(runId === undefined ? {} : { runId }),
+  };
+}
+
+/** A legacy commit status: `success` passes, `failure` and `error` fail, `pending` is unfinished. */
+export function checkFromStatus(s: RestCommitStatus): CheckInfo {
+  const state = String(s.state ?? 'pending');
+  const detailsUrl = s.target_url ?? undefined;
+  const runId = runIdFromUrl(detailsUrl);
+  const done = state === 'success' || state === 'failure' || state === 'error';
+  return {
+    name: s.context ?? '(unnamed)',
+    status: done ? 'completed' : 'in_progress',
+    conclusion: done ? (state === 'error' ? 'failure' : state) : null,
+    ...(detailsUrl ? { detailsUrl } : {}),
+    ...(runId === undefined ? {} : { runId }),
+  };
 }
 
 const REVIEW_STATES: readonly PrReviewState[] = ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'];
@@ -472,6 +569,32 @@ export class GhCliHost implements GitHost {
       all.push(...items);
       if (items.length < 100) return all;
     }
+  }
+
+  async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
+    if (!/^[0-9a-f]{7,64}$/i.test(sha)) throw new GitHostError(`not a commit sha: ${sha.slice(0, 80)}`);
+    const checks: CheckInfo[] = [];
+    // The check-runs endpoint wraps its page in an object; stop on a short page.
+    for (let page = 1; ; page++) {
+      const body = await this.json<{ check_runs?: RestCheckRun[] }>(buildListCheckRunsArgs(repo, sha, page));
+      const runs = body.check_runs ?? [];
+      checks.push(...runs.map(checkFromRun));
+      if (runs.length < 100) break;
+    }
+    for (let page = 1; ; page++) {
+      const body = await this.json<{ statuses?: RestCommitStatus[] }>(buildListStatusesArgs(repo, sha, page));
+      const statuses = body.statuses ?? [];
+      checks.push(...statuses.map(checkFromStatus));
+      if (statuses.length < 100) break;
+    }
+    return { state: summarizeChecks(checks), checks };
+  }
+
+  async getFailedLogExcerpt(repo: string, runId: number, maxLines: number): Promise<string> {
+    const out = await this.run(buildFailedLogArgs(repo, runId));
+    const lines = out.replace(/\r/g, '').split('\n');
+    while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    return lines.slice(-Math.max(0, maxLines)).join('\n');
   }
 
   async listReviewThreads(repo: string, prNumber: number): Promise<PrReviewThread[]> {

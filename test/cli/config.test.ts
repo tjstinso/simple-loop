@@ -31,6 +31,7 @@ describe('loadConfig', () => {
       allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
       maxHumanRounds: 5,
       maxConflictRounds: 2,
+      maxCiRounds: 2,
       leaseMs: 300000,
       heartbeatMs: 30000,
       maintenanceMs: 60000,

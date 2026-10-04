@@ -102,6 +102,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         allowedAuthorAssociations: config.allowedAuthorAssociations,
         maxHumanRounds: config.maxHumanRounds,
         maxConflictRounds: config.maxConflictRounds,
+        maxCiRounds: config.maxCiRounds,
       },
       now: clock,
       onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),

@@ -27,6 +27,7 @@ import {
   LABEL_READY_FOR_MERGE,
   ReviewVerdictSchema,
 } from './schemas.js';
+import { buildCiFeedback, failingChecks, MAX_CI_EXCERPTS, CI_EXCERPT_LINES } from './ci.js';
 import { MAX_CONFLICT_PATHS } from './conflict.js';
 import { PROFILES } from './profiles.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
@@ -54,6 +55,8 @@ export interface SoftwareEngineDeps {
     maxHumanRounds?: number;
     /** Conflict rounds (merging the base branch into the pull request) one chain gets (default 2). */
     maxConflictRounds?: number;
+    /** CI rounds (revisions for failing required checks) one chain gets (default 2). */
+    maxCiRounds?: number;
   };
   sleep?: (ms: number) => Promise<void>;
   /** Reports an error that does not stop the work (a feedback reply that could not be posted). */
@@ -85,6 +88,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const allowedAuthorAssociations = deps.config.allowedAuthorAssociations ?? [...DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS];
   const maxHumanRounds = Math.max(1, deps.config.maxHumanRounds ?? 5);
   const maxConflictRounds = Math.max(1, deps.config.maxConflictRounds ?? 2);
+  const maxCiRounds = Math.max(1, deps.config.maxCiRounds ?? 2);
   // Passes in a row a chain's pull request reported `unknown` mergeability (not persisted: a restart starts counting again).
   const unknownPasses = new Map<number, number>();
   const unknownLogged = new Set<number>();
@@ -199,6 +203,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         humanRounds: round,
         feedbackHandledAt: plan.newestAt,
         conflictActive: false,
+        ciActive: false,
       },
       job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: round, feedbackItems: plan.refs } },
     };
@@ -252,8 +257,69 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     return {
       outcome: 'new_work',
       reason: `conflict round ${round}`,
-      engineState: { ...s, phase: 'executing', attempt, attemptBase: s.attempt, conflictRounds: round, conflictActive: true },
+      engineState: { ...s, phase: 'executing', attempt, attemptBase: s.attempt, conflictRounds: round, conflictActive: true, ciActive: false },
       job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { conflictRound: round } },
+    };
+  }
+
+  /**
+   * The waiting chain's pull request still has the commit the chain pushed, and the required checks of
+   * exactly that commit failed: starts a CI round (the agent gets the failing checks and the end of
+   * their logs), or hands over when the chain used its CI rounds. Null when there is nothing to do:
+   * checks pending, passing or absent, another head, or a transient host failure (retried next pass).
+   * Merging stays with GitHub's branch protection; nothing here blocks or performs a merge.
+   */
+  async function reconcileCi(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
+    if (s.phase !== 'awaiting_merge' || !s.lastPushedSha || pr.headSha !== s.lastPushedSha) return null;
+    const event = (kind: string, detail: Record<string, unknown>) =>
+      recordEvent(deps.db, { at: deps.now(), chainId, kind, engine: 'software', detail });
+    let status;
+    try {
+      status = await deps.host.getChecks(s.repo, pr.headSha);
+    } catch (e) {
+      if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none', check: transientCheck(e) };
+      throw e;
+    }
+    if (status.state !== 'failing') return null;
+    const failing = failingChecks(status);
+    const names = failing.map((c) => redact(c.name));
+    const rounds = s.ciRounds ?? 0;
+    if (rounds >= maxCiRounds) {
+      const list = names.map((n) => `\`${n.replace(/[`\s]+/g, ' ').trim().slice(0, 100)}\``).join(', ');
+      await commentOnce(
+        s.repo,
+        pr.number,
+        `<!-- factory:chain=${chainId} event=ci-round-limit -->`,
+        `The required checks failed again (${list}), but the factory already revised this pull request for failing checks ${rounds} time(s), the most it does for one chain (\`maxCiRounds\`). A person has to fix them.`,
+      );
+      await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], []);
+      event('ci.gave_up', { reason: `ci rounds exhausted (${maxCiRounds})`, checks: names });
+      return { outcome: 'update', reason: `ci rounds exhausted (${maxCiRounds})`, engineState: { ...s, phase: 'needs_human' } };
+    }
+    // Logs are best effort: a check without a run (or whose log cannot be read) is listed without one.
+    const excerpts = new Map<string, string>();
+    const byRun = new Map<number, string | null>();
+    for (const c of failing.slice(0, MAX_CI_EXCERPTS)) {
+      if (c.runId === undefined) continue;
+      if (!byRun.has(c.runId)) {
+        try {
+          byRun.set(c.runId, await deps.host.getFailedLogExcerpt(s.repo, c.runId, CI_EXCERPT_LINES));
+        } catch {
+          byRun.set(c.runId, null);
+        }
+      }
+      const log = byRun.get(c.runId);
+      if (log) excerpts.set(c.name, log);
+    }
+    const feedback = buildCiFeedback(status, excerpts, deps.secretValues?.() ?? []);
+    const attempt = s.attempt + 1;
+    const round = rounds + 1;
+    event('ci.failed', { checks: names, round });
+    return {
+      outcome: 'new_work',
+      reason: `ci round ${round}`,
+      engineState: { ...s, phase: 'executing', attempt, attemptBase: s.attempt, ciRounds: round, ciActive: true, conflictActive: false },
+      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback, ciRound: round } },
     };
   }
 
@@ -439,9 +505,9 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       } catch (e) {
         errors.push(e);
       }
-      const payload = job.payload as { humanRound?: unknown; conflictRound?: unknown } | null | undefined;
-      if (job.type === 'execute' && (typeof payload?.humanRound === 'number' || typeof payload?.conflictRound === 'number')) {
-        // A person's feedback or a conflict is being worked: the pull request is no longer ready for merge.
+      const payload = job.payload as { humanRound?: unknown; conflictRound?: unknown; ciRound?: unknown } | null | undefined;
+      if (job.type === 'execute' && (typeof payload?.humanRound === 'number' || typeof payload?.conflictRound === 'number' || typeof payload?.ciRound === 'number')) {
+        // A person's feedback, a conflict or a failing check is being worked: the pull request is no longer ready for merge.
         try {
           const pr = await deps.host.findPrByHead(s.repo, s.branch);
           if (pr) await deps.host.setLabels(s.repo, pr.number, [], [LABEL_READY_FOR_MERGE, LABEL_NEEDS_HUMAN]);
@@ -522,8 +588,11 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         const replied = await retryPendingReplies(s, chain.id, pr);
         if (replied) return replied;
         // A conflict comes first; feedback is looked at on a later pass or when there is no conflict.
+        // Then failing CI checks, then feedback (each on a later pass when an earlier one started a round).
         const conflict = await reconcileConflict(s, chain.id, pr);
-        return conflict ?? reconcileFeedback(s, chain.id, pr.number);
+        if (conflict) return conflict;
+        const ci = await reconcileCi(s, chain.id, pr);
+        return ci ?? reconcileFeedback(s, chain.id, pr.number);
       }
       if (pr.state === 'merged') return { outcome: 'completed', reason: `Pull request #${pr.number} was merged` };
       return {
