@@ -85,4 +85,17 @@ describe('validatePolicies', () => {
       db.close();
     }
   });
+
+  it('rejects a malformed claude-cli pluginDirs at startup, naming the policy and the field', () => {
+    const engines = new EngineRegistry();
+    engines.register(engineWithKinds('software', ['execute']));
+    const runners = new RunnerRegistry();
+    runners.register(new ClaudeCliRunner());
+    const base = { prompt: 'x', allowedTools: ['Read'], maxBudgetUsd: 1, timeoutMs: 1000, inactivityTimeoutMs: 1000, resultFormat: 'json' };
+    const mk = (pluginDirs: unknown) => pol({ id: 'pd', runner: 'claude-cli', config: { ...base, pluginDirs } });
+    expect(() => validatePolicies([mk(['tools/ts-lsp'])], engines, runners)).not.toThrow();
+    for (const bad of ['tools/ts-lsp', [3], ['']]) {
+      expect(() => validatePolicies([mk(bad)], engines, runners)).toThrow(/policy 'pd'.*pluginDirs/);
+    }
+  });
 });

@@ -1,0 +1,21 @@
+{
+  "name": "ts-lsp",
+  "version": "0.1.0",
+  "description": "TypeScript language server for this repository, using the project's own TypeScript 7 compiler (tsc --lsp --stdio).",
+  "lspServers": {
+    "typescript": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/../../node_modules/.bin/tsc",
+      "args": ["--lsp", "--stdio"],
+      "extensionToLanguage": {
+        ".ts": "typescript",
+        ".tsx": "typescriptreact",
+        ".mts": "typescript",
+        ".cts": "typescript",
+        ".js": "javascript",
+        ".jsx": "javascriptreact",
+        ".mjs": "javascript",
+        ".cjs": "javascript"
+      }
+    }
+  }
+}

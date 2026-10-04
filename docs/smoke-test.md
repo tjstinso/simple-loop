@@ -205,6 +205,16 @@ How to check: run an execute job that takes more than 5 minutes (give the agent 
 
 Where to fix: `leaseMs` and `heartbeatMs` in `src/cli/runtime.ts`.
 
+### 8. Plugin directories in bare mode (`pluginDirs`, `tools/ts-lsp/`)
+
+Assumption: `claude --bare` skips LSP, and `claude --help` lists `--plugin-dir` among the options that supply context in bare mode, but does not say whether a plugin's language server is started. No test runs the real CLI, so it is unverified that `--bare` together with `--plugin-dir` makes the language server's tools available to the agent.
+
+How to check: in the sandbox (or this repository, after `npm install`), use a copy of `software-execute` with `pluginDirs: [tools/ts-lsp]` (bare stays `true`) and an issue that asks the agent to find the references of a known function using the language server and report them. In the run's stream (or the worker log) look for LSP tool use (an LSP tool call, or the language server initializing) and confirm the answer lists the real call sites. Repeat with `bare: false` to compare. The runner's argv itself is covered by unit tests; only the CLI's behavior needs this check.
+
+If it does not work in bare mode: run that policy with `bare: false`, and note the trade-off: non-bare mode uses your environment minus a deny-list and your real `HOME` and the `claude` login instead of the allow-listed environment and empty `HOME` (see "Credentials" in the README).
+
+Where to fix: `pluginDirs` handling in `buildArgs` and `resolvePluginDirs` in `src/runner/claude-cli.ts`; the plugin in `tools/ts-lsp/`.
+
 ## Cleanup
 
 1. Stop the worker (Ctrl-C in terminal 2) and confirm no `claude` process remains (`pgrep -fa claude`).

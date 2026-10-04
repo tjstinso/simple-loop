@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ClaudeCliRunner, childEnv, isInsideDir, removeScratchDir, worktreeClaudeMd } from '../../src/runner/claude-cli.js';
+import { ClaudeCliRunner, buildArgs, childEnv, isInsideDir, removeScratchDir, resolvePluginDirs, worktreeClaudeMd } from '../../src/runner/claude-cli.js';
 import { loadPolicies } from '../../src/policy/store.js';
 import { parseStreamLine } from '../../src/runner/stream.js';
 import type { RunHooks, RunInput } from '../../src/runner/types.js';
@@ -435,6 +435,75 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
     expect(argv.join(' ')).toMatch(/--setting-sources user/);
     // every option comes before the `--` that precedes the prompt
     expect(argv.indexOf('--bare')).toBeLessThan(argv.indexOf('--'));
+  });
+
+  it('pluginDirs adds one --plugin-dir per entry in both bare modes, before the prompt', async () => {
+    const ws = tmp('cli-ws-plug-');
+    mkdirSync(join(ws, 'tools'));
+    mkdirSync(join(ws, 'tools', 'a'));
+    const other = tmp('cli-plug-abs-');
+    for (const bare of [true, false]) {
+      const inp = input({ workspace: { path: ws }, config: config({ resultFormat: 'json', bare, pluginDirs: ['tools/a', other] }) });
+      const { argv } = (await runner('echo').run(inp, signal())) as { argv: string[] };
+      const flags = argv.filter((a) => a.startsWith('--plugin-dir'));
+      expect(flags).toEqual([`--plugin-dir=${join(ws, 'tools', 'a')}`, `--plugin-dir=${other}`]);
+      expect(argv.indexOf(flags[1]!)).toBeLessThan(argv.indexOf('--'));
+      expect(argv.includes('--bare')).toBe(bare);
+      expect(argv[argv.indexOf('--') + 1]).toContain('Do the thing.');
+    }
+  });
+
+  it('buildArgs adds nothing for an empty pluginDirs and keeps the prompt last after `--`', () => {
+    const cfg = new ClaudeCliRunner().configSchema.parse(config()) as Parameters<typeof buildArgs>[0];
+    expect(cfg.pluginDirs).toEqual([]);
+    expect(buildArgs(cfg, 'P').some((a) => a.startsWith('--plugin-dir'))).toBe(false);
+    const argv = buildArgs(cfg, '--plugin-dir=x', undefined, ['/p/one', '/p/two']);
+    expect(argv.slice(-2)).toEqual(['--', '--plugin-dir=x']);
+    expect(argv.filter((a) => a.startsWith('--plugin-dir=/p/'))).toEqual(['--plugin-dir=/p/one', '--plugin-dir=/p/two']);
+  });
+
+  it('the config schema rejects a malformed pluginDirs', () => {
+    const schema = new ClaudeCliRunner().configSchema;
+    for (const bad of ['tools/x', [1], [''], [null]]) {
+      expect(schema.safeParse(config({ pluginDirs: bad })).success).toBe(false);
+    }
+  });
+
+  it('resolvePluginDirs resolves relative entries inside the worktree and refuses everything else, naming the entry', () => {
+    const parent = tmp('cli-pd-');
+    const ws = join(parent, 'tree');
+    const evil = join(parent, 'tree-evil');
+    const outside = join(parent, 'outside');
+    for (const d of [ws, evil, outside, join(ws, 'plug')]) mkdirSync(d);
+    writeFileSync(join(ws, 'file.txt'), 'x');
+    symlinkSync(outside, join(ws, 'escape'));
+    symlinkSync(join(ws, 'plug'), join(ws, 'inner-link'));
+
+    expect(resolvePluginDirs(['plug', './inner-link'], ws)).toEqual([join(ws, 'plug'), join(ws, 'inner-link')]);
+    expect(resolvePluginDirs([], ws)).toEqual([]);
+    // absolute entries are operator configuration, allowed even outside the worktree
+    expect(resolvePluginDirs([outside], ws)).toEqual([outside]);
+
+    expect(() => resolvePluginDirs(['../outside'], ws)).toThrow(/'\.\.\/outside'.*outside the worktree/);
+    expect(() => resolvePluginDirs(['escape'], ws)).toThrow(/'escape'.*outside the worktree/);
+    expect(() => resolvePluginDirs(['../tree-evil'], ws)).toThrow(/'\.\.\/tree-evil'.*outside the worktree/);
+    expect(() => resolvePluginDirs(['.'], ws)).toThrow(/'\.'.*outside the worktree/);
+    expect(() => resolvePluginDirs(['missing'], ws)).toThrow(/'missing'.*does not exist/);
+    expect(() => resolvePluginDirs([join(parent, 'nope')], ws)).toThrow(/nope.*does not exist/);
+    expect(() => resolvePluginDirs(['file.txt'], ws)).toThrow(/'file.txt'.*not a directory/);
+    expect(() => resolvePluginDirs([join(ws, 'file.txt')], ws)).toThrow(/not a directory/);
+  });
+
+  it('run fails before spawning when a plugin directory is missing or escapes the worktree', async () => {
+    const ws = tmp('cli-ws-badplug-');
+    const spawnSpy = vi.fn();
+    const r = new ClaudeCliRunner({ bin: STUB, env: { ANTHROPIC_API_KEY: 'k' }, spawn: spawnSpy as unknown as typeof realSpawn });
+    for (const entry of ['nope', '../escape']) {
+      await expect(r.run(input({ workspace: { path: ws }, config: config({ pluginDirs: [entry] }) }), signal())).rejects.toThrow(
+        new RegExp(`'${entry.replace(/\./g, '\\.')}'`),
+      );
+    }
+    expect(spawnSpy).not.toHaveBeenCalled();
   });
 
   it('bare mode passes the worktree CLAUDE.md as --append-system-prompt-file, only a regular file inside the worktree', async () => {

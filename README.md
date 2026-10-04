@@ -283,6 +283,16 @@ Two default policies ship:
 | `settingSources` | Optional; passed as `--setting-sources` (comma-separated `user`, `project`, `local`). The review policy uses `user`, so the branch under review cannot bring its own `.claude/settings.json`. |
 | `bare` | Optional, default `true`. Bare mode: `claude --bare` (the worktree's root `CLAUDE.md` passed with `--append-system-prompt-file`), an allow-listed environment and an empty per-run `HOME`; requires `ANTHROPIC_API_KEY` in the worker's environment or a `passEnv` provider credential (see "Credentials"). `false` is the weaker opt-out: your environment minus a deny-list, with your `HOME`. |
 | `passEnv` | Optional list of extra variable names forwarded from the worker's environment in bare mode, for example a Bedrock or Vertex provider's credentials. Each must match `^[A-Z][A-Z0-9_]*$`; `GH_*`, `GITHUB_*`, `SSH_*`, `GIT_*`, `DBUS_*` and `XDG_RUNTIME_DIR` are refused. A listed variable that is set also counts as the provider credential for the start-up check. Ignored when `bare` is `false`. |
+| `pluginDirs` | Optional list of plugin directories (default `[]`), each passed as one `--plugin-dir=<absolute path>` in both bare and non-bare mode. A relative entry is resolved against the worktree and, after following symlinks, must be a directory inside it. An absolute entry is operator configuration and is taken as given. A missing, non-directory or refused entry fails the run, naming the entry. `tools/ts-lsp/` is a plugin that gives the agent a TypeScript language server (see its README). |
+
+Example: a policy that gives the agent the TypeScript language server from `tools/ts-lsp/` (needs `npm install` in the worktree; whether it works with `bare: true` is unconfirmed, see `docs/smoke-test.md`). The shipped policies leave `pluginDirs` empty.
+
+```yaml
+config:
+  # ...the other fields of software-execute.yaml...
+  pluginDirs:
+    - tools/ts-lsp
+```
 
 The review policy is read-only by tool restriction: no `Edit`, `Write` or general `Bash`, only the four read-only git subcommands. Its prompt tells the reviewer to pass `--no-ext-diff --no-textconv` to `git diff`, `git show` and `git log -p` and never to use `--output` (a prompt rule, not enforced: the `Bash(git diff:*)` rules cannot express it). The agent must end its final message with one fenced `json` block; the last such block is parsed.
 
