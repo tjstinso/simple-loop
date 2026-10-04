@@ -6,6 +6,7 @@ import { LABEL_DEAD_LETTER } from '../../src/engines/software/index.js';
 import type { SoftwareWorkspace } from '../../src/engines/software/workspace.js';
 import { DuplicateChainError } from '../../src/kernel/queue.js';
 import type { RunInput } from '../../src/runner/types.js';
+import { chainEvents } from '../../src/kernel/events.js';
 import { FAKE_API_KEY, LEASE_MS, makeHarness, ok, type Harness, type HarnessOptions } from '../support/harness.js';
 
 const N = 7;
@@ -101,7 +102,7 @@ describe('software engine scenarios', () => {
     expect(deliveryDirs(h, chain.id)).toEqual([]);
   });
 
-  it('automatic happy path merges the PR and completes the chain', async () => {
+  it('automatic happy path enables auto-merge, waits, then completes when the PR is merged', async () => {
     const h = harness();
     const { chain } = await h.submit(N, ['factory:profile:automatic']);
     writesPerAttempt(h);
@@ -110,41 +111,84 @@ describe('software engine scenarios', () => {
     const outcomes = await h.runUntilIdle();
 
     expect(outcomes.map((o) => o.outcome)).toEqual(['succeeded', 'succeeded']);
-    const c = h.chain(chain.id);
+    let c = h.chain(chain.id);
     expect(c.state.profile).toBe('automatic');
-    expect(c.status).toBe('completed');
-    expect(c.state.phase).toBe('merged');
-    expect(h.pr(BRANCH)).toMatchObject({ number: 8, state: 'merged' });
+    expect(c.status).toBe('waiting');
+    expect(c.state.phase).toBe('awaiting_merge');
+    // The required checks have not passed: auto-merge is enabled, nothing is merged.
+    expect(h.pr(BRANCH)).toMatchObject({ number: 8, state: 'open' });
+    expect(h.host.autoMergeEnabled(8)).toBe(true);
     // Pinned to the head the reviewer saw (the review delivery's seed).
     expect(h.host.calls.filter((x) => x.method === 'mergePr').map((x) => x.args)).toEqual([
       ['o/r', 8, { expectHeadSha: h.remoteHead(BRANCH) }],
     ]);
+    expect(chainEvents(h.db, chain.id).map((e) => e.kind)).toEqual(expect.arrayContaining(['merge.requested', 'merge.enabled']));
+    expect(h.comments(8).filter((x) => x.includes('event=merge-enabled'))).toHaveLength(1);
     expect(h.issueLabels(N)).toEqual(['factory:profile:automatic']);
     expect(h.remoteFile(BRANCH, 'attempt-1.txt')).toBe('attempt 1');
+
+    expect(await h.maintain()).toEqual([]);
+    expect(h.chain(chain.id).status).toBe('waiting'); // still pending
+
+    h.host.passRequiredChecks(); // GitHub merges the pull request
+    expect(await h.maintain()).toEqual([]);
+    c = h.chain(chain.id);
+    expect(c.status).toBe('completed');
+    expect(c.state.phase).toBe('merged');
+    expect(h.pr(BRANCH)).toMatchObject({ number: 8, state: 'merged' });
     expect(deliveryDirs(h, chain.id)).toEqual([]);
   });
 
-  it('automatic: a push to the PR branch after the review started blocks the merge', async () => {
+  it('automatic: a pull request closed without merging cancels the chain', async () => {
     const h = harness();
     const { chain } = await h.submit(N, ['factory:profile:automatic']);
     writesPerAttempt(h);
-    h.scriptReview(() => {
-      h.remote.commit(BRANCH, 'sneaky.txt', 'unreviewed\n'); // lands while the reviewer looks at the old head
-      return { verdict: 'approve', feedback: 'ship it' };
-    });
+    h.scriptReview([{ verdict: 'approve', feedback: 'ship it' }]);
+    await h.runUntilIdle();
+    h.host.prs.get(8)!.state = 'closed';
+    expect(await h.maintain()).toEqual([]);
+    expect(h.chain(chain.id).status).toBe('cancelled');
+  });
+
+  it.each([
+    ['the repository setting is off', (h: ReturnType<typeof harness>) => void (h.host.autoMergeAllowed = false)],
+    [
+      'the head moved after the review',
+      (h: ReturnType<typeof harness>) => {
+        h.beforeEffect = (effect) => {
+          if (effect.kind === 'merge_pr') h.remote.commit(BRANCH, 'sneaky.txt', 'unreviewed\n');
+        };
+      },
+    ],
+  ])('automatic: when GitHub refuses auto-merge (%s) a person takes over', async (_why, refuse) => {
+    const h = harness();
+    const { chain } = await h.submit(N, ['factory:profile:automatic']);
+    writesPerAttempt(h);
+    h.scriptReview([{ verdict: 'approve', feedback: 'ship it' }]);
+    refuse(h);
+
     const outcomes = await h.runUntilIdle();
+
     expect(outcomes.map((o) => [o.type, o.outcome])).toEqual([
       ['execute', 'succeeded'],
-      ['review', 'dead_lettered'],
+      ['review', 'succeeded'],
     ]);
+    const c = h.chain(chain.id);
+    expect(c.status).toBe('waiting');
+    expect(c.state.phase).toBe('needs_human');
+    expect(h.deadLetters()).toEqual([]);
+    expect(h.issueLabels(N)).toContain('factory:needs-human');
+    expect(h.issueLabels(N)).not.toContain(IN_PROGRESS);
     expect(h.pr(BRANCH)).toMatchObject({ state: 'open' });
-    expect(h.deadLetters()).toEqual([
-      expect.objectContaining({
-        reason: 'runner_error',
-        error: "effect 'merge_pr' failed: merge refused for the reviewed head: head commit changed",
-      }),
-    ]);
-    expect(h.chain(chain.id).status).toBe('dead_lettered');
+    expect(h.host.autoMergeEnabled(8)).toBe(false);
+    expect(h.comments(8)).toHaveLength(1);
+    expect(h.comments(8)[0]).toContain('a person has to merge');
+    expect(chainEvents(h.db, chain.id).map((e) => e.kind)).not.toContain('merge.enabled');
+
+    // A person merges: the reconcile hook completes the chain.
+    h.host.markMerged(8);
+    expect(await h.maintain()).toEqual([]);
+    expect(h.chain(chain.id).status).toBe('completed');
   });
 
   it('after a refused pinned merge, dlq retry re-reviews the current head before merging', async () => {
@@ -157,6 +201,8 @@ describe('software engine scenarios', () => {
       if (effect.kind === 'merge_pr' && pushed === null) {
         h.remote.commit(BRANCH, 'sneaky.txt', 'unreviewed\n'); // lands after the review, before the merge
         pushed = h.remoteHead(BRANCH);
+        // A refusal other than the typed auto-merge ones (e.g. a conflict): the review is redone.
+        h.host.failNext('mergePr', new GitHostError('Pull Request is not mergeable', 405));
       }
     };
 
@@ -173,7 +219,7 @@ describe('software engine scenarios', () => {
       expect.objectContaining({
         jobId: review.id,
         reason: 'runner_error',
-        error: "effect 'merge_pr' failed: merge refused for the reviewed head: head commit changed",
+        error: "effect 'merge_pr' failed: merge refused for the reviewed head: Pull Request is not mergeable",
       }),
     ]);
     expect(h.pr(BRANCH)).toMatchObject({ state: 'open' });
@@ -190,8 +236,8 @@ describe('software engine scenarios', () => {
       ['o/r', 8, { expectHeadSha: reviewedHead }],
       ['o/r', 8, { expectHeadSha: pushed }],
     ]);
-    expect(h.pr(BRANCH)).toMatchObject({ state: 'merged' });
-    expect(h.chain(chain.id)).toMatchObject({ status: 'completed', state: { phase: 'merged' } });
+    expect(h.host.autoMergeEnabled(8)).toBe(true);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
   });
 
   it('a review resumed without its workspace never merges unpinned: it dead-letters runner_error', async () => {
@@ -238,7 +284,8 @@ describe('software engine scenarios', () => {
     expect(h.host.calls.filter((x) => x.method === 'mergePr').map((x) => x.args)).toEqual([
       ['o/r', 8, { expectHeadSha: h.remoteHead(BRANCH) }],
     ]);
-    expect(h.pr(BRANCH)).toMatchObject({ state: 'merged' });
+    expect(h.host.autoMergeEnabled(8)).toBe(true);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
   });
 
   it('revise loop: two request_changes then approve', async () => {

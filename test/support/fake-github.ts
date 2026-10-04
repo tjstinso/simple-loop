@@ -1,5 +1,4 @@
-import { combineChecks } from '../../src/engines/software/ci.js';
-import { GitHostError, type Check, type ChecksStatus, type GitHost, type Issue, type Pr } from '../../src/engines/software/github.js';
+import { AutoMergeRefusedError, GitHostError, type GitHost, type Issue, type Pr } from '../../src/engines/software/github.js';
 
 interface StoredIssue {
   number: number;
@@ -20,10 +19,13 @@ export class FakeGitHost implements GitHost {
   readonly calls: { method: string; args: unknown[] }[] = [];
   private labels = new Map<number, Set<string>>();
   private comments = new Map<number, string[]>();
-  private checks = new Map<string, Check[]>();
-  private jobLogs = new Map<number, string>();
   private nextNumber = 1;
   private failures = new Map<string, Error>();
+  private autoMerge = new Set<number>();
+  /** Like the repository setting "Allow auto-merge": off makes `mergePr` throw AutoMergeRefusedError. */
+  autoMergeAllowed = true;
+  /** The branch protection's required checks: auto-merge merges only once they pass. */
+  requiredChecksPass = false;
   /**
    * When set, a PR's head sha is resolved from its branch on every read (the harness points this at
    * the real temp remote), so pushes after opening are visible, as on GitHub.
@@ -47,17 +49,29 @@ export class FakeGitHost implements GitHost {
     return [...(this.comments.get(n) ?? [])];
   }
 
+  /** Whether auto-merge is enabled on the pull request and it is still waiting for the checks. */
+  autoMergeEnabled(n: number): boolean {
+    return this.autoMerge.has(n);
+  }
+
+  /** The required checks pass: every open pull request with auto-merge enabled merges, like GitHub. */
+  passRequiredChecks(): void {
+    this.requiredChecksPass = true;
+    for (const n of [...this.autoMerge]) {
+      const pr = this.prs.get(n);
+      if (pr?.state === 'open') pr.state = 'merged';
+      this.autoMerge.delete(n);
+    }
+  }
+
+  /** Marks a pull request merged (a person merged it, or GitHub did). */
+  markMerged(n: number): void {
+    this.prOrThrow(n).state = 'merged';
+    this.autoMerge.delete(n);
+  }
+
   setPrHead(n: number, sha: string): void {
     this.prOrThrow(n).headSha = sha;
-  }
-
-  /** Sets the checks of one commit (what `getChecks(repo, sha)` returns for exactly that sha). */
-  setChecks(sha: string, checks: Check[]): void {
-    this.checks.set(sha, checks);
-  }
-
-  setJobLog(jobId: number, log: string): void {
-    this.jobLogs.set(jobId, log);
   }
 
   failNext(method: keyof GitHost, error: Error): void {
@@ -169,21 +183,13 @@ export class FakeGitHost implements GitHost {
     const pr = this.prOrThrow(n);
     if (pr.state === 'merged') return;
     if (pr.state === 'closed') throw new GitHostError('not mergeable', 405);
+    if (!this.autoMergeAllowed) throw new AutoMergeRefusedError('Auto merge is not allowed for this repository');
     // Like `gh pr merge --match-head-commit`: refuse when the head moved.
     if (opts?.expectHeadSha !== undefined && opts.expectHeadSha !== this.headOf(pr)) {
-      throw new GitHostError('head commit changed', 409);
+      throw new AutoMergeRefusedError('head commit changed', 409);
     }
-    pr.state = 'merged';
-  }
-
-  async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
-    this.enter('getChecks', [repo, sha]);
-    const checks = (this.checks.get(sha) ?? []).map((c) => ({ ...c }));
-    return { state: combineChecks(checks), checks };
-  }
-
-  async getJobLog(repo: string, jobId: number): Promise<string | null> {
-    this.enter('getJobLog', [repo, jobId]);
-    return this.jobLogs.get(jobId) ?? null;
+    // Like `gh pr merge --auto`: merges now when the required checks already pass, else when they do.
+    if (this.requiredChecksPass) pr.state = 'merged';
+    else this.autoMerge.add(n);
   }
 }

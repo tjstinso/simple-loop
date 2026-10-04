@@ -566,7 +566,7 @@ describe('runSoftwareEffect', () => {
     host.setPrHead(pr.number, 'seed'); // the head the review workspace was seeded from
     host.failNext('getIssue', new GitHostError('bad gateway', 502));
     await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: job({ type: 'review' }) }), fence());
-    expect(host.prs.get(pr.number)?.state).toBe('merged');
+    expect(host.autoMergeEnabled(pr.number)).toBe(true);
     expect(delays).toEqual([100]);
   });
 
@@ -672,16 +672,44 @@ describe('runSoftwareEffect', () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     host.setPrHead(pr.number, 'pushed-after-review');
     const review = job({ type: 'review' });
-    const err = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence()).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(EffectError);
-    expect((err as EffectError).reason).toBe('runner_error');
-    expect((err as Error).message).toBe('merge refused for the reviewed head: head commit changed');
+    // GitHub refuses (the head moved): a typed refusal hands over to a person instead of failing the job.
+    const outcome = await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence());
+    expect(outcome).toEqual({ engineState: { phase: 'needs_human' } });
     expect(host.calls.filter((c) => c.method === 'mergePr').map((c) => c.args)).toEqual([[REPO, pr.number, { expectHeadSha: 'seed' }]]);
-    expect(host.prs.get(pr.number)?.state).toBe('open');
+    expect(host.autoMergeEnabled(pr.number)).toBe(false);
 
     host.setPrHead(pr.number, 'seed');
-    await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence());
-    expect(host.prs.get(pr.number)?.state).toBe('merged');
+    expect(await runSoftwareEffect({ kind: 'merge_pr' }, ctx({ job: review }), fence())).toBeUndefined();
+    expect(host.autoMergeEnabled(pr.number)).toBe(true);
+  });
+
+  it('merge_pr records merge.enabled and posts one marker-guarded comment', async () => {
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.setPrHead(pr.number, 'seed');
+    const events: string[] = [];
+    const c = ctx({ job: job({ type: 'review' }), events: (kind: string) => void events.push(kind) });
+    await runSoftwareEffect({ kind: 'merge_pr' }, c, fence());
+    await runSoftwareEffect({ kind: 'merge_pr' }, c, fence());
+    expect(events).toEqual(['merge.requested', 'merge.enabled', 'merge.requested', 'merge.enabled']);
+    expect(host.getComments(pr.number)).toHaveLength(1);
+    expect(host.getComments(pr.number)[0]).toContain('event=merge-enabled');
+  });
+
+  it('a refused auto-merge labels the issue needs-human and posts one comment, retried or not', async () => {
+    const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
+    host.setPrHead(pr.number, 'seed');
+    host.autoMergeAllowed = false;
+    const c = ctx({ job: job({ type: 'review' }) });
+    for (let i = 0; i < 2; i++) {
+      expect(await runSoftwareEffect({ kind: 'merge_pr' }, c, fence())).toEqual({ engineState: { phase: 'needs_human' } });
+    }
+    expect(host.getLabels(ISSUE)).toContain('factory:needs-human');
+    const comments = host.getComments(pr.number);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain('a person has to merge');
+    expect(comments[0]).toContain('event=merge-needs-human');
+    expect(host.prs.get(pr.number)?.state).toBe('open');
+    expect(delays).toEqual([]); // a refusal is not retried
   });
 
   it('merge_pr without a workspace throws runner_error and never calls mergePr', async () => {
@@ -702,8 +730,7 @@ describe('runSoftwareEffect', () => {
   it('merge_pr checks PR state first and is a no-op when already merged', async () => {
     const pr = await host.openPr(REPO, { head: BRANCH, base: 'main', title: 't', body: 'b' });
     host.setPrHead(pr.number, 'seed');
-    await runSoftwareEffect({ kind: 'merge_pr' }, ctx(), fence());
-    expect(host.prs.get(pr.number)?.state).toBe('merged');
+    host.markMerged(pr.number);
     host.calls.length = 0;
     await runSoftwareEffect({ kind: 'merge_pr' }, ctx(), fence());
     expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead']);

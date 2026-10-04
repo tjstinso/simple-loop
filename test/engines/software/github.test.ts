@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GH_TIMEOUT_MS, GhCliHost, GitHostError, defaultExec, type ExecFn } from '../../../src/engines/software/github.js';
+import { AutoMergeRefusedError, GH_TIMEOUT_MS, GhCliHost, GitHostError, defaultExec, type ExecFn } from '../../../src/engines/software/github.js';
 import { FakeGitHost } from '../../support/fake-github.js';
 
 const R = 'o/r';
@@ -58,13 +58,32 @@ describe('FakeGitHost', () => {
     });
     expect((await gh.getPr(R, pr.number)).state).toBe('open');
     await gh.mergePr(R, pr.number, { expectHeadSha: 'new-head' });
+    expect(gh.autoMergeEnabled(pr.number)).toBe(true);
+  });
+
+  it('mergePr enables auto-merge: the PR merges only once the required checks pass', async () => {
+    const gh = new FakeGitHost();
+    const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
+    await gh.mergePr(R, pr.number);
+    expect((await gh.getPr(R, pr.number)).state).toBe('open');
+    gh.passRequiredChecks();
     expect((await gh.getPr(R, pr.number)).state).toBe('merged');
+    const later = await gh.openPr(R, { head: 'h2', base: 'main', title: 't', body: '' });
+    await gh.mergePr(R, later.number); // checks already pass: merges at once
+    expect((await gh.getPr(R, later.number)).state).toBe('merged');
+  });
+
+  it('mergePr throws AutoMergeRefusedError when auto-merge is not allowed', async () => {
+    const gh = new FakeGitHost();
+    gh.autoMergeAllowed = false;
+    const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
+    await expect(gh.mergePr(R, pr.number)).rejects.toBeInstanceOf(AutoMergeRefusedError);
   });
 
   it('mergePr is a no-op on an already merged PR', async () => {
     const gh = new FakeGitHost();
     const pr = await gh.openPr(R, { head: 'h', base: 'main', title: 't', body: '' });
-    await gh.mergePr(R, pr.number);
+    gh.markMerged(pr.number);
     await gh.mergePr(R, pr.number);
     expect((await gh.getPr(R, pr.number)).state).toBe('merged');
   });
@@ -152,20 +171,37 @@ describe('GhCliHost', () => {
   it('mergePr passes the configured merge method', async () => {
     const a = stub([{}]);
     await new GhCliHost({ exec: a.exec }).mergePr(R, 9);
-    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--delete-branch']]]);
+    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--auto', '--delete-branch']]]);
     const b = stub([{}]);
     await new GhCliHost({ exec: b.exec, mergeMethod: 'rebase' }).mergePr(R, 9);
-    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--rebase', '--delete-branch']]]);
+    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--rebase', '--auto', '--delete-branch']]]);
   });
 
   it('mergePr pins the reviewed head with --match-head-commit and deletes the branch unless disabled', async () => {
     const sha = 'a'.repeat(40);
     const a = stub([{}]);
     await new GhCliHost({ exec: a.exec }).mergePr(R, 9, { expectHeadSha: sha });
-    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--delete-branch', '--match-head-commit', sha]]]);
+    expect(a.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--auto', '--delete-branch', '--match-head-commit', sha]]]);
     const b = stub([{}]);
     await new GhCliHost({ exec: b.exec, deleteBranch: false }).mergePr(R, 9);
-    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash']]]);
+    expect(b.calls).toEqual([['gh', ['pr', 'merge', '9', '--repo', R, '--squash', '--auto']]]);
+  });
+
+  it.each([
+    'GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)',
+    'GraphQL: Pull request Protected branch rules not configured for this branch (enablePullRequestAutoMerge)',
+    'X Pull request #9 is not in the correct state to enable auto-merge',
+    'GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)',
+  ])('mergePr maps the refusal "%s" to AutoMergeRefusedError', async (stderr) => {
+    const a = stub([{ stderr, exitCode: 1 }]);
+    await expect(new GhCliHost({ exec: a.exec }).mergePr(R, 9)).rejects.toBeInstanceOf(AutoMergeRefusedError);
+  });
+
+  it('mergePr leaves other failures a plain GitHostError', async () => {
+    const a = stub([{ stderr: 'HTTP 502 Bad Gateway', exitCode: 1 }]);
+    const err = await new GhCliHost({ exec: a.exec }).mergePr(R, 9).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitHostError);
+    expect(err).not.toBeInstanceOf(AutoMergeRefusedError);
   });
 
   it('findComment pages until it finds the marker', async () => {
@@ -283,94 +319,5 @@ describe('gh subprocess timeouts', () => {
     const ok = await defaultExec(process.execPath, ['-e', 'process.stdout.write("hi")'], { timeoutMs: 5_000 });
     expect(ok).toMatchObject({ stdout: 'hi', exitCode: 0 });
     expect(ok.timedOut).toBeFalsy();
-  });
-});
-
-describe('getChecks', () => {
-  const run = (name: string, status: string, conclusion: string | null) => ({
-    name, status, conclusion, details_url: `https://ci.example/${name}`,
-  });
-  const many = (n: number, prefix: string) => Array.from({ length: n }, (_, i) => run(`${prefix}${i}`, 'completed', 'success'));
-  /** Answers by endpoint and page. */
-  function host(runs: Record<number, unknown[]>, statuses: Record<number, unknown[]>) {
-    const calls: string[][] = [];
-    const exec: ExecFn = async (_file, args) => {
-      calls.push(args);
-      const page = Number(args.find((a) => a.startsWith('page='))!.slice(5));
-      const isRuns = args[3]!.endsWith('/check-runs');
-      return { stdout: JSON.stringify(isRuns ? { check_runs: runs[page] ?? [] } : { statuses: statuses[page] ?? [] }), stderr: '', exitCode: 0 };
-    };
-    return { gh: new GhCliHost({ exec }), calls };
-  }
-
-  it('reads check runs and legacy statuses of exactly the sha, paging both with page=', async () => {
-    const { gh, calls } = host(
-      { 1: many(100, 'a'), 2: many(2, 'b') },
-      { 1: [{ context: 'ci/legacy', state: 'success', target_url: 'https://legacy.example' }] },
-    );
-    const r = await gh.getChecks(R, 'abc123');
-    expect(r.checks).toHaveLength(103);
-    expect(r.checks.at(-1)).toEqual({ name: 'ci/legacy', status: 'completed', conclusion: 'success', detailsUrl: 'https://legacy.example' });
-    expect(r.state).toBe('passing');
-    expect(calls.map((c) => [c[3], c.filter((a) => a.startsWith('page='))[0]])).toEqual([
-      ['repos/o/r/commits/abc123/check-runs', 'page=1'],
-      ['repos/o/r/commits/abc123/check-runs', 'page=2'],
-      ['repos/o/r/commits/abc123/status', 'page=1'],
-    ]);
-  });
-
-  it('pages the legacy statuses too', async () => {
-    const full = Array.from({ length: 100 }, (_, i) => ({ context: `s${i}`, state: 'success' }));
-    const { gh, calls } = host({}, { 1: full, 2: [{ context: 'last', state: 'pending' }] });
-    const r = await gh.getChecks(R, 'abc');
-    expect(r.checks).toHaveLength(101);
-    expect(r.state).toBe('pending');
-    expect(calls.filter((c) => c[3]!.endsWith('/status'))).toHaveLength(2);
-  });
-
-  it.each([
-    ['passing', [run('a', 'completed', 'success'), run('b', 'completed', 'neutral'), run('c', 'completed', 'skipped')]],
-    ['pending', [run('a', 'completed', 'success'), run('b', 'in_progress', null)]],
-    ['pending', [run('a', 'queued', null)]],
-    ['failing', [run('a', 'completed', 'failure')]],
-    ['failing', [run('a', 'completed', 'timed_out')]],
-    ['failing', [run('a', 'completed', 'cancelled')]],
-    ['failing', [run('a', 'completed', 'action_required')]],
-    ['failing', [run('a', 'completed', 'success'), run('b', 'queued', null), run('c', 'completed', 'failure')]],
-    ['none', []],
-  ])('state %s', async (state, runs) => {
-    const { gh } = host({ 1: runs }, {});
-    expect((await gh.getChecks(R, 'abc')).state).toBe(state);
-  });
-
-  it('maps legacy failure and error to failed checks and pending to unfinished ones', async () => {
-    const { gh } = host({}, { 1: [{ context: 'a', state: 'error' }, { context: 'b', state: 'pending' }] });
-    const r = await gh.getChecks(R, 'abc');
-    expect(r.checks.map((c) => [c.status, c.conclusion])).toEqual([['completed', 'failure'], ['in_progress', null]]);
-  });
-
-  it('maps a failing gh call like the other calls (HTTP status kept)', async () => {
-    const gh = new GhCliHost({ exec: async () => ({ stdout: '', stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 }) });
-    await expect(gh.getChecks(R, 'abc')).rejects.toMatchObject({ status: 404 });
-  });
-
-  it('passes the gh timeout', async () => {
-    const seen: Array<number | undefined> = [];
-    const gh = new GhCliHost({ exec: async (_f, _a, o) => (seen.push(o?.timeoutMs), { stdout: '{}', stderr: '', exitCode: 0 }), ghTimeoutMs: 1234 });
-    await gh.getChecks(R, 'abc');
-    expect(seen).toEqual([1234, 1234]);
-  });
-
-  it('getJobLog returns the log, or null when it is gone (4xx)', async () => {
-    expect(await new GhCliHost({ exec: async () => ({ stdout: 'line\n', stderr: '', exitCode: 0 }) }).getJobLog(R, 5)).toBe('line\n');
-    const gone = new GhCliHost({ exec: async () => ({ stdout: '', stderr: 'gone (HTTP 410)', exitCode: 1 }) });
-    expect(await gone.getJobLog(R, 5)).toBeNull();
-  });
-
-  it('FakeGitHost returns the checks set for exactly that sha', async () => {
-    const fake = new FakeGitHost();
-    fake.setChecks('old', [{ name: 'a', status: 'completed', conclusion: 'success' }]);
-    expect((await fake.getChecks(R, 'old')).state).toBe('passing');
-    expect(await fake.getChecks(R, 'new')).toEqual({ state: 'none', checks: [] });
   });
 });

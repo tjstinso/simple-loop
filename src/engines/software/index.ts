@@ -1,7 +1,5 @@
 import type Database from 'better-sqlite3';
 import { recordEvent } from '../../kernel/events.js';
-import { createCiGate } from './ci-gate.js';
-import { parseCiPolicy } from './ci.js';
 import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
 import { EffectError, type ChainView, type DeadLetter, type Engine, type Job, type WorkspaceProvider } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
@@ -21,7 +19,7 @@ import {
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 import { softwareSubmit } from './submit.js';
 import { redactSecrets } from './secret-scan.js';
-import { softwareTransition, type ReviewContext } from './transition.js';
+import { softwareTransition } from './transition.js';
 import type { GitWorkspaceProvider, SoftwareWorkspace } from './workspace.js';
 
 export interface SoftwareEngineDeps {
@@ -97,8 +95,6 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     }, sleep);
   }
 
-  const ciGate = createCiGate({ host: deps.host, db: deps.db, now: deps.now, sleep: deps.sleep, redact });
-
   const workspace: WorkspaceProvider = {
     async prepare(chain: ChainView<any>, job: Job): Promise<Workspace> {
       const ws = await deps.workspaces.prepare(chain, job);
@@ -140,14 +136,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     transition(chain, job, result) {
       try {
-        let review: ReviewContext = {};
-        if (job.type === 'review') {
-          const ci = parseCiPolicy(deps.policies.byId(job.policyId).config);
-          // The head the reviewer saw is the commit its worktree was seeded from.
-          const reviewedSha = cache.get(key(chain.id, job.id, job.delivery))?.seedSha ?? null;
-          review = { ci, reviewedSha, now: deps.now() };
-        }
-        const t = softwareTransition(chain, job, result, review);
+        const t = softwareTransition(chain, job, result);
         // The one event the pure transition cannot carry as an effect: recorded once per job (a
         // retry that keeps the result computes the same verdict again).
         if (job.type === 'review') {
@@ -174,7 +163,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     },
 
     async runEffect(effect, ctx) {
-      await runSoftwareEffect(
+      return runSoftwareEffect(
         effect,
         {
           chain: ctx.chain,
@@ -284,7 +273,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     async reconcile(chain) {
       const s = chain.state;
-      if (s.phase !== 'awaiting_ci' && s.phase !== 'awaiting_merge' && s.phase !== 'needs_human') return { outcome: 'none' };
+      if (s.phase !== 'awaiting_merge' && s.phase !== 'needs_human') return { outcome: 'none' };
       let pr;
       try {
         pr = await deps.host.findPrByHead(s.repo, s.branch);
@@ -293,8 +282,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none' };
         throw e;
       }
-      if (!pr) return { outcome: 'none' };
-      if (pr.state === 'open') return ciGate.check(chain, pr);
+      if (!pr || pr.state === 'open') return { outcome: 'none' };
       if (pr.state === 'merged') return { outcome: 'completed', reason: `Pull request #${pr.number} was merged` };
       return {
         outcome: 'cancelled',
