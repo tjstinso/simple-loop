@@ -253,7 +253,7 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       }
       if (workers.length === 0) stdout('no workers');
       for (const w of workers) {
-        const alive = w.alive === null ? 'unknown' : w.alive ? 'alive' : 'dead';
+        const alive = w.alive ? 'alive' : 'dead';
         const job = w.currentJobId === null ? 'idle' : `job=${w.currentJobId} delivery=${w.currentDelivery}`;
         stdout(`${w.id} pid=${w.pid} host=${w.host} ${alive} ${job} heartbeat=${formatAge(w.heartbeatAgeMs)} ago`);
       }
