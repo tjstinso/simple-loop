@@ -254,7 +254,7 @@ async function deliver(
     // Optional engine verification of the workspace; it may rerun the runner with feedback.
     if (engine.verify) {
       const rerun = async (feedback: string): Promise<unknown> => {
-        const again = await runner.run({ ...input, feedback }, signal, hooks);
+        const again = await runner.run({ ...input, feedback: input.feedback ? `${input.feedback}\n\n${feedback}` : feedback }, signal, hooks);
         const rechecked = schema.safeParse(again);
         if (!rechecked.success) {
           const issues = rechecked.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ');

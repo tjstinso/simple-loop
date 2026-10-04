@@ -57,6 +57,32 @@ describe('verification before the push', () => {
     expect((job.result as { verifyDurationMs: number }).verifyDurationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it('keeps the round feedback when it appends the verify failure', async () => {
+    const noBad = ['node', '-e', 'if(require("fs").existsSync("bad.txt")){console.log("FAIL: bad file present");process.exit(3)}'];
+    const h = harness({ repos: { [REPO]: { verify: [noBad] } } });
+    const { chain } = await h.submit(N);
+    h.scriptExecute((input, call) => {
+      if (call === 1) h.write(input, 'bad.txt', 'x\n');
+      if (call === 2) require('node:fs').rmSync(`${input.workspace.path}/bad.txt`);
+      h.write(input, `rev-${call}.txt`, `${call}\n`);
+      return ok(`call ${call}`);
+    });
+    h.scriptReview(Array.from({ length: 4 }, () => ({ verdict: 'approve' as const, feedback: 'lgtm' })));
+    await h.runUntilIdle();
+    const head = h.remoteHead(BRANCH)!;
+    h.host.setChecks(head, [{ name: 'check (node 22)', status: 'completed', conclusion: 'failure', detailsUrl: 'https://github.com/o/r/actions/runs/900/job/1', runId: 900 }]);
+    h.host.setFailedLog(900, 'expected 1 to be 2');
+    await h.maintain();
+    await h.runUntilIdle();
+    const calls = h.callsOf('execute');
+    expect(calls).toHaveLength(3);
+    expect(calls[1]!.feedback).toContain('check (node 22)');
+    expect(calls[2]!.feedback).toContain('check (node 22)');
+    expect(calls[2]!.feedback).toContain('expected 1 to be 2');
+    expect(calls[2]!.feedback).toContain('FAIL: bad file present');
+    expect(h.chain(chain.id).state.phase).toBe('awaiting_merge');
+  });
+
   it('fails the attempt after maxVerifyRounds and pushes nothing', async () => {
     const h = harness({ repos: { [REPO]: { verify: [needsFixed], maxVerifyRounds: 3 } } });
     await h.submit(N);

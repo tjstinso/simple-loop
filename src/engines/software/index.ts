@@ -490,6 +490,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       let current = result as Record<string, unknown> & { status?: string; costUsd?: number };
       let cost: number | undefined = first.costUsd;
       let verifyMs = 0;
+      let rounds = 0;
       for (let round = 0; ; round++) {
         jobEvent(chain, job, 'verify.started', { commands: commands.map((c) => c[0]), round });
         const started = Date.now();
@@ -507,14 +508,17 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
           throw new EffectError(`verification failed after ${round} round(s) of fixes: ${show(f.argv)} (exit code ${f.exitCode ?? 'none'})`, 'runner_error');
         }
         const feedback = buildVerifyFeedback(f.argv, f.exitCode, f.spawnError ?? f.output, deps.secretValues?.() ?? []);
+        rounds++;
         const next = (await rerun(feedback)) as typeof current;
         if (typeof next.costUsd === 'number') cost = (cost ?? 0) + next.costUsd;
-        // The rerun answers the same attempt: what it leaves out of its result stays as the first run reported it.
-        current = { ...(({ feedbackResponses, followups }) => ({ feedbackResponses, followups }))(current as { feedbackResponses?: unknown; followups?: unknown }), ...next };
-        for (const k of ['feedbackResponses', 'followups']) if (current[k] === undefined) delete current[k];
+        // The rerun answers the same attempt: feedbackResponses and followups it leaves out stay as the previous run reported them.
+        const { feedbackResponses, followups } = current;
+        current = { ...next };
+        if (current.feedbackResponses === undefined && feedbackResponses !== undefined) current.feedbackResponses = feedbackResponses;
+        if (current.followups === undefined && followups !== undefined) current.followups = followups;
         if (next.status !== 'ok') break;
       }
-      return { ...current, ...(cost === undefined ? {} : { costUsd: cost }), verifyDurationMs: verifyMs };
+      return { ...current, ...(cost === undefined ? {} : { costUsd: cost }), verifyDurationMs: verifyMs, verifyRounds: rounds };
     },
 
     transition(chain, job, result) {
