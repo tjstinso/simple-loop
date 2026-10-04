@@ -96,7 +96,7 @@ export function chainTimeline(db: Db, chainId: number): ChainTimeline | null {
 export const HEARTBEAT_MS = 30_000;
 
 /** True when a process with this id exists; a permission error means it exists but is not ours. */
-export function pidExists(pid: number): boolean {
+function pidExists(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
