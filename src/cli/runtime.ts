@@ -103,7 +103,9 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         maxHumanRounds: config.maxHumanRounds,
         maxConflictRounds: config.maxConflictRounds,
         maxCiRounds: config.maxCiRounds,
+        ...(config.repos === undefined ? {} : { repos: config.repos }),
       },
+      ...(tokenEnv === undefined ? {} : { withheldEnv: [tokenEnv] }),
       now: clock,
       onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),
       // The secret guard's exact values, read at each push: the model API key, every variable whose

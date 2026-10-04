@@ -41,6 +41,9 @@ export const ExecutionResultSchema = z.object({
   status: z.enum(['ok', 'error']),
   summary: z.string(),
   costUsd: z.number().optional(),
+  /** Set by the engine when verification ran: verify rounds used and the time verification took. */
+  verifyRounds: z.number().optional(),
+  verifyDurationMs: z.number().optional(),
   steps: z.array(z.string()).optional(),
   followups: LenientFollowupsSchema.optional(),
   // A malformed list never fails the run: it counts as no responses.

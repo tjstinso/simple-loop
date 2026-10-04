@@ -6,6 +6,7 @@ import type Database from 'better-sqlite3';
 import { FOLLOWUPS_DDL } from '../../src/engines/software/followups.js';
 import { ExecGitPorts } from '../../src/engines/software/git-ports.js';
 import { createSoftwareEngine, type SoftwareEngine } from '../../src/engines/software/index.js';
+import type { RepoToolSettings } from '../../src/engines/software/tool-run.js';
 import type { Followup } from '../../src/engines/software/schemas.js';
 import type { SoftwareState } from '../../src/engines/software/state.js';
 import { GitWorkspaceProvider, type SoftwareWorkspace } from '../../src/engines/software/workspace.js';
@@ -40,6 +41,7 @@ export interface HarnessOptions {
   maxConflictRounds?: number;
   maxCiRounds?: number;
   allowedAuthorAssociations?: string[];
+  repos?: Record<string, RepoToolSettings>;
 }
 
 export interface DeliveryRecord {
@@ -201,6 +203,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
         ...(opts.maxConflictRounds === undefined ? {} : { maxConflictRounds: opts.maxConflictRounds }),
         ...(opts.maxCiRounds === undefined ? {} : { maxCiRounds: opts.maxCiRounds }),
         ...(opts.allowedAuthorAssociations === undefined ? {} : { allowedAuthorAssociations: opts.allowedAuthorAssociations }),
+        ...(opts.repos === undefined ? {} : { repos: opts.repos }),
       },
       now: clock,
       sleep: async () => {},

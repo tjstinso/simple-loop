@@ -133,3 +133,31 @@ describe('loadConfig', () => {
     expect(loadConfig(join(d, 'factory.config.json'), d)).toEqual(loadConfig(undefined, d));
   });
 });
+
+describe('loadConfig repos', () => {
+  const load = (repos: unknown) => {
+    const d = tmp();
+    writeFileSync(join(d, 'factory.config.json'), JSON.stringify({ repos }));
+    return () => loadConfig(undefined, d);
+  };
+
+  it('applies the defaults of an entry', () => {
+    const c = load({ 'o/r': { setup: [['npm', 'ci', '--ignore-scripts']], verify: [['npm', 'test']] } })();
+    expect(c.repos?.['o/r']).toEqual({
+      setup: [['npm', 'ci', '--ignore-scripts']],
+      verify: [['npm', 'test']],
+      setupTimeoutMs: 300_000,
+      verifyTimeoutMs: 600_000,
+      maxVerifyRounds: 3,
+    });
+  });
+
+  it('rejects unknown keys, bad commands, a bad name and maxVerifyRounds below 1', () => {
+    expect(load({ 'o/r': { setpu: [] } })).toThrow(/repos\.o\/r/);
+    expect(load({ 'o/r': { verify: ['npm test'] } })).toThrow(/repos/);
+    expect(load({ 'o/r': { verify: [[]] } })).toThrow(/repos/);
+    expect(load({ 'o/r': { verify: [['npm', '']] } })).toThrow(/repos/);
+    expect(load({ 'o/r': { maxVerifyRounds: 0 } })).toThrow(/maxVerifyRounds/);
+    expect(load({ 'noslash': {} })).toThrow(/repos\.noslash/);
+  });
+});
