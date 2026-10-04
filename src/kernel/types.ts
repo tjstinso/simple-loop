@@ -118,6 +118,11 @@ export interface RunEffectContext<S> {
   fence: EffectFence;
 }
 
+/** What an effect may hand back: a patch merged into the transition's engine state before it commits. */
+export interface EffectOutcome<S> {
+  engineState?: Partial<S>;
+}
+
 /**
  * Prepares the private workspace for one job delivery. Engines are constructed
  * with their own ports; teardown belongs to `Engine.cleanup`, never the kernel.
@@ -129,14 +134,7 @@ export interface WorkspaceProvider {
 export type ReconcileOutcome =
   | { outcome: 'none' }
   | { outcome: 'completed'; reason: string }
-  | { outcome: 'cancelled'; reason: string }
-  /**
-   * The chain stays in the factory's hands: its engine state is replaced, its status becomes `status`
-   * (`waiting` again, or `active` when `newJobs` put it back to work) and the jobs are queued, all in
-   * one transaction that only applies while the chain is still `waiting`. The engine does its own
-   * (idempotent) side effects before returning; `afterReconcile` is not called.
-   */
-  | { outcome: 'update'; state: unknown; status: 'active' | 'waiting'; newJobs: NewJob[]; reason: string };
+  | { outcome: 'cancelled'; reason: string };
 
 export interface Engine<S = unknown> {
   id: string;
@@ -153,9 +151,10 @@ export interface Engine<S = unknown> {
   transition(chain: ChainView<S>, job: Job, result: unknown): Transition<S>;
   /**
    * Idempotent, check-before-act. Runs before the transition commits. `ctx` carries the chain view,
-   * the job and the fence (`RunEffectContext`).
+   * the job and the fence (`RunEffectContext`). May return an `EffectOutcome` to patch the engine state
+   * the transition commits (for example when the effect found a person has to take over).
    */
-  runEffect(effect: Effect, ctx: RunEffectContext<S>): Promise<void>;
+  runEffect(effect: Effect, ctx: RunEffectContext<S>): Promise<void | EffectOutcome<S>>;
   describe(chain: ChainView<S>): string;
   surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
   /**

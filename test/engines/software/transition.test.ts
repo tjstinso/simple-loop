@@ -77,12 +77,12 @@ describe('softwareTransition', () => {
     });
   });
 
-  it('automatic approve merges and completes', () => {
+  it('automatic approve enables auto-merge and waits for the merge', () => {
     const s = baseState({ profile: 'automatic', phase: 'reviewing' });
     const t = softwareTransition(chainOf(s), jobOf('review'), { verdict: 'approve', feedback: 'ok' });
     expect(t).toEqual({
-      engineState: { ...s, phase: 'merged' },
-      chainStatus: 'completed',
+      engineState: { ...s, phase: 'awaiting_merge' },
+      chainStatus: 'waiting',
       effects: [
         { kind: 'merge_pr' },
         { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },

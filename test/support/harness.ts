@@ -36,8 +36,6 @@ export const ISSUE_BODY ='## Goal\nMake the widget work.\n\n## Acceptance criter
 export interface HarnessOptions {
   defaultProfile?: 'supervised' | 'automatic';
   keptWorktreeMaxAgeMs?: number;
-  /** The review policy's `ci` object (absent: no CI gate). */
-  ci?: Record<string, unknown>;
 }
 
 export interface DeliveryRecord {
@@ -173,7 +171,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
 
     const policies = new PolicyStore([
       { id: 'default-execute', kind: 'execute', match: { labels: [] }, runner: 'fake', config: {}, default: true },
-      { id: 'default-review', kind: 'review', match: { labels: [] }, runner: 'fake', config: opts.ci === undefined ? {} : { ci: opts.ci }, default: true },
+      { id: 'default-review', kind: 'review', match: { labels: [] }, runner: 'fake', config: {}, default: true },
     ]);
     const runner = new FakeRunner();
     const runners = new RunnerRegistry();

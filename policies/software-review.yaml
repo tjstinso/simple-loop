@@ -20,10 +20,6 @@ config:
   # supply hooks or permission rules through its own .claude/settings.json. In bare mode HOME is an
   # empty per-run directory, so no user settings exist either.
   settingSources: user
-  # CI gate (automatic profile): merge only when every check of the reviewed commit passed. See the
-  # README for waitMinutes, onFailure and onNone.
-  ci:
-    required: all
   prompt: |
     You are reviewing a pull request branch that is checked out read-only in the current
     directory. Inspect the change with

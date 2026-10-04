@@ -1,10 +1,10 @@
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { fileFollowups, storeFollowups } from './followups.js';
-import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type Job } from '../../kernel/types.js';
-import { GitHostError, type GitHost, type Issue } from './github.js';
+import { EffectError, StaleDeliveryError, type ChainView, type Effect, type EffectFence, type EffectOutcome, type Job } from '../../kernel/types.js';
+import { AutoMergeRefusedError, GitHostError, type GitHost, type Issue } from './github.js';
 import type { GitPorts } from './git-ports.js';
-import type { SoftwareEffect } from './schemas.js';
+import { LABEL_NEEDS_HUMAN, type SoftwareEffect } from './schemas.js';
 import { findingsOf, redactSecrets, scanPaths, scanText, SCAN_TRUNCATED_KIND } from './secret-scan.js';
 import type { SoftwareState } from './state.js';
 import type { SoftwareWorkspace } from './workspace.js';
@@ -88,9 +88,9 @@ export async function withHostRetry<T>(fn: () => Promise<T>, sleep: (ms: number)
  * runner_error so one retry redoes the review on the current head (R46); StaleDeliveryError,
  * EffectError and non-GitHostError exceptions propagate unchanged.
  */
-async function classified(ctx: EffectContext, body: () => Promise<void>): Promise<void> {
+async function classified<T>(ctx: EffectContext, body: () => Promise<T>): Promise<T> {
   try {
-    await withHostRetry(body, ctx.sleep ?? defaultSleep);
+    return await withHostRetry(body, ctx.sleep ?? defaultSleep);
   } catch (e) {
     if (e instanceof PinnedMergeRefusedError) throw new EffectError(`merge refused for the reviewed head: ${e.message}`, 'runner_error');
     if (e instanceof GitHostError) throw new EffectError(e.message, 'effect_error');
@@ -251,7 +251,10 @@ async function setLabels(ctx: EffectContext, fence: EffectFence, e: Extract<Supp
   ctx.events?.('labels.changed', { target: e.target, add: e.add, remove: e.remove });
 }
 
-async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
+/** Handed back by `merge_pr` when a person has to merge: the transition's `awaiting_merge` becomes this. */
+const NEEDS_HUMAN_OUTCOME: EffectOutcome<SoftwareState> = { engineState: { phase: 'needs_human' } };
+
+async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
   const { repo, branch } = ctx.chain.state;
   const pr = await ctx.host.findPrByHead(repo, branch);
   if (!pr) throw new EffectError('no PR found to merge', 'effect_error');
@@ -267,12 +270,51 @@ async function mergePr(ctx: EffectContext, fence: EffectFence): Promise<void> {
   ctx.events?.('merge.requested', { pr: pr.number });
   try {
     await ctx.host.mergePr(repo, pr.number, { expectHeadSha: ctx.workspace.seedSha });
+    ctx.events?.('merge.enabled', { pr: pr.number });
+    await commentOnce(
+      ctx,
+      fence,
+      pr.number,
+      'merge-enabled',
+      'Auto-merge is enabled for the reviewed commit. GitHub merges this pull request when the required checks pass; if they fail it stays open.',
+    );
   } catch (err) {
+    if (err instanceof AutoMergeRefusedError) return handOffMerge(ctx, fence, pr.number, err);
+    if (err instanceof StaleDeliveryError) throw err;
     // Still a GitHostError (same status), so a transient one is retried before `classified` turns it
     // into runner_error (real gh reports a refused pinned merge without an HTTP status).
     if (err instanceof GitHostError) throw new PinnedMergeRefusedError(err);
     throw err;
   }
+}
+
+/** One marker-guarded comment on the pull request per `event` and chain. */
+async function commentOnce(ctx: EffectContext, fence: EffectFence, n: number, event: string, text: string): Promise<void> {
+  const { repo } = ctx.chain.state;
+  const marker = `<!-- factory:chain=${ctx.chain.id} event=${event} -->`;
+  if (await ctx.host.findComment(repo, n, marker)) return;
+  fence.assertCurrent();
+  await ctx.host.comment(repo, n, `${text}\n\n${marker}`);
+}
+
+/**
+ * GitHub refused to enable auto-merge: the engine never merges without the check protection, so it
+ * hands over like the supervised profile. A person merges (or fixes the repository settings).
+ */
+async function handOffMerge(ctx: EffectContext, fence: EffectFence, n: number, err: AutoMergeRefusedError): Promise<EffectOutcome<SoftwareState>> {
+  const { repo, issueNumber } = ctx.chain.state;
+  const why = oneLine(redactSecrets(err.message, secretValuesOf(ctx)));
+  fence.assertCurrent();
+  await ctx.host.setLabels(repo, issueNumber, [LABEL_NEEDS_HUMAN], []);
+  await commentOnce(
+    ctx,
+    fence,
+    n,
+    'merge-needs-human',
+    `The factory could not enable auto-merge, so a person has to merge this pull request once its checks pass. GitHub said: ${why}`,
+  );
+  ctx.events?.('merge.needs_human', { pr: n });
+  return NEEDS_HUMAN_OUTCOME;
 }
 
 async function comment(ctx: EffectContext, fence: EffectFence, e: Extract<Supported, { kind: 'comment' }>): Promise<void> {
@@ -346,17 +388,21 @@ async function asRunnerError(body: () => Promise<void>): Promise<void> {
  * as `runner_error`, see WORKSPACE_EFFECTS; so does a `merge_pr` with no reviewed head to pin or
  * whose pinned merge is refused, R46). StaleDeliveryError always propagates.
  */
-export async function runSoftwareEffect(effect: Effect, ctx: EffectContext, fence: EffectFence): Promise<void> {
+export async function runSoftwareEffect(
+  effect: Effect,
+  ctx: EffectContext,
+  fence: EffectFence,
+): Promise<EffectOutcome<SoftwareState> | void> {
   if (effect?.kind === 'file_followups') return fileFollowupsEffect(effect, ctx, fence);
   const e = parse(effect);
   fence.assertCurrent();
   const run = () => runClassified(e, ctx, fence);
-  if (ctx.job.type === 'execute' && WORKSPACE_EFFECTS.has(e.kind)) return asRunnerError(run);
+  if (ctx.job.type === 'execute' && WORKSPACE_EFFECTS.has(e.kind)) return asRunnerError(async () => void (await run()));
   return run();
 }
 
-async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFence): Promise<void> {
-  await classified(ctx, () => {
+async function runClassified(e: Supported, ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
+  return classified(ctx, () => {
     switch (e.kind) {
       case 'commit_push':
         return commitPush(ctx, fence);

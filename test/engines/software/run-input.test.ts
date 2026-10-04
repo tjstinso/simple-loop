@@ -1,4 +1,3 @@
-import { parseCiPolicy } from '../../../src/engines/software/ci.js';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -92,14 +91,6 @@ describe('default policies', () => {
     }
     expect((byId.get('software-execute')!.config as { resultFormat: string }).resultFormat).toBe('execution');
     expect((byId.get('software-review')!.config as { resultFormat: string }).resultFormat).toBe('json');
-  });
-
-  it('the shipped review policy has a CI gate requiring all checks, the execute policy none', () => {
-    const byId = new Map(loadPolicies(policiesDir).map((p) => [p.id, p]));
-    expect(parseCiPolicy(byId.get('software-review')!.config)).toEqual({
-      required: 'all', waitMinutes: 20, onFailure: 'revise', onNone: 'hold',
-    });
-    expect(parseCiPolicy(byId.get('software-execute')!.config)).toBeUndefined();
   });
 
   it('the review policy tool allowlist contains no unrestricted Bash and no write tools', () => {

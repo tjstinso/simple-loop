@@ -258,7 +258,8 @@ async function deliver(
   const done: Job = { ...job, result };
   for (const effect of t.effects) {
     try {
-      await engine.runEffect(effect, { chain: view, job: done, fence: effectFence });
+      const outcome = await engine.runEffect(effect, { chain: view, job: done, fence: effectFence });
+      if (outcome?.engineState) t = { ...t, engineState: { ...t.engineState, ...outcome.engineState } };
     } catch (e) {
       if (e instanceof StaleDeliveryError) return 'stale';
       const reason = e instanceof EffectError ? e.reason : 'effect_error';
