@@ -119,6 +119,34 @@ describe('buildOverview', () => {
     expect(buildOverview(t.db, NOW, { maxConcurrentJobs: 4 }).limits).toEqual({ maxConcurrentJobs: 4 });
   });
 
+  it('reports when each chain was last checked and flags a waiting chain unchecked for over three intervals', () => {
+    t = makeDb();
+    const fresh = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 1 });
+    const edge = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 2 });
+    const old = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 3 });
+    const never = addChain(t.db, { status: 'waiting', phase: 'needs_human', issue: 4 });
+    const newWaiting = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 5, at: NOW - 30_000 });
+    const active = addChain(t.db, { status: 'active', issue: 6 });
+    const set = t.db.prepare('UPDATE chains SET last_checked_at = ?, last_check_result = ? WHERE id = ?');
+    set.run(NOW - 20_000, 'none', fresh);
+    set.run(NOW - 180_000, 'unknown', edge);
+    set.run(NOW - 180_001, 'error: boom', old);
+    const byId = new Map(buildOverview(t.db, NOW).openChains.map((c) => [c.id, c]));
+    const f = (id: number) => {
+      const c = byId.get(id)!;
+      return [c.lastCheckedAt, c.lastCheckResult, c.checkStale];
+    };
+    expect(f(fresh)).toEqual([NOW - 20_000, 'none', false]);
+    expect(f(edge)).toEqual([NOW - 180_000, 'unknown', false]);
+    expect(f(old)).toEqual([NOW - 180_001, 'error: boom', true]);
+    expect(f(never)).toEqual([null, null, true]); // waiting for an hour and never looked at
+    expect(f(newWaiting)).toEqual([null, null, false]);
+    expect(f(active)).toEqual([null, null, false]);
+    // The threshold follows the maintenance interval.
+    expect(buildOverview(t.db, NOW, { maintenanceMs: 10_000 }).openChains.find((c) => c.id === fresh)!.checkStale).toBe(false);
+    expect(buildOverview(t.db, NOW, { maintenanceMs: 5_000 }).openChains.find((c) => c.id === fresh)!.checkStale).toBe(true);
+  });
+
   it('lists open chains, finished chains and workers with derived waitingOn', () => {
     t = makeDb();
     const ids = populate(t.db);

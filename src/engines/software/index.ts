@@ -92,6 +92,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
   /** Agent-written text on its way to GitHub (or a dead letter): named patterns and known values redacted. */
   const redact = (text: string) => redactSecrets(text, deps.secretValues?.() ?? []);
+  /** What the maintenance pass records for a transient host failure (the pass redacts nothing itself here). */
+  const transientCheck = (e: Error) => `error: ${redact(e.message.replace(/\s+/g, ' ').trim())}`;
 
   /**
    * Deliveries whose workspace must survive a sweep: running jobs and recently dead-lettered (kept)
@@ -164,7 +166,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       feedback = await deps.host.listPrFeedback(s.repo, prNumber);
     } catch (e) {
       // Transient host failure: the next maintenance pass retries.
-      if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none' };
+      if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none', check: transientCheck(e) };
       throw e;
     }
     const plan = planFeedbackRound(feedback, s, { allowedAuthorAssociations });
@@ -219,7 +221,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       // GitHub is still computing it: look again next pass, a few times.
       const n = (unknownPasses.get(chainId) ?? 0) + 1;
       unknownPasses.set(chainId, n);
-      if (n <= MAX_UNKNOWN_PASSES) return { outcome: 'none' };
+      if (n <= MAX_UNKNOWN_PASSES) return { outcome: 'none', check: 'unknown' };
       if (!unknownLogged.has(chainId)) {
         unknownLogged.add(chainId);
         event('conflict.gave_up', { reason: `mergeability still unknown after ${MAX_UNKNOWN_PASSES} checks` });
@@ -502,6 +504,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       ]);
     },
 
+    redact,
+
     async reconcile(chain) {
       const s = chain.state;
       if (s.phase !== 'awaiting_merge' && s.phase !== 'needs_human') return { outcome: 'none' };
@@ -510,7 +514,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         pr = await deps.host.findPrByHead(s.repo, s.branch);
       } catch (e) {
         // Transient host failure: the next maintenance pass retries.
-        if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none' };
+        if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none', check: transientCheck(e) };
         throw e;
       }
       if (!pr) return { outcome: 'none' };

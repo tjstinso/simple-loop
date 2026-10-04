@@ -7,6 +7,7 @@ import {
   chainJobViews,
   chainTimeline,
   formatAge,
+  formatLastCheck,
   formatCost,
   listWorkerViews,
   parseDuration,
@@ -61,6 +62,9 @@ interface StatusChain {
   status: string;
   /** The engine's one-line description (absent when the state does not validate). */
   description: string | null;
+  /** The maintenance pass's last look at a waiting chain (null before the first one). */
+  lastCheckedAt: number | null;
+  lastCheckResult: string | null;
   jobs: ReturnType<typeof chainJobViews>;
 }
 
@@ -77,6 +81,8 @@ function statusChains(kernel: Kernel, db: Runtime['db']): StatusChain[] {
       status: ChainView<unknown>['status'];
       subject_key: string;
       engine_state: string;
+      last_checked_at: number | null;
+      last_check_result: string | null;
     };
     let description: string | null = null;
     try {
@@ -93,15 +99,24 @@ function statusChains(kernel: Kernel, db: Runtime['db']): StatusChain[] {
     } catch {
       // An unknown engine or invalid state: the chain is still listed.
     }
-    chains.push({ id: chain.id, engine: chain.engine, status: chain.status, description, jobs: chainJobViews(db, id, now) });
+    chains.push({
+      id: chain.id,
+      engine: chain.engine,
+      status: chain.status,
+      description,
+      lastCheckedAt: chain.last_checked_at,
+      lastCheckResult: chain.last_check_result,
+      jobs: chainJobViews(db, id, now),
+    });
   }
   return chains;
 }
 
-function statusLines(chains: StatusChain[]): string[] {
+function statusLines(chains: StatusChain[], now: number): string[] {
   const lines: string[] = [];
   for (const c of chains) {
-    lines.push(`${c.id} ${c.engine} ${c.status}${c.description === null ? '' : ` ${c.description}`}`);
+    const checked = c.status === 'waiting' ? ` ${formatLastCheck(c.lastCheckedAt, c.lastCheckResult, now)}` : '';
+    lines.push(`${c.id} ${c.engine} ${c.status}${c.description === null ? '' : ` ${c.description}`}${checked}`);
     for (const j of c.jobs) {
       const parts = [`job ${j.id}`, j.type, `attempt=${j.attempt}`, j.status, `delivery=${j.delivery}`];
       if (j.workerId !== null) parts.push(`worker=${j.workerId}`);
@@ -193,7 +208,7 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       const max = kernel.deps.config.maxConcurrentJobs;
       const running = countRunning(rt.db);
       stdout(`slots: ${running}${max === undefined ? ' (no limit)' : ` of ${max}`}`);
-      const lines = statusLines(chains);
+      const lines = statusLines(chains, kernel.deps.clock());
       if (lines.length === 0) stdout('no open chains');
       for (const l of lines) stdout(l);
       return 0;
@@ -212,6 +227,9 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         return 0;
       }
       stdout(`chain ${t.chain.id} ${t.chain.engine} ${t.chain.status} ${t.chain.subjectKey}`);
+      if (t.chain.status === 'waiting') {
+        stdout(formatLastCheck(t.chain.lastCheckedAt, t.chain.lastCheckResult, kernel.deps.clock()));
+      }
       for (const e of t.events) stdout(eventLine(e, false));
       for (const j of t.cost.jobs) {
         stdout(`cost job ${j.jobId} ${j.type} attempt=${j.attempt} ${j.costUsd === null ? 'unknown' : formatCost(j.costUsd)}`);

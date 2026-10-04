@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { recordEvent } from './events.js';
+import { capEventText, recordEvent } from './events.js';
 import { StaleDeliveryError } from './types.js';
 import type { Chain, ChainStatus, Fence, Job, JobStatus, ResolvedNewJob } from './types.js';
 
@@ -383,6 +383,19 @@ export function updateWaitingChainState(db: Db, chainId: number, engineState: un
   const r = db
     .prepare(`UPDATE chains SET engine_state = ?, updated_at = ? WHERE id = ? AND status = 'waiting'`)
     .run(JSON.stringify(engineState), now, chainId);
+  return r.changes === 1;
+}
+
+/**
+ * Records what the maintenance pass found when it last looked at a chain: two columns, nothing else
+ * (`status` and `updated_at` stay). Only written while the chain has the status the pass left it in
+ * (`expected`), so a chain somebody else moved on meanwhile is not touched. `result` is capped at 200
+ * characters and must already be redacted.
+ */
+export function recordChainCheck(db: Db, chainId: number, at: number, expected: string, result: string): boolean {
+  const r = db
+    .prepare(`UPDATE chains SET last_checked_at = ?, last_check_result = ? WHERE id = ? AND status = ?`)
+    .run(at, capEventText(result), chainId, expected);
   return r.changes === 1;
 }
 

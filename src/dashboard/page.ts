@@ -20,6 +20,8 @@ details.chain > summary { cursor:pointer; padding:8px 12px; display:flex; flex-w
 .badge { display:inline-block; border:1px solid currentColor; border-radius:10px; padding:0 8px; font-size:12px; font-weight:600; }
 .s-person { color:var(--warn); } .s-dead, .s-stuck { color:var(--bad); } .s-run { color:var(--accent); } .s-queue { color:var(--muted); } .s-done { color:var(--good); }
 .stuck { border-left:4px solid var(--bad); }
+.stale { border-left:4px solid var(--warn); }
+.notchecked { font-weight:600; }
 .body { padding:4px 12px 10px; border-top:1px solid var(--line); }
 table { border-collapse:collapse; width:100%; margin:6px 0; }
 th, td { text-align:left; padding:2px 10px 2px 0; vertical-align:top; font-size:13px; }
@@ -109,12 +111,19 @@ const SCRIPT = `
     return parts.join(' \\u2014 ');
   }
 
+  function checkText(c) {
+    if (c.status !== 'waiting') return null;
+    var t = c.lastCheckedAt === null || c.lastCheckedAt === undefined ? 'never checked'
+      : 'checked ' + dur(now() - c.lastCheckedAt) + ' ago' + (c.lastCheckResult ? ' (' + c.lastCheckResult + ')' : '');
+    return c.checkStale ? el('span', { class: 'notchecked' }, '\\u26A0 not checked recently \\u2014 ' + t) : el('span', { class: 'muted' }, t);
+  }
+
   function chainCard(c, opts) {
     var open = !!expanded[c.id];
     var w = c.waitingOn;
     var sum = el('summary', null, badge(c), el('strong', null, subjectText(c)),
       el('span', { class: 'muted' }, c.engine + ' / ' + c.status + (c.phase ? ' / ' + c.phase : '') + (c.attempt ? ' / attempt ' + c.attempt : '')),
-      waitText(c) ? el('span', null, waitText(c)) : null);
+      waitText(c) ? el('span', null, waitText(c)) : null, checkText(c));
     var bodyParts = [];
     var links = [link(c.links.issue, 'issue'), link(c.links.pullRequest, 'pull request')].filter(Boolean);
     if (links.length) bodyParts.push(el.apply(null, ['div', null, 'links: '].concat(links.flatMap(function (l) { return [l, ' ']; }))));
@@ -125,7 +134,7 @@ const SCRIPT = `
     } else {
       bodyParts.push(el('div', { class: 'muted' }, 'latest events'), eventList(opts && opts.allEvents ? c.events : c.events.slice(-3)));
     }
-    var attrs = { class: 'chain' + (w && w.kind === 'stuck' ? ' stuck' : ''), 'data-chain': c.id };
+    var attrs = { class: 'chain' + (w && w.kind === 'stuck' ? ' stuck' : '') + (c.checkStale ? ' stale' : ''), 'data-chain': c.id };
     if (open) attrs.open = '';
     var d = el.apply(null, ['details', attrs, sum, el.apply(null, ['div', { class: 'body' }].concat(bodyParts))]);
     d.addEventListener('toggle', function () {

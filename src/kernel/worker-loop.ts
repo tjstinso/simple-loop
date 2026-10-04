@@ -10,6 +10,7 @@ import {
   completeWaitingChain,
   getChain,
   getJob,
+  recordChainCheck,
   renewLease,
   requeueJob,
   startWaitingChainWork,
@@ -17,7 +18,7 @@ import {
 } from './queue.js';
 import { reapExpired, type ReapDeps } from './reaper.js';
 import { pruneHistory } from './retention.js';
-import type { ChainView, Fence, Job, KernelDeps } from './types.js';
+import type { ChainStatus, ChainView, Engine, Fence, Job, KernelDeps } from './types.js';
 import {
   killProcessGroupNow,
   liveChildrenFor,
@@ -128,10 +129,19 @@ export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler =
     return;
   }
   for (const id of ids) {
+    let engine: Engine<unknown> | undefined;
+    /** One small UPDATE after the reconcile call; its failure goes to `onError` and changes nothing else. */
+    const check = (expected: ChainStatus, result: string): void => {
+      try {
+        recordChainCheck(deps.db, id, deps.clock(), expected, result);
+      } catch (e) {
+        onError(e);
+      }
+    };
     try {
       const chain = getChain(deps.db, id);
       if (chain.status !== 'waiting') continue;
-      const engine = deps.engines.get(chain.engine);
+      engine = deps.engines.get(chain.engine);
       if (!engine.reconcile) continue;
       const parsed = engine.stateSchema.safeParse(chain.engineState);
       if (!parsed.success) throw new Error(`invalid engine state for chain ${chain.id}: ${parsed.error.message}`);
@@ -143,20 +153,25 @@ export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler =
         state: parsed.data,
       };
       const result = await engine.reconcile(view);
-      if (result.outcome === 'none') continue;
+      if (result.outcome === 'none') {
+        check('waiting', result.check ?? 'none');
+        continue;
+      }
       if (result.outcome === 'update') {
         updateWaitingChainState(deps.db, id, result.engineState, deps.clock());
+        check('waiting', 'update');
         continue;
       }
       if (result.outcome === 'new_work') {
         const policy = deps.policies.match(result.job.policyKind, result.job.labels);
-        startWaitingChainWork(
+        const started = startWaitingChainWork(
           deps.db,
           id,
           result.engineState,
           { type: result.job.type, attempt: result.job.attempt, policyId: policy.id, payload: result.job.payload },
           deps.clock(),
         );
+        if (started) check('active', 'new_work');
         continue;
       }
       let applied: boolean;
@@ -177,6 +192,7 @@ export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler =
         finalView = { ...view, status: 'cancelled' };
       }
       if (!applied) continue;
+      check(finalView.status, result.outcome);
       if (result.outcome === 'cancelled' && engine.afterCancel) {
         try {
           await engine.afterCancel(finalView);
@@ -192,9 +208,21 @@ export async function reconcileWaiting(deps: KernelDeps, onError: ErrorHandler =
         }
       }
     } catch (e) {
+      check('waiting', checkErrorText(e, engine));
       onError(e);
     }
   }
+}
+
+/** `error: <message>` on one line, redacted by the chain's engine (the cap is applied when it is stored). */
+function checkErrorText(e: unknown, engine: Engine<unknown> | undefined): string {
+  let text = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, ' ').trim();
+  try {
+    text = engine?.redact?.(text) ?? text;
+  } catch {
+    text = '[unavailable]';
+  }
+  return `error: ${text}`;
 }
 
 /**
