@@ -8,12 +8,32 @@ export const LABEL_DEAD_LETTER = 'factory:dead-letter';
 export const FollowupSchema = z.object({ title: z.string(), body: z.string() });
 export type Followup = z.infer<typeof FollowupSchema>;
 
+const FOLLOWUP_TITLE_MAX = 120;
+
+/**
+ * Agents are told to return follow-ups as `{ title, body }` objects, but a model sometimes returns
+ * plain strings. A string becomes a follow-up whose title is its first line (capped) and whose body
+ * is the whole string, so one sloppy list entry does not fail the whole job.
+ */
+export const LenientFollowupsSchema = z.array(
+  z.union([
+    FollowupSchema,
+    z
+      .string()
+      .min(1)
+      .transform((text): Followup => {
+        const firstLine = text.trim().split('\n')[0] ?? '';
+        return { title: firstLine.slice(0, FOLLOWUP_TITLE_MAX), body: text };
+      }),
+  ]),
+);
+
 export const ExecutionResultSchema = z.object({
   status: z.enum(['ok', 'error']),
   summary: z.string(),
   costUsd: z.number().optional(),
   steps: z.array(z.string()).optional(),
-  followups: z.array(FollowupSchema).optional(),
+  followups: LenientFollowupsSchema.optional(),
 });
 export type ExecutionResult = z.infer<typeof ExecutionResultSchema>;
 
@@ -21,7 +41,7 @@ export const ReviewVerdictSchema = z.object({
   verdict: z.enum(['approve', 'request_changes']),
   feedback: z.string(),
   costUsd: z.number().optional(),
-  followups: z.array(FollowupSchema).optional(),
+  followups: LenientFollowupsSchema.optional(),
 });
 export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
 
