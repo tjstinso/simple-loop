@@ -33,6 +33,33 @@ function setup() {
   return { h, out, err, deps, closed: () => closed };
 }
 
+describe('policies command', () => {
+  it('prints each effective policy with redaction', async () => {
+    const { deps, out } = setup();
+    const token = 'gh' + 'p_' + 'a'.repeat(36);
+    const runtime: Runtime = {
+      ...deps.runtime!,
+      effectivePolicies: [
+        {
+          name: 'p1',
+          source: 'overridden',
+          policy: { id: 'p1', kind: 'execute', match: { labels: ['x'] }, runner: 'claude-cli', config: { bare: false, note: token } },
+        },
+      ],
+    };
+    expect(await run(['policies'], { ...deps, runtime })).toBe(0);
+    const text = out.join('\n');
+    expect(text).toContain('p1 source=overridden kind=execute labels=x');
+    expect(text).toContain('"bare": false');
+    expect(text).not.toContain(token);
+  });
+
+  it('rejects arguments', async () => {
+    const { deps } = setup();
+    expect(await run(['policies', 'x'], deps)).toBe(2);
+  });
+});
+
 async function deadLetter(h: Harness, n: number) {
   const { chain } = await h.submit(n);
   h.scriptExecute(() => {
@@ -324,7 +351,7 @@ describe('factory cli', () => {
     try {
       mkdirSync(join(dir, 'policies'));
       writeFileSync(
-        join(dir, 'policies', 'bad.yaml'),
+        join(dir, 'policies', 'software-review.yaml'),
         'id: broken-review\nkind: review\ndefault: true\nmatch:\n  labels: []\nrunner: claude-cli\nconfig:\n  prompt: x\n',
       );
       writeFileSync(join(dir, 'factory.config.json'), JSON.stringify({ dbPath: join(dir, 'f.db'), workspaceRoot: join(dir, 'ws') }));

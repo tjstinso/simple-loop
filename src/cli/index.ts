@@ -11,6 +11,7 @@ import {
 } from '../kernel/inspect.js';
 import type { Kernel } from '../kernel/kernel.js';
 import type { ChainView } from '../kernel/types.js';
+import { describePolicy } from '../policy/resolve.js';
 import { routeEngine } from '../router/router.js';
 import { loadConfig } from './config.js';
 import { buildRuntime, type Runtime } from './runtime.js';
@@ -34,6 +35,7 @@ const USAGE = `Usage:
   factory [--config <path>] dlq retry <job-id>
   factory [--config <path>] dlq discard <job-id>
   factory [--config <path>] cancel <chain-id>
+  factory [--config <path>] policies
 Options:
   --config <path>   config file (default ./factory.config.json)
   -h, --help        print this help`;
@@ -278,6 +280,13 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       }
       throw new UsageError('dlq needs a subcommand: list, retry or discard');
     }
+    case 'policies': {
+      if (rest.length > 0) throw new UsageError('policies takes no arguments');
+      const all = rt.effectivePolicies ?? [];
+      if (all.length === 0) stdout('no policies');
+      for (const e of all) for (const l of describePolicy(e)) stdout(l);
+      return 0;
+    }
     case 'cancel': {
       if (rest.length !== 1) throw new UsageError('cancel takes exactly one chain id');
       const id = parseId(rest[0], 'chain');
@@ -331,7 +340,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   const built = runtime === undefined;
   try {
     if (command[0] === undefined) return usageError('missing command');
-    if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel'].includes(command[0])) {
+    if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel', 'policies'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));

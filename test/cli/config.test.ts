@@ -20,7 +20,7 @@ describe('loadConfig', () => {
     const c = loadConfig(undefined, d);
     expect(c).toEqual({
       dbPath: join(d, 'factory.db'),
-      policiesDir: join(d, 'policies'),
+      shippedPolicies: true,
       workspaceRoot: join(d, '.factory/workspaces'),
       defaultEngine: 'software',
       defaultProfile: 'supervised',
@@ -47,6 +47,35 @@ describe('loadConfig', () => {
     expect(c.workspaceRoot).toBe(join(sub, 'ws'));
     expect(isAbsolute(c.workspaceRoot)).toBe(true);
     expect(c.policiesDir).toBe('/abs/policies');
+  });
+
+  it('accepts policiesDir, shippedPolicies and policyOverrides', () => {
+    const d = tmp();
+    writeFileSync(
+      join(d, 'factory.config.json'),
+      JSON.stringify({ policiesDir: 'p', shippedPolicies: false, policyOverrides: { a: { config: { bare: false } } } }),
+    );
+    const c = loadConfig(undefined, d);
+    expect(c.policiesDir).toBe(join(d, 'p'));
+    expect(c.shippedPolicies).toBe(false);
+    expect(c.policyOverrides).toEqual({ a: { config: { bare: false } } });
+  });
+
+  it('rejects an override of kind or match, naming the key', () => {
+    const d = tmp();
+    for (const key of ['kind', 'match']) {
+      writeFileSync(
+        join(d, 'factory.config.json'),
+        JSON.stringify({ policyOverrides: { 'software-execute': { [key]: 'x' } } }),
+      );
+      expect(() => loadConfig(undefined, d)).toThrow(new RegExp(`policyOverrides\\.software-execute\\.${key}`));
+    }
+  });
+
+  it('requires policiesDir when shippedPolicies is false', () => {
+    const d = tmp();
+    writeFileSync(join(d, 'factory.config.json'), JSON.stringify({ shippedPolicies: false }));
+    expect(() => loadConfig(undefined, d)).toThrow(/policiesDir/);
   });
 
   it('rejects an invalid config naming the field', () => {

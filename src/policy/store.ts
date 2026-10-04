@@ -6,9 +6,19 @@ import { matchPolicy } from './matcher.js';
 
 export { AmbiguousMatchError, NoPolicyError } from './matcher.js';
 
+export interface NamedPolicy {
+  /** The file name without its extension. */
+  name: string;
+  policy: Policy;
+}
+
 export function loadPolicies(dir: string): Policy[] {
+  return loadNamedPolicies(dir).map((n) => n.policy);
+}
+
+export function loadNamedPolicies(dir: string): NamedPolicy[] {
   const files = readdirSync(dir).filter((f) => f.endsWith('.yaml')).sort();
-  const policies: Policy[] = [];
+  const policies: NamedPolicy[] = [];
   const seen = new Map<string, string>();
   for (const file of files) {
     let raw: unknown;
@@ -29,7 +39,7 @@ export function loadPolicies(dir: string): Policy[] {
       throw new Error(`duplicate policy id '${res.data.id}' in ${prior} and ${file}`);
     }
     seen.set(res.data.id, file);
-    policies.push(res.data);
+    policies.push({ name: file.slice(0, -'.yaml'.length), policy: res.data });
   }
   return policies;
 }
