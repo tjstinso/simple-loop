@@ -150,7 +150,9 @@ describe('loadConfig repos', () => {
       setupTimeoutMs: 300_000,
       verifyTimeoutMs: 600_000,
       maxVerifyRounds: 3,
+      verifyBaseline: true,
     });
+    expect(load({ 'o/r': { verify: [['npm', 'test']], verifyBaseline: false } })().repos?.['o/r']?.verifyBaseline).toBe(false);
   });
 
   it('rejects unknown keys, bad commands, a bad name and maxVerifyRounds below 1', () => {

@@ -106,6 +106,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         maxCiRounds: config.maxCiRounds,
         ...(config.repos === undefined ? {} : { repos: config.repos }),
       },
+      workspaceRoot: config.workspaceRoot,
       ...(tokenEnv === undefined ? {} : { withheldEnv: [tokenEnv] }),
       now: clock,
       onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),

@@ -339,7 +339,8 @@ export function resolvePluginDirs(entries: readonly string[], workspace: string)
 
 export function buildPrompt(cfg: ClaudeCliConfig, input: RunInput): string {
   const subject = JSON.stringify(input.subject ?? null, null, 2);
-  let prompt = `${cfg.prompt}\n\n## Work item\n\n\`\`\`json\n${subject}\n\`\`\``;
+  const addendum = input.promptAddendum !== undefined && input.promptAddendum !== '' ? `\n\n${input.promptAddendum}` : '';
+  let prompt = `${cfg.prompt}${addendum}\n\n## Work item\n\n\`\`\`json\n${subject}\n\`\`\``;
   if (input.feedback !== undefined && input.feedback !== '') prompt += `\n\n## Feedback\n\n${input.feedback}`;
   return prompt;
 }

@@ -1,4 +1,5 @@
 import { isTransient } from '../engines/software/effects.js';
+import { BaselineFailingError } from '../engines/software/tool-run.js';
 import { AutoMergeRefusedError, GitHostError } from '../engines/software/github.js';
 
 /** Fragments of git (libcurl) and `gh` output that mean the network, not the repository, failed. */
@@ -22,6 +23,8 @@ const NETWORK_PATTERNS: RegExp[] = [
  */
 export function isTransientError(e: unknown): boolean {
   if (e instanceof AutoMergeRefusedError) return false;
+  // A red starting point is the base branch's or the environment's problem, not the agent's: retry later.
+  if (e instanceof BaselineFailingError) return true;
   if (e instanceof GitHostError) return isTransient(e);
   const text = e instanceof Error ? e.message : String(e);
   return NETWORK_PATTERNS.some((p) => p.test(text));

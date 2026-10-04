@@ -42,6 +42,7 @@ export interface HarnessOptions {
   maxCiRounds?: number;
   allowedAuthorAssociations?: string[];
   repos?: Record<string, RepoToolSettings>;
+  env?: () => NodeJS.ProcessEnv;
 }
 
 export interface DeliveryRecord {
@@ -194,6 +195,8 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
       host,
       git,
       workspaces,
+      workspaceRoot,
+      ...(opts.env === undefined ? {} : { env: opts.env }),
       policies,
       config: {
         defaultProfile: opts.defaultProfile ?? 'supervised',
