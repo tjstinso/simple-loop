@@ -9,6 +9,7 @@ import { GhCliHost, type ExecFn } from '../../../src/engines/software/github.js'
 import {
   ASKPASS_TOKEN_VAR,
   createGithubAuth,
+  createLazyGithubAuth,
   gitAuthEnv,
   readToken,
   verifyLogin,
@@ -199,4 +200,26 @@ describe('redaction of the token', () => {
 it('creates the per-worker directory', () => {
   const auth = createGithubAuth(TOKEN, tmp('factory-id-'));
   expect(existsSync(auth.askpassPath)).toBe(true);
+});
+
+describe('createLazyGithubAuth', () => {
+  it('reads the token and creates the directory only on first use, and dispose removes it', () => {
+    const base = mkdtempSync(join(tmpdir(), 'factory-lazy-'));
+    const saved = process.env.TMPDIR;
+    process.env.TMPDIR = base;
+    try {
+      const lazy = createLazyGithubAuth('X_TOKEN', { X_TOKEN: 'tok-' + 'y'.repeat(20) });
+      expect(readdirSync(base)).toEqual([]);
+      expect(lazy.auth.token).toBe('tok-' + 'y'.repeat(20));
+      expect(readdirSync(base)).toHaveLength(1);
+      lazy.dispose();
+      lazy.dispose();
+      expect(readdirSync(base)).toEqual([]);
+      expect(() => createLazyGithubAuth('MISSING', {}).ensure()).toThrow(/MISSING/);
+    } finally {
+      if (saved === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved;
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });

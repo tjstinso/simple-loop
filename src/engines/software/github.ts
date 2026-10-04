@@ -288,12 +288,12 @@ export class GhCliHost implements GitHost {
   private readonly mergeMethod: MergeMethod;
   private readonly ghTimeoutMs: number;
   private readonly deleteBranch: boolean;
-  private readonly env: Record<string, string> | undefined;
+  private readonly auth: GithubAuth | undefined;
 
   constructor(
     opts: { exec?: ExecFn; mergeMethod?: MergeMethod; ghTimeoutMs?: number; deleteBranch?: boolean; auth?: GithubAuth } = {},
   ) {
-    this.env = opts.auth === undefined ? undefined : ghAuthEnv(opts.auth);
+    this.auth = opts.auth;
     this.exec = opts.exec ?? defaultExec;
     this.mergeMethod = opts.mergeMethod ?? 'squash';
     this.ghTimeoutMs = opts.ghTimeoutMs ?? GH_TIMEOUT_MS;
@@ -304,7 +304,7 @@ export class GhCliHost implements GitHost {
     const r = await this.exec('gh', args, {
       ...(input === undefined ? {} : { input: JSON.stringify(input) }),
       timeoutMs: this.ghTimeoutMs,
-      ...(this.env === undefined ? {} : { env: this.env }),
+      ...(this.auth === undefined ? {} : { env: ghAuthEnv(this.auth) }),
     });
     // No status: the effects' classification treats it as transient and retries.
     if (r.timedOut) throw new GitHostError(`gh ${args[0]} timed out after ${this.ghTimeoutMs} ms`);

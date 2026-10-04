@@ -1,6 +1,6 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /** The `github` object of the configuration: the factory's own GitHub identity. */
 export interface GithubSettings {
@@ -36,7 +36,7 @@ export const NO_CREDENTIAL_HELPER_ARGS = ['-c', 'credential.helper='];
 export function readToken(name: string, env: Readonly<Record<string, string | undefined>>): string {
   const value = env[name];
   if (value === undefined || value.trim() === '') {
-    throw new Error(`github.tokenEnv: the environment variable ${name} is not set or is empty`);
+    throw new Error(`github.tokenEnv: the environment variable ${name} is not set or is empty (read-only commands such as status, show, events, workers, dlq list and policies do not need it)`);
   }
   return value;
 }
@@ -59,6 +59,51 @@ export function createGithubAuth(token: string, baseDir: string = tmpdir()): Git
   const askpassPath = join(dir, 'askpass.sh');
   writeFileSync(askpassPath, ASKPASS_SCRIPT, { mode: 0o700 });
   return { token, ghConfigDir, askpassPath };
+}
+
+/** A `GithubAuth` that reads the token and creates its directory on first use. */
+export interface LazyGithubAuth {
+  auth: GithubAuth;
+  /** Reads the token and creates the directory now (throws when the variable is missing); idempotent. */
+  ensure(): GithubAuth;
+  /** Removes the per-process directory if it was created; safe to call more than once. */
+  dispose(): void;
+}
+
+export function createLazyGithubAuth(
+  tokenEnv: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): LazyGithubAuth {
+  let real: GithubAuth | undefined;
+  let dir: string | undefined;
+  const ensure = (): GithubAuth => {
+    if (real === undefined) {
+      const created = createGithubAuth(readToken(tokenEnv, env));
+      real = created;
+      dir = dirname(created.askpassPath);
+    }
+    return real;
+  };
+  const auth: GithubAuth = {
+    get token() {
+      return ensure().token;
+    },
+    get ghConfigDir() {
+      return ensure().ghConfigDir;
+    },
+    get askpassPath() {
+      return ensure().askpassPath;
+    },
+  };
+  return {
+    auth,
+    ensure,
+    dispose() {
+      if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+      dir = undefined;
+      real = undefined;
+    },
+  };
 }
 
 /** The environment that makes a git command authenticate over HTTPS with the token. */

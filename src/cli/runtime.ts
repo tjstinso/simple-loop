@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import { FOLLOWUPS_DDL } from '../engines/software/followups.js';
 import { ExecGitPorts, FACTORY_GIT_EMAIL, FACTORY_GIT_NAME } from '../engines/software/git-ports.js';
 import { GhCliHost } from '../engines/software/github.js';
-import { createGithubAuth, readToken, verifyLogin, type GithubAuth } from '../engines/software/identity.js';
+import { createLazyGithubAuth, verifyLogin, type GithubAuth, type LazyGithubAuth } from '../engines/software/identity.js';
 import { createSoftwareEngine } from '../engines/software/index.js';
 import { secretEnvValues } from '../engines/software/secret-scan.js';
 import { GitWorkspaceProvider } from '../engines/software/workspace.js';
@@ -22,6 +22,8 @@ export interface Runtime {
   defaultEngine: string;
   /** The policies in effect (name, source and merged value), for `factory policies`. */
   effectivePolicies?: EffectivePolicy[];
+  /** Reads the GitHub token and creates the auth directory now; throws when the token is missing. A no-op without `github.tokenEnv`. */
+  requireGithub?(): void;
   /** Checks the factory's GitHub identity (the token's login against `github.expectLogin`); run at worker start. */
   verifyIdentity?(): Promise<void>;
   close(): void;
@@ -42,6 +44,7 @@ function passEnvNames(policies: readonly Policy[]): string[] {
 export function buildRuntime(config: FactoryConfig): Runtime {
   const clock = () => Date.now();
   const db = openDb(config.dbPath);
+  let lazy: LazyGithubAuth | undefined;
   try {
     migrate(db, [FOLLOWUPS_DDL]);
     const effectivePolicies = resolvePolicies({
@@ -54,7 +57,10 @@ export function buildRuntime(config: FactoryConfig): Runtime {
     const gh = config.github;
     const tokenEnv = gh?.tokenEnv;
     let auth: GithubAuth | undefined;
-    if (tokenEnv !== undefined) auth = createGithubAuth(readToken(tokenEnv, process.env));
+    if (tokenEnv !== undefined) {
+      lazy = createLazyGithubAuth(tokenEnv, process.env);
+      auth = lazy.auth;
+    }
     const identity =
       gh?.commitName !== undefined || gh?.commitEmail !== undefined
         ? { name: gh.commitName ?? FACTORY_GIT_NAME, email: gh.commitEmail ?? FACTORY_GIT_EMAIL }
@@ -114,10 +120,15 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       db,
       defaultEngine: config.defaultEngine,
       effectivePolicies,
+      ...(lazy !== undefined ? { requireGithub: () => void lazy?.ensure() } : {}),
       ...(auth !== undefined && expectLogin !== undefined ? { verifyIdentity: () => verifyLogin(host, expectLogin) } : {}),
-      close: () => db.close(),
+      close: () => {
+        lazy?.dispose();
+        db.close();
+      },
     };
   } catch (e) {
+    lazy?.dispose();
     db.close();
     throw e;
   }

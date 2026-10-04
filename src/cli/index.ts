@@ -135,6 +135,7 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         options: { label: { type: 'string', multiple: true }, engine: { type: 'string' } },
       });
       if (positionals.length !== 1) throw new UsageError('submit takes exactly one issue url');
+      rt.requireGithub?.();
       const labels = [...(values.label ?? [])];
       if (values.engine !== undefined) labels.push(`factory:engine:${values.engine}`);
       try {
@@ -159,6 +160,7 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         if (!/^[0-9]+$/.test(values['poll-ms'])) throw new UsageError('--poll-ms must be a non-negative integer');
         pollMs = Number(values['poll-ms']);
       }
+      rt.requireGithub?.();
       await rt.verifyIdentity?.();
       const worker = kernel.startWorker({
         ...(pollMs === undefined ? {} : { pollMs }),
@@ -344,6 +346,16 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));
+    if (built && command[0] !== 'worker') {
+      // The worker stops gracefully on a signal; other commands remove the auth directory and exit.
+      const rt = runtime;
+      for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
+        onSignal(sig, () => {
+          rt.close();
+          process.exit(code);
+        });
+      }
+    }
     return await execute(command, runtime, { stdout, stderr, onSignal });
   } catch (e) {
     if (e instanceof UsageError || (e instanceof TypeError && (e as { code?: string }).code?.startsWith('ERR_PARSE_ARGS'))) {
