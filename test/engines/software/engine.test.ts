@@ -431,7 +431,21 @@ describe('software engine', () => {
     it.each([undefined, 429, 503])('treats host error status %s as transient', async (status) => {
       const { engine, host } = make();
       host.failNext('findPrByHead', new GitHostError('boom', status));
-      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none', check: 'error: boom' });
+    });
+
+    it('reports a transient failure with the secrets redacted', async () => {
+      const { engine, host } = make();
+      const token = 'gh' + 'p_' + 'a'.repeat(36);
+      host.failNext('findPrByHead', new GitHostError(`boom ${token}\nline two`, 503));
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none', check: 'error: boom [redacted] line two' });
+    });
+
+    it('reports an unknown mergeability as the result of the check', async () => {
+      const { engine, host } = make();
+      open(host, 'open');
+      host.prs.get(9)!.mergeable = 'unknown';
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none', check: 'unknown' });
     });
 
     it('rethrows a non-transient host error', async () => {

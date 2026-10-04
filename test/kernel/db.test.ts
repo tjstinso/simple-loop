@@ -62,3 +62,29 @@ describe('kernel schema', () => {
     expect(() => migrate(db)).not.toThrow();
   });
 });
+
+describe('chain check columns', () => {
+  const columns = (db: ReturnType<typeof mk>) =>
+    (db.pragma('table_info(chains)') as { name: string; notnull: number }[]).filter((c) => c.name.startsWith('last_check'));
+
+  it('adds the two nullable columns to a database created before them, keeping old rows', () => {
+    const db = openDb(':memory:');
+    db.exec(`CREATE TABLE chains (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, engine TEXT NOT NULL, subject_key TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('active','waiting','dead_lettered','completed','cancelled')),
+      engine_state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    db.prepare(`INSERT INTO chains (engine, subject_key, status, engine_state, created_at, updated_at) VALUES ('e', 'old', 'waiting', '{}', 1, 2)`).run();
+    migrate(db);
+    expect(columns(db).map((c) => [c.name, c.notnull])).toEqual([['last_checked_at', 0], ['last_check_result', 0]]);
+    expect(db.prepare('SELECT status, updated_at, last_checked_at, last_check_result FROM chains').get()).toEqual({
+      status: 'waiting', updated_at: 2, last_checked_at: null, last_check_result: null,
+    });
+  });
+
+  it('is idempotent', () => {
+    const db = mk();
+    migrate(db);
+    migrate(db);
+    expect(columns(db)).toHaveLength(2);
+  });
+});

@@ -103,9 +103,24 @@ CREATE INDEX IF NOT EXISTS events_chain ON events(chain_id, id);
 CREATE INDEX IF NOT EXISTS events_at ON events(at);
 `;
 
+/** Columns added after the first release: `ALTER TABLE` only when `PRAGMA table_info` does not list them yet. */
+const CHAIN_COLUMNS: [name: string, ddl: string][] = [
+  // When the maintenance pass last looked at a waiting chain (epoch ms) and what it found.
+  ['last_checked_at', 'INTEGER'],
+  ['last_check_result', 'TEXT'],
+];
+
+function addMissingChainColumns(db: Database.Database): void {
+  const have = new Set((db.pragma('table_info(chains)') as { name: string }[]).map((c) => c.name));
+  for (const [name, ddl] of CHAIN_COLUMNS) {
+    if (!have.has(name)) db.exec(`ALTER TABLE chains ADD COLUMN ${name} ${ddl}`);
+  }
+}
+
 export function migrate(db: Database.Database, extra: string[] = []): void {
   db.transaction(() => {
     db.exec(KERNEL_DDL);
+    addMissingChainColumns(db);
     for (const ddl of extra) db.exec(ddl);
   })();
 }
