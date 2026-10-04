@@ -35,7 +35,7 @@ describe('verification before the push', () => {
     const h = harness({ repos: { [REPO]: { verify: [needsFixed], verifyBaseline: false } } });
     await h.submit(N);
     h.scriptExecute((input, call) => {
-      if (call === 0) return { status: 'ok', summary: 'first', costUsd: 0.1, followups: [] };
+      if (call === 0) return (h.write(input, 'first.txt', 'x\n'), { status: 'ok', summary: 'first', costUsd: 0.1, followups: [] });
       h.write(input, 'fixed.txt', 'x\n');
       return { status: 'ok', summary: 'fixed', costUsd: 0.2 };
     });
@@ -48,7 +48,7 @@ describe('verification before the push', () => {
     expect(calls[1]!.feedback).toContain('Exit code: 2');
     expect(calls[1]!.workspace.path).toBe(calls[0]!.workspace.path);
     expect(h.remoteFile(BRANCH, 'fixed.txt')).toBe('x');
-    expect(h.remoteLog(BRANCH)).toHaveLength(2);
+    expect(h.remoteLog(BRANCH)).toHaveLength(3);
     expect(kinds(h).filter((k) => k.startsWith('verify.'))).toEqual(['verify.started', 'verify.failed', 'verify.started', 'verify.passed']);
     const failed = chainEvents(h.db, h.chain().id).find((e) => e.kind === 'verify.failed')!;
     expect(failed.detail).toMatchObject({ exitCode: 2, round: 0 });
@@ -86,7 +86,7 @@ describe('verification before the push', () => {
   it('fails the attempt after maxVerifyRounds and pushes nothing', async () => {
     const h = harness({ repos: { [REPO]: { verify: [needsFixed], verifyBaseline: false, maxVerifyRounds: 3 } } });
     await h.submit(N);
-    h.scriptExecute(() => ok('never fixes'));
+    h.scriptExecute((input, call) => (h.write(input, `try-${call}.txt`, 'x\n'), ok('never fixes')));
     const first = h.claim()!;
     expect(await h.deliver(first)).toBe('dead_lettered');
     expect(h.callsOf('execute')).toHaveLength(4);

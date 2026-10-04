@@ -21,7 +21,8 @@ import {
   type BaselineEntry, type RepoToolSettings,
 } from './tool-run.js';
 import { depCacheKey, isStandardInstall, pruneDepCache, restoreDepCache, storeDepCache } from './dep-cache.js';
-import { defaultSleep, isTransient, neutralizeSummary, runSoftwareEffect, withHostRetry } from './effects.js';
+import { validateRound, type RoundOutcome, type ValidationDeps } from './commit-validation.js';
+import { defaultSleep, filesWithMarkers, isTransient, neutralizeSummary, oneLine, runSoftwareEffect, withHostRetry } from './effects.js';
 import { planFeedbackRound, DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS } from './feedback.js';
 import { postFeedbackReplies } from './replies.js';
 import { GitHostError, type GitHost, type Pr } from './github.js';
@@ -609,32 +610,72 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       const cfg = deps.config.repos?.[chain.state.repo];
       const commands = cfg?.verify ?? [];
       const first = result as { status?: string; costUsd?: number };
-      if (job.type !== 'execute' || commands.length === 0 || first.status !== 'ok') return result;
+      const sws = ws as SoftwareWorkspace;
+      if (job.type !== 'execute' || first.status !== 'ok') return result;
       const maxRounds = Math.max(1, cfg?.maxVerifyRounds ?? 3);
       const timeoutMs = cfg?.verifyTimeoutMs ?? 600_000;
+      const sleep = deps.sleep ?? defaultSleep;
+      const conflictRound = ((job.payload as { conflictRound?: unknown } | null | undefined)?.conflictRound ?? null) !== null;
+      const issue = await withHostRetry(() => deps.host.getIssue(chain.state.repo, chain.state.issueNumber), sleep);
+      const title = oneLine(redact(issue.title)) || `#${chain.state.issueNumber}`;
       let current = result as Record<string, unknown> & { status?: string; costUsd?: number };
       let cost: number | undefined = first.costUsd;
       let verifyMs = 0;
       let rounds = 0;
+      let conflictHead: string | undefined = conflictRound ? sws.seedSha : undefined;
+      const record = (kind: string, detail: Record<string, unknown>) => jobEvent(chain, job, kind, detail);
       for (let round = 0; ; round++) {
-        jobEvent(chain, job, 'verify.started', { commands: commands.map((c) => c[0]), round });
-        const started = Date.now();
-        const r = await runCommands(ws, commands, timeoutMs, signal);
-        const ms = Date.now() - started;
-        verifyMs += ms;
-        if (signal.aborted) throw new Error('aborted');
-        if (!r.failed) {
-          jobEvent(chain, job, 'verify.passed', { round, durationMs: ms });
+        const validation: ValidationDeps = {
+          expect: { branch: sws.localBranch, email: deps.git.commitEmail?.() ?? '' },
+          seedSha: sws.seedSha,
+          fallbackMessage: `factory: ${title} (attempt ${job.attempt})`,
+          conflictRound,
+          prepare: async () => deps.git.prepareForPush?.(sws),
+          inspect: () => deps.git.inspect!(sws, { firstParent: conflictRound }),
+          commitAll: (message) => deps.git.commitAll(sws, message),
+          markersLeft: () => filesWithMarkers(sws),
+          headSha: () => deps.git.headSha(sws),
+          events: (kind, detail) => record(kind, Object.fromEntries(Object.entries(detail).map(([k, v]) => [k, typeof v === 'string' ? redact(v) : v]))),
+          verify: async () => {
+            if (commands.length === 0) return null;
+            record('verify.started', { commands: commands.map((c) => c[0]), round });
+            const started = Date.now();
+            const r = await runCommands(ws, commands, timeoutMs, signal);
+            const ms = Date.now() - started;
+            verifyMs += ms;
+            if (signal.aborted) throw new Error('aborted');
+            if (!r.failed) {
+              record('verify.passed', { round, durationMs: ms });
+              return null;
+            }
+            const f = r.failed;
+            record('verify.failed', { command: show(f.argv), exitCode: f.exitCode, round, durationMs: ms });
+            if (round >= maxRounds) {
+              throw new EffectError(`verification failed after ${round} round(s) of fixes: ${show(f.argv)} (exit code ${f.exitCode ?? 'none'})`, 'runner_error');
+            }
+            const feedback = buildVerifyFeedback(f.argv, f.exitCode, f.spawnError ?? f.output, deps.secretValues?.() ?? [], baselines.get(key(chain.id, job.id, job.delivery)));
+            return { feedback, command: show(f.argv), exitCode: f.exitCode };
+          },
+        };
+        let outcome: RoundOutcome;
+        if (deps.git.inspect === undefined) {
+          // Ports without validation support: only the verify commands run, `commit_push` commits.
+          const failure = await validation.verify();
+          if (failure === null) break;
+          outcome = { kind: 'fix', head: '', ...failure };
+        } else {
+          outcome = await validateRound(validation, conflictHead);
+        }
+        if (outcome?.kind === 'validated') {
+          current = { ...current, validatedSha: outcome.head, commitCount: outcome.commitCount, commits: outcome.commits };
           break;
         }
-        const f = r.failed;
-        jobEvent(chain, job, 'verify.failed', { command: show(f.argv), exitCode: f.exitCode, round, durationMs: ms });
+        if (conflictRound) conflictHead = outcome.head;
         if (round >= maxRounds) {
-          throw new EffectError(`verification failed after ${round} round(s) of fixes: ${show(f.argv)} (exit code ${f.exitCode ?? 'none'})`, 'runner_error');
+          throw new EffectError(`validation failed after ${round} round(s) of fixes: ${outcome.command ?? 'verification'}`, 'runner_error');
         }
-        const feedback = buildVerifyFeedback(f.argv, f.exitCode, f.spawnError ?? f.output, deps.secretValues?.() ?? [], baselines.get(key(chain.id, job.id, job.delivery)));
         rounds++;
-        const next = (await rerun(feedback)) as typeof current;
+        const next = (await rerun(outcome.feedback)) as typeof current;
         if (typeof next.costUsd === 'number') cost = (cost ?? 0) + next.costUsd;
         // The rerun answers the same attempt: feedbackResponses and followups it leaves out stay as the previous run reported them.
         const { feedbackResponses, followups } = current;

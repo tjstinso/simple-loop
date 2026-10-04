@@ -33,6 +33,76 @@ export interface GitPorts {
    * `GitWorkspaceProvider.sanitizeForPush`).
    */
   prepareForPush?(ws: SoftwareWorkspace): Promise<void>;
+  /**
+   * Optional (without it only the verify commands run before the push and `commit_push` commits): what the validation round needs to know about the workspace (see `WorkspaceFacts`), read
+   * with the scan's isolation. `firstParent` lists only the first-parent chain since the seed (a
+   * conflict round, where the merged-in base commits are other people's).
+   */
+  inspect?(ws: SoftwareWorkspace, opts: { firstParent: boolean }): Promise<WorkspaceFacts>;
+  /** Optional: the email every commit of the delivery must carry (the factory identity). */
+  commitEmail?(): string;
+}
+
+/** One commit of `seed..HEAD`, newest first. */
+export interface CommitFact {
+  sha: string;
+  parents: string[];
+  authorEmail: string;
+  committerEmail: string;
+  subject: string;
+}
+
+/** The state of a workspace as the validation round sees it. */
+export interface WorkspaceFacts {
+  /** The checked-out local branch; null when HEAD is detached. */
+  branch: string | null;
+  head: string;
+  seedIsAncestor: boolean;
+  /** The commits of `seed..HEAD`, newest first (at most `MAX_INSPECTED_COMMITS`). */
+  commits: CommitFact[];
+  /** Number of commits in `seed..HEAD` (may exceed `commits.length`). */
+  commitCount: number;
+  /** Commits (shas) that add, change or remove a gitlink (submodule) entry. */
+  gitlinkCommits: string[];
+  /** Tracked changes and untracked files that are not ignored. */
+  dirtyFiles: string[];
+  /** The subset of `dirtyFiles` that are tracked. */
+  trackedDirtyFiles: string[];
+  /** A merge is in progress (a conflict round whose merge commit the engine has not made yet). */
+  merging: boolean;
+}
+
+/** Most commits `inspect` reads in full; `commitCount` still counts all. */
+export const MAX_INSPECTED_COMMITS = 200;
+
+/** The `%x01<sha>%x02` + raw records of `git log --raw -z`: the commits that touch a gitlink (mode 160000). */
+export function parseGitlinkCommits(out: string): string[] {
+  const found: string[] = [];
+  const re = /\u0001([0-9a-f]+)\u0002|:(\d{6}) (\d{6}) [0-9a-f]+ [0-9a-f]+ [A-Z]\d*\0/g;
+  let current = '';
+  for (let m = re.exec(out); m !== null; m = re.exec(out)) {
+    if (m[1] !== undefined) current = m[1];
+    else if ((m[2] === '160000' || m[3] === '160000') && !found.includes(current)) found.push(current);
+  }
+  return found;
+}
+
+/** Parses `git status --porcelain=v1 -z --untracked-files=all` into the dirty paths. */
+export function parseStatus(out: string): { dirty: string[]; tracked: string[] } {
+  const dirty: string[] = [];
+  const tracked: string[] = [];
+  const tokens = out.split('\0');
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (t.length < 4) continue;
+    const xy = t.slice(0, 2);
+    const path = t.slice(3);
+    // A rename or copy is followed by its source path.
+    if (xy[0] === 'R' || xy[0] === 'C' || xy[1] === 'R' || xy[1] === 'C') i++;
+    dirty.push(path);
+    if (xy !== '??') tracked.push(path);
+  }
+  return { dirty, tracked };
 }
 
 export interface AddedChanges {
@@ -416,6 +486,51 @@ export class ExecGitPorts implements GitPorts {
     // Message on stdin: untrusted text never sits in argv.
     await must(ws.path, ['commit', '--quiet', '--no-verify', '--cleanup=whitespace', '-F', '-'], this.local, message, false, this.commitEnv);
     return true;
+  }
+
+  commitEmail(): string {
+    return this.commitEnv.GIT_AUTHOR_EMAIL!;
+  }
+
+  async inspect(ws: SoftwareWorkspace, o: { firstParent: boolean }): Promise<WorkspaceFacts> {
+    if (!SHA_RE.test(ws.seedSha)) throw new Error(`invalid seed sha: ${JSON.stringify(ws.seedSha)}`);
+    const branchRun = await run(ws.path, ['symbolic-ref', '-q', '--short', 'HEAD'], this.local, undefined, true);
+    const head = await must(ws.path, ['rev-parse', '--verify', 'HEAD^{commit}'], this.local, undefined, true);
+    const seedIsAncestor = (await run(ws.path, ['merge-base', '--is-ancestor', ws.seedSha, head], this.local, undefined, true)).code === 0;
+    const range = `${ws.seedSha}..${head}`;
+    const parent = o.firstParent ? ['--first-parent'] : [];
+    // Unit separator between fields; the subject is one line.
+    const log = seedIsAncestor
+      ? await must(ws.path, ['log', ...parent, '-n', String(MAX_INSPECTED_COMMITS), '--format=%H%x1f%P%x1f%ae%x1f%ce%x1f%s%x1e', range], this.local, undefined, true)
+      : '';
+    const commits: CommitFact[] = log
+      .split('\x1e')
+      .map((r) => r.replace(/^\n+/, ''))
+      .filter((r) => r !== '')
+      .map((r) => {
+        const [sha = '', parents = '', authorEmail = '', committerEmail = '', subject = ''] = r.split('\x1f');
+        return { sha, parents: parents.split(' ').filter((p) => p !== ''), authorEmail, committerEmail, subject };
+      });
+    const commitCount = seedIsAncestor ? Number(await must(ws.path, ['rev-list', '--count', ...parent, range], this.local, undefined, true)) : 0;
+    const raw = seedIsAncestor
+      ? await must(ws.path, ['log', ...parent, '--format=%x01%H%x02', '--raw', '--no-abbrev', '--no-renames', '-z', '--diff-merges=first-parent', range], this.local, undefined, true)
+      : '';
+    const status = parseStatus(await run(ws.path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], this.local, undefined, true).then((r) => {
+      if (r.code !== 0) throw new Error(`git status failed: ${r.stderr.trim() || `exit ${r.code}`}`);
+      return r.stdout;
+    }));
+    const merging = (await run(ws.path, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], this.local, undefined, true)).code === 0;
+    return {
+      branch: branchRun.code === 0 ? branchRun.stdout.trim() : null,
+      head,
+      seedIsAncestor,
+      commits,
+      commitCount,
+      gitlinkCommits: parseGitlinkCommits(raw),
+      dirtyFiles: status.dirty,
+      trackedDirtyFiles: status.tracked,
+      merging,
+    };
   }
 
   async headSha(ws: SoftwareWorkspace): Promise<string> {

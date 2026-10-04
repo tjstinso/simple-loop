@@ -44,6 +44,10 @@ export const ExecutionResultSchema = z.object({
   /** Set by the engine when verification ran: verify rounds used and the time verification took. */
   verifyRounds: z.number().optional(),
   verifyDurationMs: z.number().optional(),
+  /** Set by the engine's validation round: the verified head the push is pinned to, the commits since the seed and the first 20 of them. */
+  validatedSha: z.string().optional(),
+  commitCount: z.number().optional(),
+  commits: z.array(z.object({ sha: z.string(), subject: z.string() })).optional(),
   steps: z.array(z.string()).optional(),
   followups: LenientFollowupsSchema.optional(),
   // A malformed list never fails the run: it counts as no responses.

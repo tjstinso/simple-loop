@@ -134,7 +134,7 @@ function requireWorkspace(ctx: EffectContext): SoftwareWorkspace {
 }
 
 /** One line, no control characters, bounded: issue titles are untrusted. */
-function oneLine(s: string, max = 200): string {
+export function oneLine(s: string, max = 200): string {
   // eslint-disable-next-line no-control-regex
   const t = s.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
@@ -211,6 +211,12 @@ function titleOf(ctx: EffectContext, issue: Issue): string {
   return oneLine(redactSecrets(issue.title, secretValuesOf(ctx))) || `#${ctx.chain.state.issueNumber}`;
 }
 
+/** The head the validation round verified (absent when no validation ran). */
+function validatedShaOf(job: Job): string | undefined {
+  const r = ExecutionResultSchema.safeParse(job.result);
+  return r.success ? r.data.validatedSha : undefined;
+}
+
 /** The number of the human feedback round an execute job works on (absent for the factory's own attempts). */
 function humanRoundOf(job: Job): number | null {
   const n = (job.payload as { humanRound?: unknown } | null | undefined)?.humanRound;
@@ -224,7 +230,7 @@ function conflictRoundOf(job: Job): number | null {
 }
 
 /** The conflicted files of the round that still hold a conflict marker line. */
-async function filesWithMarkers(ws: SoftwareWorkspace): Promise<string[]> {
+export async function filesWithMarkers(ws: SoftwareWorkspace): Promise<string[]> {
   const left: string[] = [];
   for (const p of ws.conflict?.paths ?? []) {
     const file = join(ws.path, p);
@@ -384,14 +390,21 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<Effec
   const title = titleOf(ctx, issue);
   // The agent could have written the shared repository config: sanitize before any engine git command.
   await ctx.git.prepareForPush?.(ws);
-  // The engine completes the merge of a conflict round; the agent only edited files.
-  const conflicted = await filesWithMarkers(ws);
-  if (conflicted.length > 0) {
-    throw new EffectError(`refusing to push: conflict markers remain in ${conflicted.join(', ')}`, 'runner_error');
+  // The validation round committed the agent's work (and completed a conflict round's merge) and
+  // verified exactly `validatedSha`; a result without one (no validation ran) is committed here.
+  const validated = validatedShaOf(ctx.job);
+  if (validated === undefined) {
+    const conflicted = await filesWithMarkers(ws);
+    if (conflicted.length > 0) {
+      throw new EffectError(`refusing to push: conflict markers remain in ${conflicted.join(', ')}`, 'runner_error');
+    }
+    await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
   }
-  await ctx.git.commitAll(ws, `factory: ${title} (attempt ${ctx.job.attempt})`);
   // Pinned: the push sends exactly the commit that was scanned, even if HEAD moves meanwhile.
   const head = await ctx.git.headSha(ws);
+  if (validated !== undefined && head !== validated) {
+    throw new EffectError('refusing to push: HEAD moved after the committed state was validated', 'runner_error');
+  }
   if (head === ws.seedSha) {
     // Nothing new in this delivery. If the branch was already published (e.g. a rerun after a
     // crash that followed the push), the work is on the remote: succeed so open_pr can proceed.
@@ -417,6 +430,22 @@ async function commitPush(ctx: EffectContext, fence: EffectFence): Promise<Effec
   return { engineState: { lastPushedSha: head } };
 }
 
+/** The "Commits" list of the pull request body (short sha and subject, redacted), from the validated result. */
+function commitsSection(ctx: EffectContext): string[] {
+  const r = ExecutionResultSchema.safeParse(ctx.job.result);
+  const commits = r.success ? (r.data.commits ?? []) : [];
+  if (commits.length === 0) return [];
+  const values = secretValuesOf(ctx);
+  const more = (r.success ? (r.data.commitCount ?? 0) : 0) - commits.length;
+  return [
+    [
+      '## Commits',
+      ...commits.map((c) => `- \`${c.sha.replace(/[^0-9a-f]/g, '').slice(0, 12)}\` ${neutralizeSummary(oneLine(redactSecrets(c.subject, values), 100))}`),
+      ...(more > 0 ? [`- … and ${more} more`] : []),
+    ].join('\n'),
+  ];
+}
+
 async function openPr(ctx: EffectContext, fence: EffectFence): Promise<EffectOutcome<SoftwareState> | void> {
   const ws = requireWorkspace(ctx);
   const { repo, issueNumber, branch } = ctx.chain.state;
@@ -427,7 +456,7 @@ async function openPr(ctx: EffectContext, fence: EffectFence): Promise<EffectOut
   const marker = `<!-- factory:chain=${ctx.chain.id} job=${ctx.job.id} event=open-pr -->`;
   // Redacted before neutralizing and capping, so a secret is never cut in half and kept.
   const safeSummary = summary ? neutralizeSummary(redactSecrets(summary, secretValuesOf(ctx))) : null;
-  const body = [`Closes #${issueNumber}`, ...(safeSummary ? [safeSummary] : []), marker].join('\n\n');
+  const body = [`Closes #${issueNumber}`, ...(safeSummary ? [safeSummary] : []), ...commitsSection(ctx), marker].join('\n\n');
   fence.assertCurrent();
   const pr = await ctx.host.openPr(repo, { head: branch, base: ws.baseBranch, title: titleOf(ctx, issue), body });
   ctx.events?.('pr.opened', { branch, base: ws.baseBranch, number: pr.number });
