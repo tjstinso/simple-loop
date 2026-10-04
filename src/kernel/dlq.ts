@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { getChain, getJob } from './queue.js';
-import type { Chain, DeadLetter, DeadLetterReason, Job } from './types.js';
+import type { Chain, ChainStatus, DeadLetter, DeadLetterReason, Job } from './types.js';
 
 type Db = Database.Database;
 
@@ -170,13 +170,16 @@ export function discardDeadLetter(db: Db, jobId: number, now: number): Job {
  * transaction: the chain becomes `cancelled` (freeing its subject key), its queued jobs `cancelled`,
  * and its unresolved dead letters resolved. Refuses (throws, writes nothing) an unknown chain, a
  * chain that is already completed or cancelled, and a chain with a `running` job (stop its worker or
- * wait for the delivery to finish first). Returns the cancelled chain.
+ * wait for the delivery to finish first). With `onlyIfStatus` it also refuses a chain in any other status. Returns the cancelled chain.
  */
-export function cancelChain(db: Db, chainId: number, now: number): Chain {
+export function cancelChain(db: Db, chainId: number, now: number, opts: { onlyIfStatus?: ChainStatus } = {}): Chain {
   return db
     .transaction((): Chain => {
       const chain = db.prepare('SELECT status FROM chains WHERE id = ?').get(chainId) as { status: string } | undefined;
       if (!chain) throw new Error(`chain ${chainId} not found`);
+      if (opts.onlyIfStatus !== undefined && chain.status !== opts.onlyIfStatus) {
+        throw new Error(`cannot cancel chain ${chainId}: it is ${chain.status}, not ${opts.onlyIfStatus}`);
+      }
       if (chain.status === 'completed' || chain.status === 'cancelled') {
         throw new Error(`cannot cancel chain ${chainId}: it is ${chain.status}`);
       }

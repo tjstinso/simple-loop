@@ -127,6 +127,11 @@ export interface WorkspaceProvider {
   prepare(chain: ChainView<any>, job: Job): Promise<Workspace>;
 }
 
+export type ReconcileOutcome =
+  | { outcome: 'none' }
+  | { outcome: 'completed'; reason: string }
+  | { outcome: 'cancelled'; reason: string };
+
 export interface Engine<S = unknown> {
   id: string;
   policyKinds: string[];
@@ -161,6 +166,23 @@ export interface Engine<S = unknown> {
   afterCancel?(chain: ChainView<S>, job?: Job): Promise<void>;
   /** Called after every delivery, whatever its outcome. */
   cleanup(chain: ChainView<S>, job: Job): Promise<void>;
+  /**
+   * Optional: called by the maintenance pass for every `waiting` chain, with its validated state, to
+   * learn whether the subject was settled outside the factory (for example a person merged or closed
+   * the pull request). `completed` finishes the chain (its engine state becomes `finalState(state)`
+   * when defined), `cancelled` cancels it like `Kernel.cancelChain`, `none` leaves it. Must be cheap
+   * (at most one lookup) and return `none` on a transient failure so the next pass retries; a thrown
+   * error goes to `onError` and leaves the chain untouched.
+   */
+  reconcile?(chain: ChainView<S>): Promise<ReconcileOutcome>;
+  /** Optional: the engine state of a chain that `reconcile` completed (default: unchanged). Pure. */
+  finalState?(state: S): S;
+  /**
+   * Optional: called after `reconcile` completed or cancelled a chain (after `afterCancel`, for a
+   * cancellation), with the chain view and the outcome (for example to label and comment on the
+   * subject). Errors go to `onError`; the transition stands.
+   */
+  afterReconcile?(chain: ChainView<S>, outcome: { outcome: 'completed' | 'cancelled'; reason: string }): Promise<void>;
   /** Optional periodic maintenance, called on the kernel's maintenance interval. */
   sweep?(now: number): Promise<void>;
 }

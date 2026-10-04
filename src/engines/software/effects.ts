@@ -60,7 +60,7 @@ class PinnedMergeRefusedError extends GitHostError {
   }
 }
 
-const isTransient = (e: GitHostError) => e.status === undefined || e.status === 429 || e.status >= 500;
+export const isTransient = (e: GitHostError) => e.status === undefined || e.status === 429 || e.status >= 500;
 
 /**
  * The host retry policy shared by effects and run-input building: `fn` is retried on a transient

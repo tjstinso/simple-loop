@@ -3,8 +3,8 @@ import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
 import { EffectError, type ChainView, type DeadLetter, type Engine, type Job, type WorkspaceProvider } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { Workspace } from '../../runner/types.js';
-import { defaultSleep, runSoftwareEffect, withHostRetry } from './effects.js';
-import type { GitHost } from './github.js';
+import { defaultSleep, isTransient, runSoftwareEffect, withHostRetry } from './effects.js';
+import { GitHostError, type GitHost } from './github.js';
 import type { GitPorts } from './git-ports.js';
 import { buildSoftwareRunInput } from './run-input.js';
 import {
@@ -189,6 +189,51 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         LABEL_DEAD_LETTER,
         LABEL_READY_FOR_MERGE,
       ]);
+    },
+
+    async reconcile(chain) {
+      const s = chain.state;
+      if (s.phase !== 'awaiting_merge' && s.phase !== 'needs_human') return { outcome: 'none' };
+      let pr;
+      try {
+        pr = await deps.host.findPrByHead(s.repo, s.branch);
+      } catch (e) {
+        // Transient host failure: the next maintenance pass retries.
+        if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none' };
+        throw e;
+      }
+      if (!pr || pr.state === 'open') return { outcome: 'none' };
+      if (pr.state === 'merged') return { outcome: 'completed', reason: `Pull request #${pr.number} was merged` };
+      return {
+        outcome: 'cancelled',
+        reason: `Pull request #${pr.number} was closed without merging; this chain was cancelled`,
+      };
+    },
+
+    finalState: (state) => ({ ...state, phase: 'merged' }),
+
+    async afterReconcile(chain, outcome) {
+      const s = chain.state;
+      const errors: unknown[] = [];
+      try {
+        await deps.host.setLabels(s.repo, s.issueNumber, [], [
+          LABEL_READY_FOR_MERGE,
+          LABEL_NEEDS_HUMAN,
+          LABEL_IN_PROGRESS,
+          LABEL_DEAD_LETTER,
+        ]);
+      } catch (e) {
+        errors.push(e);
+      }
+      try {
+        const marker = `<!-- factory:chain=${chain.id} event=reconcile -->`;
+        if (!(await deps.host.findComment(s.repo, s.issueNumber, marker))) {
+          await deps.host.comment(s.repo, s.issueNumber, `${outcome.reason}.\n\n${marker}`);
+        }
+      } catch (e) {
+        errors.push(e);
+      }
+      if (errors.length > 0) throw errors[0];
     },
 
     async cleanup(chain, job) {

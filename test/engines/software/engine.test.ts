@@ -399,4 +399,52 @@ describe('software engine', () => {
       expect(titles).toEqual(['unfiled']); // the prune step still ran
     });
   });
+  describe('reconcile', () => {
+    const waiting = (over: Partial<SoftwareState> = {}) => chain(3, { phase: 'awaiting_merge', ...over });
+    const open = (host: FakeGitHost, state: 'open' | 'closed' | 'merged') => {
+      host.prs.set(9, { number: 9, state, headSha: 's', baseBranch: 'main', head: 'factory/issue-7', title: 't', body: 'b' });
+    };
+
+    it('maps a merged pull request to completed', async () => {
+      const { engine, host } = make();
+      open(host, 'merged');
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'completed', reason: 'Pull request #9 was merged' });
+    });
+
+    it('maps a pull request closed without merging to cancelled', async () => {
+      const { engine, host } = make();
+      open(host, 'closed');
+      expect(await engine.reconcile!(waiting({ phase: 'needs_human' }))).toEqual({
+        outcome: 'cancelled',
+        reason: 'Pull request #9 was closed without merging; this chain was cancelled',
+      });
+    });
+
+    it('leaves an open pull request and a missing one alone, with one lookup each', async () => {
+      const { engine, host } = make();
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
+      open(host, 'open');
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
+      expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead', 'findPrByHead']);
+    });
+
+    it.each([undefined, 429, 503])('treats host error status %s as transient', async (status) => {
+      const { engine, host } = make();
+      host.failNext('findPrByHead', new GitHostError('boom', status));
+      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
+    });
+
+    it('rethrows a non-transient host error', async () => {
+      const { engine, host } = make();
+      host.failNext('findPrByHead', new GitHostError('forbidden', 403));
+      await expect(engine.reconcile!(waiting())).rejects.toThrow('forbidden');
+    });
+
+    it('ignores chains that are not waiting on a person', async () => {
+      const { engine, host } = make();
+      open(host, 'merged');
+      expect(await engine.reconcile!(chain(3, { phase: 'reviewing' }))).toEqual({ outcome: 'none' });
+      expect(host.calls).toEqual([]);
+    });
+  });
 });
