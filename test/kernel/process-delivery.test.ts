@@ -560,4 +560,36 @@ describe('processDelivery', () => {
     });
     expect(listJobsForChain(s.db, chain.id)).toHaveLength(1);
   });
+
+  it('schedules transient retry when surfaceDeadLetter throws a transient error', async () => {
+    const s = setup();
+    const reported: Array<{ err: unknown; context: string }> = [];
+    s.deps.onError = (err, context) => reported.push({ err, context });
+    s.engine.surfaceDeadLetter = async () => {
+      throw new Error('Connection timed out');
+    };
+    s.engine.transition = () => ({
+      engineState: { count: 0 },
+      chainStatus: 'active',
+      newJobs: [],
+      effects: [{ kind: 'fail' }],
+    });
+    const chain = s.addChain();
+    const job = s.claim();
+    s.fake.script('echo', [new EffectError('github error', 'effect_error')]);
+
+    expect(await processDelivery(s.deps, job, 'w1', signal())).toBe('retry_scheduled');
+
+    // Dead letter is created but not surfaced
+    expect(listDeadLetters(s.db)[0]).toMatchObject({ jobId: job.id, surfacedAt: null });
+
+    // Job is requeued with backoff, not dead-lettered
+    const requeued = getJob(s.db, job.id);
+    expect(requeued.status).toBe('queued');
+    expect(requeued.transientRetries).toBe(1);
+    expect(requeued.availableAt).toBeGreaterThan(NOW);
+
+    // No error reported to onError
+    expect(reported).toHaveLength(0);
+  });
 });
