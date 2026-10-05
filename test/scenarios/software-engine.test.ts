@@ -348,7 +348,7 @@ describe('software engine scenarios', () => {
     expect(h.pr(BRANCH)).toEqual({ number: 8, state: 'open', labels: [READY], head: BRANCH });
   });
 
-  it('revise loop exhausts at 3 attempts and ends needs_human with the PR open', async () => {
+  it('three consecutive rejected attempts open the review breaker: the chain waits with the PR open', async () => {
     const h = harness();
     const { chain } = await h.submit(N);
     writesPerAttempt(h);
@@ -364,7 +364,9 @@ describe('software engine scenarios', () => {
     expect(outcomes.every((o) => o.outcome === 'succeeded')).toBe(true);
     const c = h.chain(chain.id);
     expect(c.status).toBe('waiting');
-    expect(c.state.phase).toBe('needs_human');
+    expect(c.state.phase).toBe('awaiting_merge');
+    expect(c.state.pendingFix).toMatchObject({ cls: 'review', feedback: 'no 3' });
+    expect(c.state.breakers?.review).toMatchObject({ consecutiveFailures: 3, opens: 1 });
     expect(c.state.attempt).toBe(3);
     expect(h.callsOf('execute')).toHaveLength(3);
     expect(h.callsOf('review')).toHaveLength(3);
@@ -373,7 +375,7 @@ describe('software engine scenarios', () => {
       'execute:2:succeeded', 'review:2:succeeded',
       'execute:3:succeeded', 'review:3:succeeded',
     ]);
-    expect(h.pr(BRANCH)).toEqual({ number: 8, state: 'open', labels: [NEEDS_HUMAN], head: BRANCH });
+    expect(h.pr(BRANCH)).toEqual({ number: 8, state: 'open', labels: [], head: BRANCH });
     expect(h.issueLabels(N)).toEqual([]);
     expect(h.deadLetters()).toEqual([]);
   });
@@ -608,7 +610,7 @@ describe('software engine scenarios', () => {
       { verdict: 'request_changes', feedback: 'c' },
     ]);
     await h.runUntilIdle();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human' } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
     await expect(h.kernel.enqueue('software', { issueUrl: url })).rejects.toBeInstanceOf(DuplicateChainError);
 
     await h.kernel.cancelChain(chain.id);
@@ -823,10 +825,10 @@ describe('software engine scenarios', () => {
       expect(outcomeComments(h)).toHaveLength(1);
     });
 
-    it('completes a needs_human chain whose pull request was merged', async () => {
+    it('completes a chain waiting on an open breaker whose pull request was merged', async () => {
       const h = harness();
       const chain = await driveToWaiting(h, 'reject');
-      expect(h.chain(chain.id).state.phase).toBe('needs_human');
+      expect(h.chain(chain.id).state.phase).toBe('awaiting_merge');
       h.host.prs.get(8)!.state = 'merged';
 
       expect(await h.maintain()).toEqual([]);

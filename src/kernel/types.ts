@@ -208,6 +208,13 @@ export interface Engine<S = unknown> {
   redact?(text: string): string;
   surfaceDeadLetter(chain: ChainView<S>, dl: DeadLetter): Promise<void>;
   /**
+   * Optional: called when a job fails with `runner_error` (before it would be dead-lettered). Returning
+   * an engine state absorbs the failure: the job ends without a result and the chain goes back to
+   * `waiting` with that state (the engine counted the failure itself and decides when to try again).
+   * Null: dead-letter as usual. A thrown error is reported and the job is dead-lettered.
+   */
+  absorbFailure?(chain: ChainView<S>, job: Job, reason: DeadLetterReason, error: string): Promise<S | null>;
+  /**
    * Optional: called by `Kernel.retryDeadLetter` after a dead-lettered job was re-queued, with the
    * chain view and the re-queued job (for example to clear a dead-letter marker on the subject).
    * Errors are swallowed: the retry stands.

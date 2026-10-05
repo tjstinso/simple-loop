@@ -67,7 +67,7 @@ describe('softwareTransition', () => {
   it('supervised approve labels the PR ready-for-merge and waits', () => {
     const t = softwareTransition(chainOf(baseState({ phase: 'reviewing' })), jobOf('review'), { verdict: 'approve', feedback: 'ok' });
     expect(t).toEqual({
-      engineState: baseState({ phase: 'awaiting_merge' }),
+      engineState: baseState({ phase: 'awaiting_merge', breakers: { review: { consecutiveFailures: 0, opens: 0 } } }),
       chainStatus: 'waiting',
       effects: [
         { kind: 'set_labels', target: 'pr', add: [LABEL_READY_FOR_MERGE], remove: [LABEL_IN_PROGRESS] },
@@ -81,7 +81,7 @@ describe('softwareTransition', () => {
     const s = baseState({ profile: 'automatic', phase: 'reviewing' });
     const t = softwareTransition(chainOf(s), jobOf('review'), { verdict: 'approve', feedback: 'ok' });
     expect(t).toEqual({
-      engineState: { ...s, phase: 'awaiting_merge' },
+      engineState: { ...s, phase: 'awaiting_merge', breakers: { review: { consecutiveFailures: 0, opens: 0 } } },
       chainStatus: 'waiting',
       effects: [
         { kind: 'merge_pr' },
@@ -97,28 +97,47 @@ describe('softwareTransition', () => {
       feedback: 'fix it',
     });
     expect(t).toEqual({
-      engineState: baseState({ attempt: attempt + 1, phase: 'executing' }),
+      engineState: baseState({ attempt: attempt + 1, phase: 'executing', breakers: { review: { consecutiveFailures: 1, opens: 0 } } }),
       chainStatus: 'active',
       effects: [],
       newJobs: [{ type: 'execute', attempt: attempt + 1, policyKind: 'execute', labels, payload: { feedback: 'fix it' } }],
     });
   });
 
-  it('request_changes at the max attempt ends in needs_human', () => {
-    const max = PROFILES.supervised.maxAttempts;
-    const t = softwareTransition(chainOf(baseState({ attempt: max, phase: 'reviewing' })), jobOf('review', max), {
-      verdict: 'request_changes',
-      feedback: 'no',
-    });
+  it('the request_changes that reaches the failure threshold opens the review breaker and the chain waits', () => {
+    const now = 1_000_000;
+    const before = baseState({ attempt: 3, phase: 'reviewing', breakers: { review: { consecutiveFailures: 2, opens: 0 } } });
+    const t = softwareTransition(chainOf(before), jobOf('review', 3), { verdict: 'request_changes', feedback: 'no' }, { now });
     expect(t).toEqual({
-      engineState: baseState({ attempt: max, phase: 'needs_human' }),
+      engineState: baseState({
+        attempt: 3,
+        phase: 'awaiting_merge',
+        breakers: { review: { consecutiveFailures: 3, opens: 1, openUntil: now + 600_000 } },
+        pendingFix: { cls: 'review', feedback: 'no' },
+      }),
       chainStatus: 'waiting',
-      effects: [
-        { kind: 'set_labels', target: 'pr', add: [LABEL_NEEDS_HUMAN], remove: [LABEL_IN_PROGRESS] },
-        { kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] },
-      ],
+      effects: [{ kind: 'set_labels', target: 'issue', add: [], remove: [LABEL_IN_PROGRESS] }],
       newJobs: [],
     });
+  });
+
+  it('the review breaker opening for the maxOpens-th time raises an ask', () => {
+    const now = 1_000_000;
+    const before = baseState({ attempt: 3, phase: 'reviewing', lastPushedSha: 'abc', breakers: { review: { consecutiveFailures: 2, opens: 2 } } });
+    const t = softwareTransition(chainOf(before), jobOf('review', 3), { verdict: 'request_changes', feedback: 'no' }, { now });
+    expect(t.engineState.phase).toBe('needs_input');
+    expect(t.engineState.ask).toMatchObject({ class: 'review', at: new Date(now).toISOString() });
+    expect(t.effects[0]).toMatchObject({ kind: 'comment', target: 'pr' });
+    expect(t.effects[1]).toEqual({ kind: 'set_labels', target: 'issue', add: [LABEL_NEEDS_HUMAN], remove: [LABEL_IN_PROGRESS] });
+  });
+
+  it('an execute result with an ask waits for an answer: no push, no breaker touched', () => {
+    const t = softwareTransition(chainOf(baseState()), jobOf('execute'), { status: 'ok', summary: 'stuck', ask: { question: 'A or B?', options: ['A', 'B'] } }, { now: 5 });
+    expect(t.chainStatus).toBe('waiting');
+    expect(t.newJobs).toEqual([]);
+    expect(t.engineState.phase).toBe('needs_input');
+    expect(t.engineState.breakers).toBeUndefined();
+    expect(t.effects.map((e) => e.kind)).toEqual(['comment', 'set_labels']);
   });
 
   it('followups from any result add a file_followups effect', () => {

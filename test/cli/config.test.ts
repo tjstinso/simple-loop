@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { loadConfig } from '../../src/cli/config.js';
+import { deprecationWarnings, resolveBreakers, loadConfig } from '../../src/cli/config.js';
 
 const dirs: string[] = [];
 const tmp = () => {
@@ -29,9 +29,7 @@ describe('loadConfig', () => {
       keepWorktreeOnFailure: true,
       keptWorktreeMaxAgeMs: 604800000,
       allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
-      maxHumanRounds: 5,
-      maxConflictRounds: 2,
-      maxCiRounds: 2,
+      chainBudgetUsd: 25,
       leaseMs: 300000,
       heartbeatMs: 30000,
       maintenanceMs: 60000,
@@ -162,5 +160,39 @@ describe('loadConfig repos', () => {
     expect(load({ 'o/r': { verify: [['npm', '']] } })).toThrow(/repos/);
     expect(load({ 'o/r': { maxVerifyRounds: 0 } })).toThrow(/maxVerifyRounds/);
     expect(load({ 'noslash': {} })).toThrow(/repos\.noslash/);
+  });
+});
+
+describe('breaker settings', () => {
+  const load = (cfg: object) => {
+    const d = tmp();
+    writeFileSync(join(d, 'factory.config.json'), JSON.stringify(cfg));
+    return loadConfig(undefined, d);
+  };
+
+  it('defaults chainBudgetUsd to 25 and refuses less than 1', () => {
+    expect(load({}).chainBudgetUsd).toBe(25);
+    expect(() => load({ chainBudgetUsd: 0.5 })).toThrow(/chainBudgetUsd/);
+  });
+
+  it('takes failureThreshold, cooldownMs and maxOpens per class and refuses unknown keys', () => {
+    const c = load({ breakers: { ci: { failureThreshold: 4, cooldownMs: 1000, maxOpens: 2 } } });
+    expect(resolveBreakers(c).ci).toEqual({ failureThreshold: 4, cooldownMs: 1000, maxOpens: 2 });
+    expect(() => load({ breakers: { nope: {} } })).toThrow();
+  });
+
+  it('the deprecated max*Rounds settings are aliases for failureThreshold, with a warning naming the replacement', () => {
+    const c = load({ maxConflictRounds: 4, maxCiRounds: 5, maxHumanRounds: 6, breakers: { ci: { failureThreshold: 9 } } });
+    expect(deprecationWarnings(c)).toEqual([
+      expect.stringContaining('breakers.conflict.failureThreshold'),
+      expect.stringContaining('breakers.ci.failureThreshold'),
+      expect.stringContaining('breakers.human.failureThreshold'),
+    ]);
+    const b = resolveBreakers(c);
+    expect(b.conflict).toEqual({ failureThreshold: 4 });
+    expect(b.human).toEqual({ failureThreshold: 6 });
+    // An explicit breakers value wins over the alias.
+    expect(b.ci).toEqual({ failureThreshold: 9 });
+    expect(deprecationWarnings(load({}))).toEqual([]);
   });
 });

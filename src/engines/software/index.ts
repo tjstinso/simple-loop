@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { recordEvent } from '../../kernel/events.js';
+import { costOf } from '../../kernel/queue.js';
 import { pruneFiledFollowups, sweepUnfiledFollowups } from './followups.js';
 import {
   EffectError,
@@ -38,6 +39,12 @@ import {
 } from './schemas.js';
 import { buildCiFeedback, failingChecks, MAX_CI_EXCERPTS, CI_EXCERPT_LINES } from './ci.js';
 import { MAX_CONFLICT_PATHS } from './conflict.js';
+import { askMarker, buildAskComment, triedText } from './ask.js';
+import {
+  BREAKER_CLASSES, canAttempt, DEFAULT_BREAKER_POLICY, isExhausted, modeOf, onFailure, onSuccess,
+  type BreakerClass, type BreakerPolicy, type Breakers,
+} from './breaker.js';
+import { roundClass } from './transition.js';
 import { PROFILES } from './profiles.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 import { softwareSubmit } from './submit.js';
@@ -60,12 +67,10 @@ export interface SoftwareEngineDeps {
     keptWorktreeMaxAgeMs?: number;
     /** Whose pull request feedback counts (default OWNER, MEMBER, COLLABORATOR). */
     allowedAuthorAssociations?: string[];
-    /** Human feedback rounds one chain accepts (default 5). */
-    maxHumanRounds?: number;
-    /** Conflict rounds (merging the base branch into the pull request) one chain gets (default 2). */
-    maxConflictRounds?: number;
-    /** CI rounds (revisions for failing required checks) one chain gets (default 2). */
-    maxCiRounds?: number;
+    /** Circuit breaker policy per failure class (unset values use the defaults of breaker.ts). */
+    breakers?: Partial<Record<BreakerClass, Partial<BreakerPolicy>>>;
+    /** Recorded cost (USD) above which a chain gets no more automatic rounds and raises an ask (default 25). */
+    chainBudgetUsd?: number;
     /** Per repository (`owner/name`): setup and verification commands (a repository without an entry has none). */
     repos?: Record<string, RepoToolSettings>;
   };
@@ -116,9 +121,64 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     baselines.delete(key(chainId, jobId, delivery));
   };
   const allowedAuthorAssociations = deps.config.allowedAuthorAssociations ?? [...DEFAULT_ALLOWED_AUTHOR_ASSOCIATIONS];
-  const maxHumanRounds = Math.max(1, deps.config.maxHumanRounds ?? 5);
-  const maxConflictRounds = Math.max(1, deps.config.maxConflictRounds ?? 2);
-  const maxCiRounds = Math.max(1, deps.config.maxCiRounds ?? 2);
+  const policyOf = (cls: BreakerClass): BreakerPolicy => ({ ...DEFAULT_BREAKER_POLICY, ...deps.config.breakers?.[cls] });
+  const chainBudgetUsd = Math.max(1, deps.config.chainBudgetUsd ?? 25);
+  const chainEvent = (chainId: number, kind: string, detail: Record<string, unknown>, jobId?: number) =>
+    recordEvent(deps.db, { at: deps.now(), chainId, ...(jobId === undefined ? {} : { jobId }), kind, engine: 'software', detail });
+  const nowIso = () => new Date(deps.now()).toISOString();
+
+  /** The cost recorded for the chain's jobs so far. */
+  function chainCostUsd(chainId: number): number {
+    const rows = deps.db.prepare('SELECT result FROM jobs WHERE chain_id = ?').all(chainId) as { result: string | null }[];
+    return rows.reduce((sum, r) => sum + (costOf(r.result) ?? 0), 0);
+  }
+
+  /** Records `breaker.opened` / `breaker.closed` for what changed between two breaker sets (once per job and class when a job is given). */
+  function breakerEvents(chainId: number, before: Breakers | undefined, after: Breakers | undefined, jobId?: number): void {
+    const seen = (kind: string, cls: string) =>
+      jobId !== undefined &&
+      deps.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = ? AND detail LIKE ?`).get(jobId, kind, `%"class":"${cls}"%`) !== undefined;
+    for (const cls of BREAKER_CLASSES) {
+      const b = before?.[cls];
+      const a = after?.[cls];
+      if ((a?.opens ?? 0) > (b?.opens ?? 0) && !seen('breaker.opened', cls)) {
+        chainEvent(chainId, 'breaker.opened', { class: cls, failures: a!.consecutiveFailures, cooldownMs: Math.max(0, (a!.openUntil ?? 0) - deps.now()) }, jobId);
+      }
+      const wasDirty = (b?.opens ?? 0) > 0;
+      const isClean = a === undefined || (a.consecutiveFailures === 0 && a.opens === 0);
+      if (wasDirty && isClean && !seen('breaker.closed', cls)) chainEvent(chainId, 'breaker.closed', { class: cls }, jobId);
+    }
+  }
+
+  /**
+   * Hands the chain to a person with a question: one marker-guarded comment on the pull request (the
+   * issue when there is none), the `factory:needs-human` label and the `needs_input` phase.
+   */
+  async function raiseAsk(
+    s: SoftwareState,
+    chainId: number,
+    prNumber: number | undefined,
+    question: string,
+    context: string,
+    reason: string,
+    cls?: BreakerClass,
+  ): Promise<SoftwareState> {
+    const askId = `${chainId}-${deps.now()}`;
+    await commentOnce(s.repo, prNumber ?? s.issueNumber, askMarker(chainId, askId), buildAskComment(redact(question), redact(context), triedText(s.breakers)));
+    await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], [LABEL_IN_PROGRESS]);
+    chainEvent(chainId, 'ask.raised', { reason, ...(cls === undefined ? {} : { class: cls }), askId });
+    const next: SoftwareState = {
+      ...s,
+      phase: 'needs_input',
+      ask: { id: askId, question, reason, ...(cls === undefined ? {} : { class: cls }), at: nowIso() },
+      feedbackHandledAt: nowIso(),
+    };
+    delete next.conflictActive;
+    delete next.ciActive;
+    delete next.humanActive;
+    delete next.pendingFix;
+    return next;
+  }
   // Passes in a row a chain's pull request reported `unknown` mergeability (not persisted: a restart starts counting again).
   const unknownPasses = new Map<number, number>();
   const unknownLogged = new Set<number>();
@@ -191,13 +251,117 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   }
 
   /**
-   * The factory's pull request is open and waiting: starts a revision when a person left feedback
-   * since `feedbackHandledAt`, or hands over (`needs_human`) when the chain used its human rounds.
+   * Decides whether an automatic round of class `cls` may start now. Null: go (a half-open breaker
+   * gets its one trial). Otherwise the chain keeps waiting, or an ask is raised when the chain's cost
+   * went over the budget (`budget` rounds only) or the breaker opened `maxOpens` times.
    */
-  async function reconcileFeedback(s: SoftwareState, chainId: number, prNumber: number): Promise<ReconcileOutcome<SoftwareState>> {
+  async function gate(s: SoftwareState, chainId: number, pr: Pr, cls: BreakerClass, opts: { budget: boolean }): Promise<ReconcileOutcome<SoftwareState> | null> {
+    const now = deps.now();
+    if (opts.budget) {
+      const spent = chainCostUsd(chainId) - (s.costBaseUsd ?? 0);
+      if (spent > chainBudgetUsd) {
+        const next = await raiseAsk(
+          s, chainId, pr.number,
+          `This chain spent $${spent.toFixed(2)}, over its budget of $${chainBudgetUsd} (\`chainBudgetUsd\`). Should the factory keep working on it?`,
+          'The factory stops automatic rounds for a chain over its budget so a loop cannot spend without bound.',
+          'chain budget exceeded',
+        );
+        return { outcome: 'update', reason: 'chain budget exceeded', engineState: next };
+      }
+    }
+    const b = s.breakers?.[cls];
+    if (isExhausted(b, policyOf(cls))) {
+      const next = await raiseAsk(
+        s, chainId, pr.number,
+        `Automatic ${cls} rounds failed repeatedly; what should the factory do?`,
+        `The ${cls} breaker opened ${b?.opens ?? 0} time(s), the most it does before asking.`,
+        `breaker ${cls} opened ${b?.opens ?? 0} times`,
+        cls,
+      );
+      return { outcome: 'update', reason: `breaker ${cls} exhausted`, engineState: next };
+    }
+    if (!canAttempt(b, now)) return { outcome: 'none', check: `cool-down (${cls}, until ${new Date(b!.openUntil!).toISOString()})` };
+    if (modeOf(b, now) === 'half_open') chainEvent(chainId, 'breaker.half_open', { class: cls });
+    return null;
+  }
+
+  /** The state a new round starts from: one class flag set, the others cleared. */
+  function roundState(s: SoftwareState, flag: 'conflictActive' | 'ciActive' | 'humanActive' | null): SoftwareState {
+    const attempt = s.attempt + 1;
+    const next: SoftwareState = { ...s, phase: 'executing', attempt, attemptBase: s.attempt, conflictActive: false, ciActive: false, humanActive: false };
+    if (flag !== null) next[flag] = true;
+    delete next.pendingFix;
+    delete next.ciVerifying;
+    return next;
+  }
+
+  /**
+   * A round the reviewer rejected while its breaker was open: tried again once the breaker lets it
+   * (the pull request keeps the pushed work, the agent gets the reviewer's feedback again).
+   */
+  async function reconcilePendingFix(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
+    const fix = s.pendingFix;
+    if (!fix) return null;
+    const held = await gate(s, chainId, pr, fix.cls, { budget: fix.cls !== 'human' });
+    if (held) return held;
+    const next = roundState(s, fix.cls === 'conflict' ? 'conflictActive' : fix.cls === 'ci' ? 'ciActive' : fix.cls === 'human' ? 'humanActive' : null);
+    const marker = fix.cls === 'conflict' ? { conflictRound: next.attempt } : fix.cls === 'ci' ? { ciRound: next.attempt } : fix.cls === 'human' ? { humanRound: next.attempt } : {};
+    return {
+      outcome: 'new_work',
+      reason: `${fix.cls} retry after review feedback`,
+      engineState: next,
+      job: { type: 'execute', attempt: next.attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: fix.feedback, ...marker } },
+    };
+  }
+
+  /**
+   * The chain asked a question: a comment, review or push after it is the answer. The chain resumes as
+   * a human feedback round with the question and the answer, and every breaker starts again.
+   */
+  async function reconcileAnswer(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState>> {
+    const ask = s.ask;
+    if (!ask) return { outcome: 'none' };
     let feedback;
     try {
-      feedback = await deps.host.listPrFeedback(s.repo, prNumber);
+      feedback = await deps.host.listPrFeedback(s.repo, pr.number);
+    } catch (e) {
+      if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none', check: transientCheck(e) };
+      throw e;
+    }
+    const plan = planFeedbackRound(feedback, { feedbackHandledAt: ask.at }, { allowedAuthorAssociations });
+    const pushed = s.lastPushedSha !== undefined && pr.headSha !== s.lastPushedSha;
+    if (!plan.round && !pushed) return { outcome: 'none' };
+    const answer = plan.round ? plan.text : `A person pushed commit ${pr.headSha.slice(0, 7)} to the branch after the question.`;
+    await deps.host.setLabels(s.repo, s.issueNumber, [], [LABEL_NEEDS_HUMAN]);
+    await deps.host.setLabels(s.repo, pr.number, [], [LABEL_NEEDS_HUMAN, LABEL_READY_FOR_MERGE]);
+    chainEvent(chainId, 'ask.answered', { askId: ask.id });
+    chainEvent(chainId, 'breaker.closed', { reason: 'ask answered' });
+    const next = roundState(s, 'humanActive');
+    delete next.ask;
+    next.breakers = {};
+    next.feedbackBefore = ask.at;
+    next.feedbackHandledAt = plan.round ? plan.newestAt : nowIso();
+    next.costBaseUsd = chainCostUsd(chainId);
+    return {
+      outcome: 'new_work',
+      reason: 'ask answered',
+      engineState: next,
+      job: {
+        type: 'execute', attempt: next.attempt, policyKind: 'execute', labels: s.labels,
+        payload: { feedback: `The factory asked: ${ask.question}\n\nThe answer:\n${answer}`, humanRound: next.attempt, feedbackItems: plan.round ? plan.refs : [] },
+      },
+    };
+  }
+
+  /**
+   * The factory's pull request is open and waiting: starts a revision when a person left feedback
+   * since `feedbackHandledAt` (a person's feedback is never a failure; only the human breaker, which
+   * counts the factory's own failed rounds, can make it wait).
+   */
+  async function reconcileFeedback(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState>> {
+    let feedback;
+    try {
+      feedback = await deps.host.listPrFeedback(s.repo, pr.number);
     } catch (e) {
       // Transient host failure: the next maintenance pass retries.
       if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none', check: transientCheck(e) };
@@ -205,44 +369,23 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     }
     const plan = planFeedbackRound(feedback, s, { allowedAuthorAssociations });
     if (!plan.round) return { outcome: 'none' };
-    const rounds = s.humanRounds ?? 0;
-    if (rounds >= maxHumanRounds) {
-      await commentOnce(
-        s.repo,
-        prNumber,
-        `<!-- factory:chain=${chainId} event=human-round-limit -->`,
-        `The factory has already revised this pull request for ${rounds} round(s) of feedback, the most it accepts for one chain, so it will not act on newer feedback. A person has to take over.`,
-      );
-      await deps.host.setLabels(s.repo, prNumber, [LABEL_NEEDS_HUMAN], []);
-      return {
-        outcome: 'update',
-        reason: `human feedback rounds exhausted (${maxHumanRounds})`,
-        engineState: { ...s, phase: 'needs_human', feedbackHandledAt: plan.newestAt },
-      };
-    }
-    const attempt = s.attempt + 1;
-    const round = rounds + 1;
+    const held = await gate(s, chainId, pr, 'human', { budget: false });
+    if (held) return held;
+    const next = roundState(s, 'humanActive');
+    next.feedbackHandledAt = plan.newestAt;
+    if (s.feedbackHandledAt !== undefined) next.feedbackBefore = s.feedbackHandledAt;
     return {
       outcome: 'new_work',
-      reason: `feedback round ${round}`,
-      engineState: {
-        ...s,
-        phase: 'executing',
-        attempt,
-        attemptBase: s.attempt,
-        humanRounds: round,
-        feedbackHandledAt: plan.newestAt,
-        conflictActive: false,
-        ciActive: false,
-      },
-      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: round, feedbackItems: plan.refs } },
+      reason: `feedback round (attempt ${next.attempt})`,
+      engineState: next,
+      job: { type: 'execute', attempt: next.attempt, policyKind: 'execute', labels: s.labels, payload: { feedback: plan.text, humanRound: next.attempt, feedbackItems: plan.refs } },
     };
   }
 
   /**
    * The waiting chain's pull request stopped being mergeable: starts a conflict round (the base branch
-   * is merged into the branch and the agent resolves the conflicts), or hands over when the chain used
-   * its conflict rounds. Null when there is nothing to do for conflicts (feedback is looked at next).
+   * is merged into the branch and the agent resolves the conflicts) unless the conflict breaker or the
+   * chain budget holds it back. Null when there is nothing to do for conflicts (feedback is looked at next).
    */
   async function reconcileConflict(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
     const event = (kind: string, detail: Record<string, unknown>) =>
@@ -265,37 +408,22 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     }
     unknownPasses.delete(chainId);
     unknownLogged.delete(chainId);
-    if (s.conflictGaveUp) return null;
-    const rounds = s.conflictRounds ?? 0;
-    if (rounds >= maxConflictRounds) {
-      await commentOnce(
-        s.repo,
-        pr.number,
-        `<!-- factory:chain=${chainId} event=conflict-round-limit -->`,
-        `This pull request conflicts with \`${pr.baseBranch}\` again, but the factory already resolved conflicts ${rounds} time(s), the most it does for one chain (\`maxConflictRounds\`). A person has to resolve the conflicts.`,
-      );
-      await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], []);
-      event('conflict.gave_up', { reason: `conflict rounds exhausted (${maxConflictRounds})` });
-      return {
-        outcome: 'update',
-        reason: `conflict rounds exhausted (${maxConflictRounds})`,
-        engineState: { ...s, phase: 'needs_human', conflictGaveUp: true },
-      };
-    }
-    const attempt = s.attempt + 1;
-    const round = rounds + 1;
+    const held = await gate(s, chainId, pr, 'conflict', { budget: true });
+    if (held) return held;
+    // A new base head after a success is a new problem: it starts a round without counting against the breaker.
+    const next = roundState(s, 'conflictActive');
     return {
       outcome: 'new_work',
-      reason: `conflict round ${round}`,
-      engineState: { ...s, phase: 'executing', attempt, attemptBase: s.attempt, conflictRounds: round, conflictActive: true, ciActive: false },
-      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { conflictRound: round } },
+      reason: `conflict round (attempt ${next.attempt})`,
+      engineState: next,
+      job: { type: 'execute', attempt: next.attempt, policyKind: 'execute', labels: s.labels, payload: { conflictRound: next.attempt } },
     };
   }
 
   /**
    * The waiting chain's pull request still has the commit the chain pushed, and the required checks of
    * exactly that commit failed: starts a CI round (the agent gets the failing checks and the end of
-   * their logs), or hands over when the chain used its CI rounds. Null when there is nothing to do:
+   * their logs) unless the CI breaker or the chain budget holds it back. Null when there is nothing to do:
    * checks pending, passing or absent, another head, or a transient host failure (retried next pass).
    * Merging stays with GitHub's branch protection; nothing here blocks or performs a merge.
    */
@@ -310,22 +438,26 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       if (e instanceof GitHostError && isTransient(e)) return { outcome: 'none', check: transientCheck(e) };
       throw e;
     }
+    if (s.ciVerifying && status.state === 'passing') {
+      const breakers = { ...s.breakers, ci: onSuccess() };
+      breakerEvents(chainId, s.breakers, breakers);
+      const next = { ...s, breakers };
+      delete next.ciVerifying;
+      return { outcome: 'update', reason: 'ci passes after the round', engineState: next };
+    }
     if (status.state !== 'failing') return null;
+    if (s.ciVerifying) {
+      // The agent's fix did not make the checks of the pushed head pass: a failure of the class.
+      const breakers = { ...s.breakers, ci: onFailure(s.breakers?.ci, deps.now(), policyOf('ci')) };
+      breakerEvents(chainId, s.breakers, breakers);
+      const next = { ...s, breakers };
+      delete next.ciVerifying;
+      return { outcome: 'update', reason: 'ci still fails after the round', engineState: next };
+    }
     const failing = failingChecks(status);
     const names = failing.map((c) => redact(c.name));
-    const rounds = s.ciRounds ?? 0;
-    if (rounds >= maxCiRounds) {
-      const list = names.map((n) => `\`${n.replace(/[`\s]+/g, ' ').trim().slice(0, 100)}\``).join(', ');
-      await commentOnce(
-        s.repo,
-        pr.number,
-        `<!-- factory:chain=${chainId} event=ci-round-limit -->`,
-        `The required checks failed again (${list}), but the factory already revised this pull request for failing checks ${rounds} time(s), the most it does for one chain (\`maxCiRounds\`). A person has to fix them.`,
-      );
-      await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], []);
-      event('ci.gave_up', { reason: `ci rounds exhausted (${maxCiRounds})`, checks: names });
-      return { outcome: 'update', reason: `ci rounds exhausted (${maxCiRounds})`, engineState: { ...s, phase: 'needs_human' } };
-    }
+    const held = await gate(s, chainId, pr, 'ci', { budget: true });
+    if (held) return held;
     // Logs are best effort: a check without a run (or whose log cannot be read) is listed without one.
     const excerpts = new Map<string, string>();
     const byRun = new Map<number, string | null>();
@@ -342,14 +474,13 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       if (log) excerpts.set(c.name, log);
     }
     const feedback = buildCiFeedback(status, excerpts, deps.secretValues?.() ?? []);
-    const attempt = s.attempt + 1;
-    const round = rounds + 1;
-    event('ci.failed', { checks: names, round });
+    const next = roundState(s, 'ciActive');
+    event('ci.failed', { checks: names, round: next.attempt });
     return {
       outcome: 'new_work',
-      reason: `ci round ${round}`,
-      engineState: { ...s, phase: 'executing', attempt, attemptBase: s.attempt, ciRounds: round, ciActive: true, conflictActive: false },
-      job: { type: 'execute', attempt, policyKind: 'execute', labels: s.labels, payload: { feedback, ciRound: round } },
+      reason: `ci round (attempt ${next.attempt})`,
+      engineState: next,
+      job: { type: 'execute', attempt: next.attempt, policyKind: 'execute', labels: s.labels, payload: { feedback, ciRound: next.attempt } },
     };
   }
 
@@ -377,22 +508,16 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       deleted_modified: 'a file was deleted on one side and modified on the other',
       too_many: `more than ${MAX_CONFLICT_PATHS} files conflict`,
     }[info.refusal];
-    if (pr) {
-      await commentOnce(
-        s.repo,
-        pr.number,
-        `<!-- factory:chain=${chain.id} event=conflict-gave-up -->`,
-        `This pull request conflicts with \`${info.baseBranch}\`, and the factory does not resolve it itself: ${why}. A person has to resolve the conflicts.`,
-      );
-    }
-    await deps.host.setLabels(s.repo, s.issueNumber, [LABEL_NEEDS_HUMAN], [LABEL_IN_PROGRESS]);
     event('conflict.gave_up', { reason: why });
-    throw new HandBackError(`conflict not resolvable by the agent: ${why}`, {
-      ...s,
-      phase: 'needs_human',
-      conflictActive: false,
-      conflictGaveUp: true,
-    });
+    // Not resolvable by the agent: a question to a person, answered by a comment or by resolving it themselves.
+    const asked = await raiseAsk(
+      s, chain.id, pr?.number,
+      `This pull request conflicts with \`${info.baseBranch}\`, and the factory does not resolve it itself: ${why}. Please resolve the conflicts (push the resolution or comment how to proceed).`,
+      `The conflict is not one the agent may resolve: ${why}.`,
+      'conflict not resolvable by the agent',
+      'conflict',
+    );
+    throw new HandBackError(`conflict not resolvable by the agent: ${why}`, asked);
   }
 
   const jobEvent = (chain: ChainView<any>, job: Job, kind: string, detail: Record<string, unknown>) =>
@@ -609,9 +734,10 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     async verify(chain, job, ws, result, rerun, signal) {
       const cfg = deps.config.repos?.[chain.state.repo];
       const commands = cfg?.verify ?? [];
-      const first = result as { status?: string; costUsd?: number };
+      const first = result as { status?: string; costUsd?: number; ask?: unknown };
       const sws = ws as SoftwareWorkspace;
-      if (job.type !== 'execute' || first.status !== 'ok') return result;
+      // An ask leaves the work unfinished on purpose: nothing is validated, committed or pushed.
+      if (job.type !== 'execute' || first.status !== 'ok' || first.ask !== undefined) return result;
       const maxRounds = Math.max(1, cfg?.maxVerifyRounds ?? 3);
       const timeoutMs = cfg?.verifyTimeoutMs ?? 600_000;
       const sleep = deps.sleep ?? defaultSleep;
@@ -689,7 +815,16 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     transition(chain, job, result) {
       try {
-        const t = softwareTransition(chain, job, result);
+        const t = softwareTransition(chain, job, result, { now: deps.now(), policy: policyOf });
+        breakerEvents(chain.id, chain.state.breakers, t.engineState.breakers, job.id);
+        if (job.type === 'execute' && t.engineState.phase === 'needs_input' && t.engineState.ask !== undefined) {
+          const seen = deps.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'ask.raised'`).get(job.id);
+          if (!seen) chainEvent(chain.id, 'ask.raised', { reason: t.engineState.ask.reason, askId: t.engineState.ask.id }, job.id);
+        }
+        if (job.type === 'review' && t.engineState.phase === 'needs_input' && t.engineState.ask !== undefined) {
+          const seen = deps.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND kind = 'ask.raised'`).get(job.id);
+          if (!seen) chainEvent(chain.id, 'ask.raised', { reason: t.engineState.ask.reason, class: t.engineState.ask.class, askId: t.engineState.ask.id }, job.id);
+        }
         // The one event the pure transition cannot carry as an effect: recorded once per job (a
         // retry that keeps the result computes the same verdict again).
         if (job.type === 'review') {
@@ -838,9 +973,42 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     redact,
 
+    async absorbFailure(chain, job, reason, error) {
+      const s = chain.state;
+      // Only a round of a class counts; a transient failure is retried by the kernel and never counted.
+      if (job.type !== 'execute' || reason !== 'runner_error' || error.startsWith('transient_retries_exhausted')) return null;
+      if (s.phase !== 'executing' || !(s.conflictActive || s.ciActive || s.humanActive)) return null;
+      const cls = roundClass(s);
+      const failed = onFailure(s.breakers?.[cls], deps.now(), policyOf(cls));
+      const breakers: Breakers = { ...s.breakers, [cls]: failed };
+      breakerEvents(chain.id, s.breakers, breakers, job.id);
+      chainEvent(chain.id, 'round.failed', { class: cls, error: redact(error).slice(0, 300) }, job.id);
+      let next: SoftwareState = { ...s, breakers, phase: 'awaiting_merge' };
+      delete next.conflictActive;
+      delete next.ciActive;
+      delete next.humanActive;
+      if (s.humanActive) {
+        // The person's feedback is still unanswered: it is looked at again.
+        if (s.feedbackBefore === undefined) delete next.feedbackHandledAt;
+        else next.feedbackHandledAt = s.feedbackBefore;
+        delete next.feedbackBefore;
+      }
+      if (isExhausted(failed, policyOf(cls))) {
+        const pr = await withHostRetry(() => deps.host.findPrByHead(s.repo, s.branch), deps.sleep ?? defaultSleep);
+        next = await raiseAsk(
+          next, chain.id, pr?.number,
+          `Automatic ${cls} rounds failed repeatedly; what should the factory do?`,
+          `The ${cls} breaker opened ${failed.opens} time(s). The last error: ${error.slice(0, 500)}`,
+          `breaker ${cls} opened ${failed.opens} times`,
+          cls,
+        );
+      }
+      return next;
+    },
+
     async reconcile(chain) {
       const s = chain.state;
-      if (s.phase !== 'awaiting_merge' && s.phase !== 'needs_human') return { outcome: 'none' };
+      if (s.phase !== 'awaiting_merge' && s.phase !== 'needs_human' && s.phase !== 'needs_input') return { outcome: 'none' };
       let pr;
       try {
         pr = await deps.host.findPrByHead(s.repo, s.branch);
@@ -855,10 +1023,13 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         if (replied) return replied;
         // A conflict comes first; feedback is looked at on a later pass or when there is no conflict.
         // Then failing CI checks, then feedback (each on a later pass when an earlier one started a round).
+        if (s.phase === 'needs_input') return reconcileAnswer(s, chain.id, pr);
+        const fix = await reconcilePendingFix(s, chain.id, pr);
+        if (fix) return fix;
         const conflict = await reconcileConflict(s, chain.id, pr);
         if (conflict) return conflict;
         const ci = await reconcileCi(s, chain.id, pr);
-        return ci ?? reconcileFeedback(s, chain.id, pr.number);
+        return ci ?? reconcileFeedback(s, chain.id, pr);
       }
       if (pr.state === 'merged') return { outcome: 'completed', reason: `Pull request #${pr.number} was merged` };
       return {

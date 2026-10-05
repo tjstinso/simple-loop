@@ -14,7 +14,7 @@ import { resolvePolicies, type EffectivePolicy } from '../policy/resolve.js';
 import { PolicyStore } from '../policy/store.js';
 import { ClaudeCliRunner } from '../runner/claude-cli.js';
 import { RunnerRegistry } from '../runner/registry.js';
-import type { FactoryConfig } from './config.js';
+import { deprecationWarnings, resolveBreakers, type FactoryConfig } from './config.js';
 
 export interface Runtime {
   kernel: Kernel;
@@ -45,6 +45,7 @@ function passEnvNames(policies: readonly Policy[]): string[] {
 /** The production composition root. Not used by tests. */
 export function buildRuntime(config: FactoryConfig): Runtime {
   const clock = () => Date.now();
+  for (const w of deprecationWarnings(config)) console.error(`warning: ${w}`);
   const db = openDb(config.dbPath);
   let lazy: LazyGithubAuth | undefined;
   try {
@@ -101,9 +102,8 @@ export function buildRuntime(config: FactoryConfig): Runtime {
         historyRetentionDays: config.historyRetentionDays,
         keptWorktreeMaxAgeMs: config.keptWorktreeMaxAgeMs,
         allowedAuthorAssociations: config.allowedAuthorAssociations,
-        maxHumanRounds: config.maxHumanRounds,
-        maxConflictRounds: config.maxConflictRounds,
-        maxCiRounds: config.maxCiRounds,
+        breakers: resolveBreakers(config),
+        chainBudgetUsd: config.chainBudgetUsd,
         ...(config.repos === undefined ? {} : { repos: config.repos }),
       },
       workspaceRoot: config.workspaceRoot,

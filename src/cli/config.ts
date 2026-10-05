@@ -30,6 +30,14 @@ export const RepoToolSchema = z
   .strict();
 export type RepoToolConfig = z.infer<typeof RepoToolSchema>;
 
+const BreakerConfigSchema = z
+  .object({
+    failureThreshold: z.number().int().min(1).optional(),
+    cooldownMs: z.number().int().min(1).optional(),
+    maxOpens: z.number().int().min(1).optional(),
+  })
+  .strict();
+
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
   policiesDir: z.string().min(1).optional(),
@@ -43,9 +51,17 @@ const ConfigSchema = z.object({
   keepWorktreeOnFailure: z.boolean().default(true),
   keptWorktreeMaxAgeMs: z.number().nonnegative().default(604_800_000),
   allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
-  maxHumanRounds: z.number().int().min(1).default(5),
-  maxConflictRounds: z.number().int().min(1).default(2),
-  maxCiRounds: z.number().int().min(1).default(2),
+  // Deprecated for one release: aliases for `breakers.<class>.failureThreshold` (see `deprecationWarnings`).
+  maxHumanRounds: z.number().int().min(1).optional(),
+  maxConflictRounds: z.number().int().min(1).optional(),
+  maxCiRounds: z.number().int().min(1).optional(),
+  breakers: z.object({
+    conflict: BreakerConfigSchema.optional(),
+    ci: BreakerConfigSchema.optional(),
+    human: BreakerConfigSchema.optional(),
+    review: BreakerConfigSchema.optional(),
+  }).strict().optional(),
+  chainBudgetUsd: z.number().min(1).default(25),
   maxConcurrentJobs: z.number().int().min(1).optional(),
   leaseMs: z.number().int().min(10_000).default(300_000),
   heartbeatMs: z.number().int().min(1_000).default(30_000),
@@ -84,6 +100,31 @@ const ConfigSchema = z.object({
 });
 
 export type FactoryConfig = z.infer<typeof ConfigSchema>;
+
+const DEPRECATED_ROUNDS = [
+  ['maxConflictRounds', 'conflict'],
+  ['maxCiRounds', 'ci'],
+  ['maxHumanRounds', 'human'],
+] as const;
+
+/** One warning per deprecated setting that is present, naming the replacement. */
+export function deprecationWarnings(c: Pick<FactoryConfig, 'maxConflictRounds' | 'maxCiRounds' | 'maxHumanRounds'>): string[] {
+  return DEPRECATED_ROUNDS.filter(([key]) => c[key] !== undefined).map(
+    ([key, cls]) => `config: ${key} is deprecated and will be removed; use breakers.${cls}.failureThreshold instead`,
+  );
+}
+
+/** The breaker settings per class: `breakers`, with the deprecated `max*Rounds` as the threshold when it is not set there. */
+export function resolveBreakers(c: FactoryConfig): NonNullable<FactoryConfig['breakers']> {
+  const out: NonNullable<FactoryConfig['breakers']> = {};
+  for (const [key, cls] of DEPRECATED_ROUNDS) {
+    const explicit = c.breakers?.[cls] ?? {};
+    const alias = c[key];
+    out[cls] = { ...explicit, ...(explicit.failureThreshold === undefined && alias !== undefined ? { failureThreshold: alias } : {}) };
+  }
+  if (c.breakers?.review !== undefined) out.review = c.breakers.review;
+  return out;
+}
 
 export const DEFAULT_CONFIG_FILE = 'factory.config.json';
 

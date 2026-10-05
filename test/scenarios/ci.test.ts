@@ -52,7 +52,7 @@ describe('revising the pull request when required checks fail', () => {
     expect(await h.maintain()).toEqual([]);
     expect(h.chain(chain.id)).toMatchObject({
       status: 'active',
-      state: { phase: 'executing', attempt: 2, attemptBase: 1, ciRounds: 1, ciActive: true, lastPushedSha: head },
+      state: { phase: 'executing', attempt: 2, attemptBase: 1, ciActive: true, lastPushedSha: head },
     });
     // The same failure does not start a second round on the next pass.
     await h.maintain();
@@ -70,17 +70,17 @@ describe('revising the pull request when required checks fail', () => {
     await h.runUntilIdle();
     const newHead = h.remoteHead(BRANCH)!;
     expect(newHead).not.toBe(head);
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', ciRounds: 1, lastPushedSha: newHead } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', lastPushedSha: newHead } });
     expect(h.chain(chain.id).state.ciActive).toBeUndefined();
     expect(h.pr(BRANCH)!.labels).toEqual([READY]);
     expect(h.issueLabels(N)).not.toContain(IN_PROGRESS);
     expect(h.callsOf('review')).toHaveLength(2);
-    const comments = prComments(h, pr, 'ci-round-1');
+    const comments = prComments(h, pr, 'ci-round-2');
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain(`Fixed failing checks in ${newHead.slice(0, 7)}`);
     expect(eventKinds(h, chain.id)).toEqual(expect.arrayContaining(['ci.failed', 'ci.fixed']));
-    expect(chainEvents(h.db, chain.id).find((e) => e.kind === 'ci.failed')!.detail).toMatchObject({ checks: ['check (node 22)', 'check (node 24)'], round: 1 });
-    expect(chainEvents(h.db, chain.id).find((e) => e.kind === 'ci.fixed')!.detail).toMatchObject({ round: 1 });
+    expect(chainEvents(h.db, chain.id).find((e) => e.kind === 'ci.failed')!.detail).toMatchObject({ checks: ['check (node 22)', 'check (node 24)'], round: 2 });
+    expect(chainEvents(h.db, chain.id).find((e) => e.kind === 'ci.fixed')!.detail).toMatchObject({ round: 2 });
 
     // Checks on the new head are not read as failing: nothing more starts.
     h.host.setChecks(newHead, [{ name: 'check (node 22)', status: 'in_progress', conclusion: null }]);
@@ -95,7 +95,7 @@ describe('revising the pull request when required checks fail', () => {
     await h.maintain();
     await h.runOne();
     expect(h.callsOf('execute').at(-1)!.feedback).toContain('check (node 22)');
-    expect(h.chain(chain.id).state.ciRounds).toBe(1);
+    expect(h.chain(chain.id).state.ciActive).toBe(true);
   });
 
   it.each([
@@ -146,34 +146,40 @@ describe('revising the pull request when required checks fail', () => {
     expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
     expect(executes(h, chain.id)).toHaveLength(1);
     await h.maintain();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { ciRounds: 1 } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { ciActive: true } });
   });
 
-  it('stops at maxCiRounds: needs_human, still waiting, one comment, own budget', async () => {
-    const h = harness({ maxCiRounds: 1, maxHumanRounds: 1, maxConflictRounds: 1 });
+  it('a fix whose pushed head still fails is a failure: the breaker opens, the chain waits without comments, a trial round runs after the cool-down', async () => {
+    const h = harness({ breakers: { ci: { failureThreshold: 1, cooldownMs: 600_000 } } });
     const { chain, pr, head } = await awaitingMerge(h);
     h.host.setChecks(head, [failure('check (node 22)')]);
     await h.maintain();
     await h.runUntilIdle();
     const second = h.remoteHead(BRANCH)!;
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', ciRounds: 1 } });
-    expect(h.chain(chain.id).state.humanRounds ?? 0).toBe(0);
-    expect(h.chain(chain.id).state.conflictRounds ?? 0).toBe(0);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', ciVerifying: true } });
+    const comments = h.comments(pr).length;
 
+    // The fix did not help: the head the round pushed still fails.
     h.host.setChecks(second, [failure('check (node 24)')]);
     await h.maintain();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human', ciRounds: 1 } });
+    expect(h.chain(chain.id).state.breakers?.ci).toMatchObject({ consecutiveFailures: 1, opens: 1 });
+    expect(eventKinds(h, chain.id)).toContain('breaker.opened');
     await h.maintain();
     await h.maintain();
     expect(executes(h, chain.id)).toHaveLength(2);
-    const limit = prComments(h, pr, 'ci-round-limit');
-    expect(limit).toHaveLength(1);
-    expect(limit[0]).toContain('check (node 24)');
-    expect(limit[0]).toContain('maxCiRounds');
-    expect(h.issueLabels(N)).toContain(NEEDS_HUMAN);
-    const gaveUp = chainEvents(h.db, chain.id).filter((e) => e.kind === 'ci.gave_up');
-    expect(gaveUp).toHaveLength(1);
-    expect(gaveUp[0]!.detail).toMatchObject({ reason: expect.stringContaining('exhausted') });
+    expect(h.comments(pr)).toHaveLength(comments);
+    expect((h.db.prepare('SELECT last_check_result AS r FROM chains WHERE id = ?').get(chain.id) as { r: string }).r).toContain('cool-down (ci, until');
+
+    // After the cool-down one trial round runs.
+    h.advance(600_001);
+    await h.maintain();
+    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { ciActive: true } });
+    expect(eventKinds(h, chain.id)).toContain('breaker.half_open');
+    await h.runUntilIdle();
+    h.host.setChecks(h.remoteHead(BRANCH)!, [passed('check (node 24)')]);
+    await h.maintain();
+    expect(h.chain(chain.id).state.breakers?.ci).toEqual({ consecutiveFailures: 0, opens: 0 });
+    expect(eventKinds(h, chain.id)).toContain('breaker.closed');
   });
 
   it('CI rounds leave the reviewer attempts untouched', async () => {
@@ -195,8 +201,8 @@ describe('revising the pull request when required checks fail', () => {
     h.host.addConversationComment(pr, { createdAt: at(h, 60), body: 'please rename the file' });
 
     await h.maintain();
-    expect(h.chain(chain.id).state).toMatchObject({ conflictRounds: 1, conflictActive: true });
-    expect(h.chain(chain.id).state.ciRounds ?? 0).toBe(0);
+    expect(h.chain(chain.id).state).toMatchObject({ conflictActive: true });
+    expect(h.chain(chain.id).state.ciActive).toBeFalsy();
     h.host.setMergeable(pr, 'mergeable');
     await h.runUntilIdle();
     expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
@@ -204,13 +210,13 @@ describe('revising the pull request when required checks fail', () => {
     // CI of the conflict resolution's head fails: CI before the feedback that is still waiting.
     h.host.setChecks(h.remoteHead(BRANCH)!, [failure('check (node 24)')]);
     await h.maintain();
-    expect(h.chain(chain.id).state).toMatchObject({ ciRounds: 1, ciActive: true });
-    expect(h.chain(chain.id).state.humanRounds ?? 0).toBe(0);
+    expect(h.chain(chain.id).state).toMatchObject({ ciActive: true });
+    expect(h.chain(chain.id).state.humanActive).toBeFalsy();
     await h.runUntilIdle();
 
     // The CI fix is clean: the feedback comes last.
     await h.maintain();
-    expect(h.chain(chain.id).state).toMatchObject({ humanRounds: 1, ciRounds: 1, conflictRounds: 1 });
+    expect(h.chain(chain.id).state).toMatchObject({ humanActive: true });
     expect(h.chain(chain.id).state.ciActive).toBeFalsy();
   });
 });

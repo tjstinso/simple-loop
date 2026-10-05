@@ -7,6 +7,21 @@ const job = (o: Partial<WaitingInput['jobs'][number]>): WaitingInput['jobs'][num
   id: 1, type: 'execute', attempt: 1, status: 'queued', workerId: null, leaseExpiresAt: null, startedAt: null, createdAt: NOW - 10_000, ...o,
 });
 
+describe('waitingOn breakers and asks', () => {
+  it('an open breaker shows the cool-down with the class and the time', () => {
+    const until = NOW + 5 * 60_000;
+    const w = waitingOn({ ...base, status: 'waiting', phase: 'awaiting_merge', breakers: { conflict: { openUntil: until }, ci: { openUntil: NOW - 1 } } });
+    expect(w.kind).toBe('cool_down');
+    expect(w.label).toBe(`cool-down (conflict, until ${new Date(until).toISOString()})`);
+  });
+
+  it('a chain that asked a question waits on an answer', () => {
+    const w = waitingOn({ ...base, status: 'waiting', phase: 'needs_input' });
+    expect(w.kind).toBe('person_answer');
+    expect(w.label).toBe('an answer to a question');
+  });
+});
+
 describe('waitingOn', () => {
   it('a queued job with no live worker waits on a worker', () => {
     const w = waitingOn({ ...base, jobs: [job({})] });

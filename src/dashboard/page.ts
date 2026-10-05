@@ -68,6 +68,7 @@ const SCRIPT = `
 
   var KIND = {
     person_merge: ['\\u261D', 'person', 's-person'], person_attention: ['\\u261D', 'person', 's-person'],
+    person_answer: ['\\u261D', 'question', 's-person'], cool_down: ['\\u23F8', 'cool-down', 's-queue'],
     dead_letter: ['\\u2716', 'dead letter', 's-dead'], stuck: ['\\u26A0', 'stuck', 's-stuck'],
     running: ['\\u25B6', 'running', 's-run'], reviewer: ['\\u25B6', 'reviewer', 's-run'],
     worker: ['\\u23F8', 'queued', 's-queue'], none: ['\\u2022', 'idle', 's-queue']
@@ -151,7 +152,7 @@ const SCRIPT = `
     return el.apply(null, ['section', null, el('h2', null, title + ' (' + chains.length + ')')].concat(items));
   }
   function hasRunning(c) { return c.jobs.some(function (j) { return j.status === 'running'; }); }
-  function isPerson(c) { var k = c.waitingOn && c.waitingOn.kind; return k === 'person_merge' || k === 'person_attention' || k === 'dead_letter'; }
+  function isPerson(c) { var k = c.waitingOn && c.waitingOn.kind; return k === 'person_merge' || k === 'person_attention' || k === 'person_answer' || k === 'dead_letter'; }
 
   function render() {
     if (!data) { root.replaceChildren(el('main', null, el('div', { class: 'empty' }, disconnected ? 'Waiting for the server\\u2026' : 'Loading\\u2026')), banner()); return; }

@@ -52,7 +52,7 @@ describe('revising the pull request for a person’s feedback', () => {
     expect(await h.maintain()).toEqual([]);
     expect(h.chain(chain.id)).toMatchObject({
       status: 'active',
-      state: { phase: 'executing', attempt: 2, humanRounds: 1, attemptBase: 1, feedbackHandledAt: at(h, 60) },
+      state: { phase: 'executing', attempt: 2, humanActive: true, attemptBase: 1, feedbackHandledAt: at(h, 60) },
     });
     const queued = h.jobs(chain.id).filter((j) => j.status === 'queued');
     expect(queued.map((j) => [j.type, j.attempt])).toEqual([['execute', 2]]);
@@ -73,13 +73,13 @@ describe('revising the pull request for a person’s feedback', () => {
 
     await h.runUntilIdle();
     const c = h.chain(chain.id);
-    expect(c).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', humanRounds: 1 } });
+    expect(c).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
     expect(h.remoteFiles(BRANCH)).toEqual(['README.md', 'rev-0.txt', 'rev-1.txt']);
     expect(h.remoteLog(BRANCH)).toHaveLength(3);
     expect(h.pr(BRANCH)!.labels).toEqual([READY]);
     expect(h.issueLabels(N)).not.toContain(IN_PROGRESS);
 
-    const summaries = prComments(h, pr, 'human-round-1');
+    const summaries = prComments(h, pr, 'human-round-2');
     expect(summaries).toHaveLength(1);
     expect(summaries[0]).toContain('0 changed, 0 explained, 0 declined');
     expect(summaries[0]).toContain(`https://github.com/o/r/commit/${h.remoteHead(BRANCH)}`);
@@ -88,7 +88,7 @@ describe('revising the pull request for a person’s feedback', () => {
     await h.maintain();
     await h.maintain();
     expect(h.jobs(chain.id).filter((j) => j.type === 'execute')).toHaveLength(2);
-    expect(prComments(h, pr, 'human-round-1')).toHaveLength(1);
+    expect(prComments(h, pr, 'human-round-2')).toHaveLength(1);
   });
 
   it('ignores feedback from authors that are not collaborators', async () => {
@@ -109,27 +109,6 @@ describe('revising the pull request for a person’s feedback', () => {
     await h.maintain();
     expect(h.chain(chain.id).status).toBe('waiting');
     expect(h.jobs(chain.id)).toHaveLength(2);
-  });
-
-  it('stops at maxHumanRounds: needs_human, still waiting, one comment', async () => {
-    const h = harness({ maxHumanRounds: 1 });
-    const { chain, pr } = await awaitingMerge(h);
-    h.host.addConversationComment(pr, { createdAt: at(h, 10), body: 'first change please' });
-    await h.maintain();
-    await h.runUntilIdle();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', humanRounds: 1 } });
-
-    h.host.addConversationComment(pr, { createdAt: at(h, 20), body: 'second change please' });
-    await h.maintain();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human', humanRounds: 1 } });
-    h.host.addConversationComment(pr, { createdAt: at(h, 30), body: 'and a third' });
-    await h.maintain();
-    await h.maintain();
-
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human' } });
-    expect(h.jobs(chain.id).filter((j) => j.type === 'execute')).toHaveLength(2);
-    expect(prComments(h, pr, 'human-round-limit')).toHaveLength(1);
-    expect(h.pr(BRANCH)!.labels).toContain(NEEDS_HUMAN);
   });
 
   it("builds on top of a person's own commit and never overwrites it", async () => {
@@ -161,12 +140,11 @@ describe('revising the pull request for a person’s feedback', () => {
       return ok('done');
     });
     await h.runOne();
-    const dl = h.deadLetters();
-    expect(dl).toHaveLength(1);
-    expect(dl[0]).toMatchObject({ reason: 'runner_error' });
-    expect(dl[0]!.error).toContain('remote branch moved by someone else');
+    // The refused push is a failure of the human breaker, not a dead letter; the feedback is seen again.
+    expect(h.deadLetters()).toEqual([]);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', breakers: { human: { consecutiveFailures: 1 } } } });
     expect(h.remoteHead(BRANCH)).toBe(moved);
-    await h.kernel.retryDeadLetter(dl[0]!.jobId);
+    await h.maintain();
     await h.runUntilIdle();
     expect((h.callsOf('execute').at(-1)!.workspace as SoftwareWorkspace).seedSha).toBe(moved);
     expect(h.remoteFiles(BRANCH)).toContain('person.txt');
@@ -182,9 +160,9 @@ describe('revising the pull request for a person’s feedback', () => {
     await h.maintain();
     await h.runUntilIdle();
 
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', humanRounds: 1 } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
     expect(h.jobs(chain.id).filter((j) => j.type === 'review')).toHaveLength(1); // no review of an unchanged branch
-    const unchanged = prComments(h, pr, 'human-round-1-unchanged');
+    const unchanged = prComments(h, pr, 'human-round-2-unchanged');
     expect(unchanged).toHaveLength(1);
     expect(unchanged[0]).toContain('made no change');
     expect(unchanged[0]).toContain('already correct');
@@ -195,7 +173,7 @@ describe('revising the pull request for a person’s feedback', () => {
     await h.maintain();
     await h.maintain();
     expect(h.jobs(chain.id).filter((j) => j.type === 'execute')).toHaveLength(2);
-    expect(prComments(h, pr, 'human-round-1-unchanged')).toHaveLength(1);
+    expect(prComments(h, pr, 'human-round-2-unchanged')).toHaveLength(1);
   });
 
   it("does not use up the factory's own review attempts", async () => {
@@ -209,7 +187,7 @@ describe('revising the pull request for a person’s feedback', () => {
     ]);
     const outcomes = await h.runUntilIdle();
     expect(outcomes.map((o) => [o.type, o.attempt])).toEqual([['execute', 2], ['review', 2], ['execute', 3], ['review', 3]]);
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', attempt: 3, humanRounds: 1 } });
-    expect(prComments(h, pr, 'human-round-1')).toHaveLength(1);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', attempt: 3 } });
+    expect(prComments(h, pr, 'human-round-3')).toHaveLength(1);
   });
 });

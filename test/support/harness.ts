@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { FOLLOWUPS_DDL } from '../../src/engines/software/followups.js';
 import { ExecGitPorts } from '../../src/engines/software/git-ports.js';
-import { createSoftwareEngine, type SoftwareEngine } from '../../src/engines/software/index.js';
+import { createSoftwareEngine, type SoftwareEngine, type SoftwareEngineDeps } from '../../src/engines/software/index.js';
 import type { RepoToolSettings } from '../../src/engines/software/tool-run.js';
 import type { Followup } from '../../src/engines/software/schemas.js';
 import type { SoftwareState } from '../../src/engines/software/state.js';
@@ -37,9 +37,8 @@ export const ISSUE_BODY ='## Goal\nMake the widget work.\n\n## Acceptance criter
 export interface HarnessOptions {
   defaultProfile?: 'supervised' | 'automatic';
   keptWorktreeMaxAgeMs?: number;
-  maxHumanRounds?: number;
-  maxConflictRounds?: number;
-  maxCiRounds?: number;
+  breakers?: NonNullable<SoftwareEngineDeps['config']['breakers']>;
+  chainBudgetUsd?: number;
   allowedAuthorAssociations?: string[];
   repos?: Record<string, RepoToolSettings>;
   env?: () => NodeJS.ProcessEnv;
@@ -68,11 +67,14 @@ export interface ExecuteResult {
   followups?: Followup[];
   /** Left untyped on purpose: tests also script malformed responses. */
   feedbackResponses?: unknown;
+  ask?: unknown;
+  costUsd?: number;
 }
 
 export interface ReviewResult {
   verdict: 'approve' | 'request_changes';
   feedback: string;
+  costUsd?: number;
   followups?: Followup[];
 }
 
@@ -202,9 +204,8 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
         defaultProfile: opts.defaultProfile ?? 'supervised',
         requiredSections: ['## Goal', '## Acceptance criteria'],
         ...(opts.keptWorktreeMaxAgeMs === undefined ? {} : { keptWorktreeMaxAgeMs: opts.keptWorktreeMaxAgeMs }),
-        ...(opts.maxHumanRounds === undefined ? {} : { maxHumanRounds: opts.maxHumanRounds }),
-        ...(opts.maxConflictRounds === undefined ? {} : { maxConflictRounds: opts.maxConflictRounds }),
-        ...(opts.maxCiRounds === undefined ? {} : { maxCiRounds: opts.maxCiRounds }),
+        ...(opts.breakers === undefined ? {} : { breakers: opts.breakers }),
+        ...(opts.chainBudgetUsd === undefined ? {} : { chainBudgetUsd: opts.chainBudgetUsd }),
         ...(opts.allowedAuthorAssociations === undefined ? {} : { allowedAuthorAssociations: opts.allowedAuthorAssociations }),
         ...(opts.repos === undefined ? {} : { repos: opts.repos }),
       },
