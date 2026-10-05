@@ -20,6 +20,8 @@ import type { ChainView } from '../kernel/types.js';
 import { describePolicy } from '../policy/resolve.js';
 import { routeEngine } from '../router/router.js';
 import { planIntake } from '../intake/plan.js';
+import { Intake, runIntakeLoop } from '../intake/loop.js';
+import { redactSecrets } from '../engines/software/secret-scan.js';
 import { loadConfig } from './config.js';
 import { buildRuntime, type Runtime } from './runtime.js';
 
@@ -47,7 +49,7 @@ const USAGE = `Usage:
   factory [--config <path>] dlq discard <job-id>
   factory [--config <path>] cancel <chain-id>
   factory [--config <path>] policies
-  factory [--config <path>] intake --once --dry-run
+  factory [--config <path>] intake [--once] [--dry-run]
   factory [--config <path>] dashboard [--port <n>] [--host <addr>]
 Options:
   --config <path>   config file (default ./factory.config.json)
@@ -388,27 +390,54 @@ async function execute(
         stderr('error: intake is not configured');
         return 1;
       }
-      if (values.once !== true || values['dry-run'] !== true) {
-        throw new UsageError('intake needs --once --dry-run; the polling loop arrives in a later phase');
-      }
       const host = rt.host;
       if (host === undefined) throw new Error('no GitHub adapter available');
       rt.requireGithub?.();
-      let failed = false;
-      for (const repo of intake.repos) {
-        try {
-          const issues = await host.listIssuesByLabel(repo, intake.readyLabel);
-          const rows = rt.db
-            .prepare(`SELECT subject_key FROM chains WHERE status IN ('active', 'waiting', 'dead_lettered')`)
-            .all() as Array<{ subject_key: string }>;
-          const decisions = planIntake(issues, rows.map((r) => r.subject_key), { ...intake, repo });
-          for (const d of decisions) stdout(`${repo}#${d.number} ${d.decision} ${d.reason}`);
-        } catch (e) {
-          stderr(`error: ${message(e)}`);
-          failed = true;
+      if (values['dry-run'] === true) {
+        let failed = false;
+        for (const repo of intake.repos) {
+          try {
+            const issues = await host.listIssuesByLabel(repo, intake.readyLabel);
+            const rows = rt.db
+              .prepare(`SELECT subject_key FROM chains WHERE status IN ('active', 'waiting', 'dead_lettered')`)
+              .all() as Array<{ subject_key: string }>;
+            const decisions = planIntake(issues, rows.map((r) => r.subject_key), { ...intake, repo });
+            for (const d of decisions) stdout(`${repo}#${d.number} ${d.decision} ${d.reason}`);
+          } catch (e) {
+            stderr(`error: ${message(e)}`);
+            failed = true;
+          }
         }
+        return failed ? 1 : 0;
       }
-      return failed ? 1 : 0;
+      const worker = new Intake({
+        host,
+        kernel,
+        config: intake,
+        engine: rt.defaultEngine,
+        openSubjects: () =>
+          (rt.db.prepare(`SELECT subject_key FROM chains WHERE status IN ('active', 'waiting', 'dead_lettered')`).all() as Array<{ subject_key: string }>).map(
+            (r) => r.subject_key,
+          ),
+        isDraining: () => isDraining(rt.db),
+        redact: (text) => redactSecrets(text, rt.secretValues?.() ?? []),
+        stdout,
+        stderr,
+      });
+      if (values.once === true) return (await worker.pass()) ? 1 : 0;
+      let received: 'SIGINT' | 'SIGTERM' | null = null;
+      let wake!: () => void;
+      const stopped = new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+      for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+        deps.onSignal(sig, () => {
+          received ??= sig;
+          wake();
+        });
+      }
+      await runIntakeLoop(worker, intake.pollIntervalMs, stopped, () => received !== null);
+      return received === 'SIGINT' ? 130 : 143;
     }
     default:
       throw new UsageError(cmd === undefined ? 'missing command' : `unknown command: ${cmd}`);
@@ -501,8 +530,8 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));
-    if (built && command[0] !== 'worker') {
-      // The worker stops gracefully on a signal; other commands remove the auth directory and exit.
+    if (built && command[0] !== 'worker' && !(command[0] === 'intake' && !command.includes('--once') && !command.includes('--dry-run'))) {
+      // The worker and the intake loop stop gracefully on a signal; other commands remove the auth directory and exit.
       const rt = runtime;
       for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
         onSignal(sig, () => {

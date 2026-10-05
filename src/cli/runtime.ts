@@ -24,6 +24,8 @@ export interface Runtime {
   host?: GitHost;
   /** The `intake` block of the config; absent when intake is not configured. */
   intake?: IntakeConfig;
+  /** The exact secret values of the environment, for redacting text posted to GitHub. */
+  secretValues?: () => string[];
   /** Interval of the worker's periodic maintenance. */
   maintenanceMs?: number;
   /** The policies in effect (name, source and merged value), for `factory policies`. */
@@ -90,6 +92,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       keepOnFailure: config.keepWorktreeOnFailure,
     });
     const host = new GhCliHost(auth === undefined ? {} : { auth });
+    const secretValues = () => secretEnvValues(process.env, tokenEnv === undefined ? forwarded : [...forwarded, tokenEnv]);
     const engine = createSoftwareEngine({
       db,
       host,
@@ -116,7 +119,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       onError: (err, context) => console.error(`error: ${context}: ${err instanceof Error ? err.message : String(err)}`),
       // The secret guard's exact values, read at each push: the model API key, every variable whose
       // name looks secret, the claude-cli policies' passEnv variables and the factory's GitHub token.
-      secretValues: () => secretEnvValues(process.env, tokenEnv === undefined ? forwarded : [...forwarded, tokenEnv]),
+      secretValues,
     });
     const engines = new EngineRegistry();
     engines.register(engine);
@@ -135,6 +138,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       db,
       defaultEngine: config.defaultEngine,
       host,
+      secretValues,
       ...(config.intake === undefined ? {} : { intake: config.intake }),
       maintenanceMs: config.maintenanceMs,
       effectivePolicies,

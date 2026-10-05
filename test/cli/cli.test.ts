@@ -488,12 +488,10 @@ describe('intake command', () => {
     expect(err).toEqual(['error: intake is not configured']);
   });
 
-  it('needs --once and --dry-run', async () => {
-    const { h, deps, err } = setup();
+  it('rejects arguments', async () => {
+    const { h, deps } = setup();
     const runtime: Runtime = { ...deps.runtime!, host: h.host, intake };
-    expect(await run(['intake'], { ...deps, runtime })).toBe(2);
-    expect(await run(['intake', '--once'], { ...deps, runtime })).toBe(2);
-    expect(err.join('\n')).toContain('later phase');
+    expect(await run(['intake', 'extra'], { ...deps, runtime })).toBe(2);
   });
 
   it('prints one line per issue and writes nothing', async () => {

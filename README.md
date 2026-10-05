@@ -325,23 +325,33 @@ resumed
 
 ## Intake
 
-The optional `intake` block of `factory.config.json` lets the factory find the issues a person marked ready with a label. In this first phase it only reads: it enqueues, comments and labels nothing.
+The optional `intake` block of `factory.config.json` lets the factory find the issues a person marked ready with a label. `factory intake` is a long-running deterministic poller: every `pollIntervalMs` it enqueues the ready issues, acknowledges them on GitHub and rejects unusable ones, so work no longer has to be submitted by hand.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `repos` | required, at least one | `owner/name` of each repository to watch. |
 | `readyLabel` | `factory:ready` | Label that marks an open issue as ready. |
-| `pollIntervalMs` | `60000` | At least 5000. For the polling loop of a later phase. |
+| `pollIntervalMs` | `60000` | At least 5000. Time between passes of the loop. |
 | `maxOpenChains` | `2` | At least 1. Open chains (active, waiting or dead-lettered) allowed per repository. |
 | `allowedAuthorAssociations` | `["OWNER", "MEMBER", "COLLABORATOR"]` | Only issues by authors with one of these GitHub `author_association` values may cause work. |
 
 Unknown keys in the block are an error. Without the block `factory intake` exits 1 with `intake is not configured`.
 
 ```
-factory intake --once --dry-run
+factory intake                 # the loop: one pass now, then one per pollIntervalMs
+factory intake --once          # a single pass
+factory intake --dry-run       # print the decisions, change nothing (implies --once)
 ```
 
-prints one line per ready issue, oldest first, as `<owner/repo>#<n> <decision> <reason>`, and exits 0. The decision is `enqueue ready`, or `skip` with the reason `author not allowed`, `already queued` or `at capacity`. If `gh` fails for a repository, `error: <message>` goes to stderr, the other repositories are still processed and the exit code is 1. The command reads the GitHub token and calls GitHub, but writes nothing to GitHub or the database. Both flags are required until the loop exists.
+Labels: `factory:ready` (set by a person) marks an issue to take on, `factory:queued` is set once its chain exists and `factory:rejected` once the issue was found unusable.
+
+**The loop** runs until SIGINT or SIGTERM, finishes the issue it is on, and exits 130 or 143. `--once` exits 0, or 1 if any repository errored. A failing `gh` call prints `error: <message>` to stderr and never ends the loop; it changes nothing and is retried on the next pass. While `factory drain` is in effect the loop enqueues nothing.
+
+**Enqueueing.** For each issue the plan marks `enqueue`, oldest first, the loop calls the same enqueue as `factory submit` with the configured `defaultEngine` and prints `<owner/repo>#<n> enqueued chain <c> job <j>`. It then swaps `factory:ready` for `factory:queued` (adds first, then removes). If that swap fails, the next pass sees the issue again, finds its open chain (no second chain is made) and retries the swap. The other decisions (`skip` with `author not allowed`, `already queued` or `at capacity`) are printed as by `--dry-run`, but only when they change from the previous pass, so a held-back issue is not reprinted every minute.
+
+**Rejection.** When the issue itself is unusable (a required section is missing, it is closed or empty, or no policy matches), the loop posts one comment with the engine's validation message (redacted) and swaps `factory:ready` for `factory:rejected`. The comment carries the hidden marker `<!-- factory:intake-rejected hash=<8 hex> -->`, a short hash of the issue body, so it is posted once per distinct body. After fixing the issue, add `factory:ready` again. Transient failures (a `gh` error, a timeout, a 429 or 5xx) change nothing and post no comment.
+
+Issues whose author's association is not in `allowedAuthorAssociations` are never enqueued, commented on or relabeled. If `gh` fails for a repository, the other repositories are still processed.
 
 ## Dashboard
 
