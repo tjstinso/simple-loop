@@ -101,6 +101,13 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_chain ON events(chain_id, id);
 CREATE INDEX IF NOT EXISTS events_at ON events(at);
+
+-- Operator switches; the row with key 'drain' stops every worker from claiming jobs (control.ts).
+CREATE TABLE IF NOT EXISTS control (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 /** Columns added after the first release: `ALTER TABLE` only when `PRAGMA table_info` does not list them yet. */

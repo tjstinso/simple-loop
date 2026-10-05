@@ -4,6 +4,7 @@ import { deadLetter, discardDeadLetter, listDeadLetters, retryDeadLetter } from 
 import { EngineRegistry } from '../../src/kernel/engine-registry.js';
 import { processDelivery } from '../../src/kernel/process-delivery.js';
 import { createKernel, type Kernel } from '../../src/kernel/kernel.js';
+import { startDrain, stopDrain } from '../../src/kernel/control.js';
 import { recentEvents } from '../../src/kernel/events.js';
 import { DuplicateChainError, claimNext, getChain, getJob, listJobsForChain, requeueJob } from '../../src/kernel/queue.js';
 import type { Engine, Job } from '../../src/kernel/types.js';
@@ -833,6 +834,52 @@ describe('maxConcurrentJobs', () => {
     const w = s.start({ id: 'w1' });
     await tick(5_000);
     expect(s.db.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'job.throttled'`).get()).toEqual({ n: 0 });
+    await w.stop();
+  });
+});
+
+describe('drain', () => {
+  let kernels: Kernel[] = [];
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW });
+    kernels = [];
+  });
+  afterEach(() => {
+    for (const k of kernels) k.close();
+    vi.useRealTimers();
+  });
+
+  it('lets a running job finish normally, starts no queued job, and claims it after resume', async () => {
+    const releases: Array<(v: unknown) => void> = [];
+    let started = 0;
+    const s = setup({
+      runner: customRunner(async (_input, signal) => {
+        started++;
+        return await Promise.race([new Promise((r) => releases.push(r)), untilAborted(signal)]);
+      }),
+    });
+    kernels.push(s.kernel);
+    const { job: first } = await s.kernel.enqueue('echo', { key: 'a' });
+    const { job: second } = await s.kernel.enqueue('echo', { key: 'b' });
+    const w = s.start({ id: 'w1' });
+    await tick(500);
+    expect(started).toBe(1);
+    startDrain(s.db, Date.now());
+
+    releases[0]!({ value: 'x' });
+    await tick(5_000);
+    expect(getJob(s.db, first.id).status).not.toBe('running');
+    expect(getJob(s.db, second.id).status).toBe('queued');
+    expect(started).toBe(1);
+    expect(s.errors).toEqual([]);
+    expect(s.db.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'job.throttled'`).get()).toEqual({ n: 0 });
+
+    stopDrain(s.db, Date.now());
+    await tick(500);
+    expect(started).toBe(2);
+    expect(getJob(s.db, second.id).status).toBe('running');
+    releases[1]!({ value: 'y' });
+    await tick(500);
     await w.stop();
   });
 });

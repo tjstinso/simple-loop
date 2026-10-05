@@ -314,6 +314,15 @@ $ factory cancel 1
 cancelled chain 1
 ```
 
+**drain and resume.** Quiesce the factory for maintenance without losing in-flight work. `factory drain` sets a flag (the `drain` row of the `control` table) that stops every worker from claiming new jobs; jobs already running finish normally, and maintenance (reaper, reconcile, dead-letter surfacing, pruning) and heartbeats keep running. Queued, retried, requeued and reaper-reclaimed jobs stay `queued` until `factory resume`. It prints `draining: <n> job(s) running` and records `drain.started` the first time (a second call changes nothing). `factory drain --wait` sets the flag, then polls the database every 2 seconds until no job is running, prints `drained` and exits 0; `--timeout <seconds>` gives up with exit 1 and `still draining: <n> job(s) running`, leaving the flag set. SIGINT and SIGTERM exit 130 and 143, also leaving the flag set. `factory resume` clears the flag, prints `resumed` and records `drain.resumed` only if it was set. Neither command needs the GitHub token. While the flag is set, `factory status` ends with `DRAINING (<n> job(s) still running)` and the dashboard header shows the same text.
+
+```
+$ factory drain --wait --timeout 3600
+drained
+$ factory resume
+resumed
+```
+
 ## Dashboard
 
 `factory dashboard [--port <n>] [--host <addr>]` serves a page in the browser that shows where every chain is and who has to act next, so you do not have to combine `status`, `show` and `workers`. It listens on `127.0.0.1:4173` by default and runs until SIGINT or SIGTERM, then shuts down cleanly.

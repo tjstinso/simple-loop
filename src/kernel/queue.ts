@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { isDraining } from './control.js';
 import { capEventText, recordEvent } from './events.js';
 import { StaleDeliveryError } from './types.js';
 import type { Chain, ChainStatus, Fence, Job, JobStatus, ResolvedNewJob } from './types.js';
@@ -145,6 +146,7 @@ const json = (v: unknown): string | null => (v === undefined ? null : JSON.strin
  */
 export function claimNext(db: Db, workerId: string, now: number, leaseMs: number, maxConcurrent?: number): Job | null {
   const claim = db.transaction((): Job | null => {
+    if (isDraining(db)) return null;
     if (maxConcurrent !== undefined && countRunning(db) >= maxConcurrent) return null;
     const r = db
       .prepare(
@@ -187,6 +189,7 @@ export const THROTTLE_EVENT_INTERVAL_MS = 60_000;
 export function recordThrottled(db: Db, now: number, limit: number): boolean {
   return db
     .transaction((): boolean => {
+      if (isDraining(db)) return false;
       const running = countRunning(db);
       if (running < limit) return false;
       const next = db
