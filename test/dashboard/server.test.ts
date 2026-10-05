@@ -305,4 +305,68 @@ describe('page rendering', () => {
     expect(await stale()).toBe(false);
     expect(await stale(10_000)).toBe(true);
   });
+
+  describe('config watcher', () => {
+    function fakeWatcher(initial: number | undefined) {
+      let value = initial;
+      let fail: Error | undefined;
+      let listener: (() => void) | undefined;
+      let watches = 0;
+      let stopped = false;
+      return {
+        watcher: {
+          read: () => {
+            if (fail) throw fail;
+            return value;
+          },
+          watch: (onChange: () => void) => {
+            watches++;
+            listener = onChange;
+            return () => {
+              stopped = true;
+            };
+          },
+        },
+        change: (v: number | undefined) => {
+          value = v;
+          listener!();
+        },
+        breakFile: (e: Error) => {
+          fail = e;
+          listener!();
+        },
+        watches: () => watches,
+        stopped: () => stopped,
+      };
+    }
+    const overview = async () => (await (await fetch(url('/api/overview'))).json()) as { limits: { maxConcurrentJobs: number | null } };
+
+    it('picks up a changed maxConcurrentJobs on the next request', async () => {
+      t = makeDb();
+      const fake = fakeWatcher(2);
+      dash = await startDashboard({ db: openReadOnlyDb(t.path), port: 0, now: () => NOW, maxConcurrentJobs: 2, configWatcher: fake.watcher });
+      expect(fake.watches()).toBe(1);
+      expect((await overview()).limits.maxConcurrentJobs).toBe(2);
+      fake.change(5);
+      const after = await overview();
+      expect(after.limits.maxConcurrentJobs).toBe(5);
+      expect(after).toEqual(JSON.parse(JSON.stringify(buildOverview(openReadOnlyDb(t.path), NOW, { maxConcurrentJobs: 5 }))));
+      fake.change(undefined);
+      expect((await overview()).limits.maxConcurrentJobs).toBeNull();
+      expect(fake.watches()).toBe(1);
+      await dash.close();
+      expect(fake.stopped()).toBe(true);
+    });
+
+    it('keeps the last known value and warns when the config cannot be read', async () => {
+      t = makeDb();
+      const fake = fakeWatcher(3);
+      const warnings: string[] = [];
+      dash = await startDashboard({ db: openReadOnlyDb(t.path), port: 0, now: () => NOW, maxConcurrentJobs: 3, configWatcher: fake.watcher, warn: (m) => warnings.push(m) });
+      fake.breakFile(new Error('file not found'));
+      expect((await overview()).limits.maxConcurrentJobs).toBe(3);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/keeping 3.*file not found/);
+    });
+  });
 });

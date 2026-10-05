@@ -25,6 +25,18 @@ export interface DashboardOptions {
   maxConcurrentJobs?: number;
   /** The configured `maintenanceMs`, which sets when a waiting chain counts as not checked recently (absent: the default). */
   maintenanceMs?: number;
+  /** Watched once from `startDashboard`; a failed re-read keeps the last known value and logs a warning. */
+  configWatcher?: ConfigWatcher;
+  /** Receives the warnings (default: stderr). */
+  warn?: (message: string) => void;
+}
+
+/** Follows the config file so the overview picks up a changed `maxConcurrentJobs` without a restart. */
+export interface ConfigWatcher {
+  /** Re-reads `maxConcurrentJobs`; throws when the file is gone or unreadable. */
+  read(): number | undefined;
+  /** Calls `onChange` whenever the config file may have changed; returns a function that stops watching. */
+  watch(onChange: () => void): () => void;
 }
 
 export interface DashboardServer {
@@ -44,6 +56,15 @@ const SECURITY_HEADERS = {
 export function startDashboard(opts: DashboardOptions): Promise<DashboardServer> {
   const now = opts.now ?? (() => Date.now());
   const host = opts.host ?? DEFAULT_HOST;
+  let maxConcurrentJobs = opts.maxConcurrentJobs;
+  const warn = opts.warn ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const stopWatching = opts.configWatcher?.watch(() => {
+    try {
+      maxConcurrentJobs = opts.configWatcher!.read();
+    } catch (e) {
+      warn(`warning: could not reload maxConcurrentJobs from the config, keeping ${maxConcurrentJobs ?? 'no limit'}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
   const send = (res: import('node:http').ServerResponse, status: number, type: string, body: string, extra: Record<string, string> = {}) => {
     res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': type, ...extra });
     res.end(body);
@@ -77,7 +98,7 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
         return;
       }
       if (path === '/api/overview') {
-        json(res, 200, buildOverview(opts.db, now(), { maxConcurrentJobs: opts.maxConcurrentJobs ?? null, ...(opts.maintenanceMs === undefined ? {} : { maintenanceMs: opts.maintenanceMs }) }));
+        json(res, 200, buildOverview(opts.db, now(), { maxConcurrentJobs: maxConcurrentJobs ?? null, ...(opts.maintenanceMs === undefined ? {} : { maintenanceMs: opts.maintenanceMs }) }));
         return;
       }
       const m = /^\/api\/chains\/([0-9]+)$/.exec(path);
@@ -93,9 +114,12 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
     }
   });
   return new Promise((resolve, reject) => {
-    server.once('error', reject);
+    server.once('error', (e) => {
+      stopWatching?.();
+      reject(e);
+    });
     server.listen(opts.port ?? DEFAULT_PORT, host, () => {
-      server.off('error', reject);
+      server.removeAllListeners('error');
       const addr = server.address() as AddressInfo;
       boundPort = addr.port;
       resolve({
@@ -104,6 +128,7 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
         port: addr.port,
         close: () =>
           new Promise<void>((done) => {
+            stopWatching?.();
             server.close(() => done());
             server.closeAllConnections();
           }),
