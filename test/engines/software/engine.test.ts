@@ -479,7 +479,22 @@ describe('software engine', () => {
       const { engine, host } = make();
       open(host, 'open');
       host.prs.get(9)!.mergeable = 'unknown';
-      expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none', check: 'unknown' });
+      const result = await engine.reconcile!(waiting());
+      expect(result.outcome).toBe('update');
+      expect((result as any).engineState.unknown_mergeability_attempts).toBe(1);
+    });
+
+    it('persists unknown mergeability counter across reconcile calls', async () => {
+      const { engine, host } = make();
+      open(host, 'open');
+      host.prs.get(9)!.mergeable = 'unknown';
+      let c = waiting();
+      for (let i = 1; i <= 3; i++) {
+        const result = await engine.reconcile!(c);
+        expect(result.outcome).toBe('update');
+        expect((result as any).engineState.unknown_mergeability_attempts).toBe(i);
+        c = chain(3, (result as any).engineState);
+      }
     });
 
     it('rethrows a non-transient host error', async () => {

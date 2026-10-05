@@ -179,8 +179,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     delete next.pendingFix;
     return next;
   }
-  // Passes in a row a chain's pull request reported `unknown` mergeability (not persisted: a restart starts counting again).
-  const unknownPasses = new Map<number, number>();
+  // Tracks chains that have logged unknown-mergeability exhaustion (one log per chain per session).
   const unknownLogged = new Set<number>();
   const historyRetentionDays = deps.config.historyRetentionDays ?? 30;
   const keptWorktreeMaxAgeMs = deps.config.keptWorktreeMaxAgeMs ?? 7 * 86_400_000;
@@ -391,32 +390,42 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     const event = (kind: string, detail: Record<string, unknown>) =>
       recordEvent(deps.db, { at: deps.now(), chainId, kind, engine: 'software', detail });
     if (pr.mergeable === 'mergeable') {
-      unknownPasses.delete(chainId);
       unknownLogged.delete(chainId);
-      return null;
+      let next = s;
+      if (s.unknown_mergeability_attempts !== undefined) {
+        next = { ...s, unknown_mergeability_attempts: undefined };
+        delete next.unknown_mergeability_attempts;
+      }
+      return next !== s ? { outcome: 'update', reason: 'mergeability resolved', engineState: next } : null;
     }
     if (pr.mergeable === 'unknown') {
       // GitHub is still computing it: look again next pass, a few times.
-      const n = (unknownPasses.get(chainId) ?? 0) + 1;
-      unknownPasses.set(chainId, n);
-      if (n <= MAX_UNKNOWN_PASSES) return { outcome: 'none', check: 'unknown' };
+      const n = (s.unknown_mergeability_attempts ?? 0) + 1;
+      if (n <= MAX_UNKNOWN_PASSES) {
+        const next = { ...s, unknown_mergeability_attempts: n };
+        return { outcome: 'update', reason: 'mergeability still unknown', engineState: next };
+      }
       if (!unknownLogged.has(chainId)) {
         unknownLogged.add(chainId);
         event('conflict.gave_up', { reason: `mergeability still unknown after ${MAX_UNKNOWN_PASSES} checks` });
       }
       return null;
     }
-    unknownPasses.delete(chainId);
     unknownLogged.delete(chainId);
-    const held = await gate(s, chainId, pr, 'conflict', { budget: true });
+    let next = s;
+    if (s.unknown_mergeability_attempts !== undefined) {
+      next = { ...s, unknown_mergeability_attempts: undefined };
+      delete next.unknown_mergeability_attempts;
+    }
+    const held = await gate(next, chainId, pr, 'conflict', { budget: true });
     if (held) return held;
     // A new base head after a success is a new problem: it starts a round without counting against the breaker.
-    const next = roundState(s, 'conflictActive');
+    const work = roundState(next, 'conflictActive');
     return {
       outcome: 'new_work',
-      reason: `conflict round (attempt ${next.attempt})`,
-      engineState: next,
-      job: { type: 'execute', attempt: next.attempt, policyKind: 'execute', labels: s.labels, payload: { conflictRound: next.attempt } },
+      reason: `conflict round (attempt ${work.attempt})`,
+      engineState: work,
+      job: { type: 'execute', attempt: work.attempt, policyKind: 'execute', labels: next.labels, payload: { conflictRound: work.attempt } },
     };
   }
 
