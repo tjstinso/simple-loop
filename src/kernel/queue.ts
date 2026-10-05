@@ -183,8 +183,13 @@ export function countRunning(db: Db): number {
 export const THROTTLE_EVENT_INTERVAL_MS = 60_000;
 
 /**
- * Records `job.throttled` (against the oldest queued job) when the limit is reached and work is
- * queued, unless one was recorded within the last minute by any worker. Returns whether it recorded.
+ * Records `job.throttled` (against the oldest claimable queued job) when the limit is reached and
+ * work is claimable, unless one was recorded within the last minute by any worker. Returns whether
+ * it recorded.
+ *
+ * When every queued job is still waiting for its `available_at` time, nothing is claimable, so the
+ * limit is not what blocks the worker and no event is recorded (there is never a `job.throttled`
+ * event with a null `job_id`). The `events.job_id` column is nullable for other event kinds.
  */
 export function recordThrottled(db: Db, now: number, limit: number): boolean {
   /** The throttle checks; the event to record, or null when nothing needs recording. */
