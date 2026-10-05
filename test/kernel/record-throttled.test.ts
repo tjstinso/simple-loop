@@ -53,6 +53,28 @@ describe('recordThrottled', () => {
     expect(events(db)).toBe(2);
   });
 
+  describe('attribution', () => {
+    const throttledJob = (db: Db) =>
+      (db.prepare(`SELECT job_id FROM events WHERE kind = 'job.throttled'`).get() as { job_id: number }).job_id;
+    const idOf = (db: Db, key: string) =>
+      (db.prepare(`SELECT j.id FROM jobs j JOIN chains c ON c.id = j.chain_id WHERE c.subject_key = ?`).get(key) as { id: number }).id;
+
+    it('names a claimable job, skipping an older one that is not yet available', () => {
+      const db = blocked();
+      job(db, 'c', false);
+      db.prepare('UPDATE jobs SET available_at = ? WHERE id = ?').run(NOW + 60_000, idOf(db, 'b'));
+      expect(recordThrottled(db, NOW, 1)).toBe(true);
+      expect(throttledJob(db)).toBe(idOf(db, 'c'));
+    });
+
+    it('records nothing when every queued job is still waiting for its availability time', () => {
+      const db = blocked();
+      db.prepare('UPDATE jobs SET available_at = ? WHERE id = ?').run(NOW + 60_000, idOf(db, 'b'));
+      expect(recordThrottled(db, NOW, 1)).toBe(false);
+      expect(events(db)).toBe(0);
+    });
+  });
+
   describe('returns false without starting a write transaction', () => {
     const cases: Array<[string, () => { db: Db; limit: number }]> = [
       ['when draining', () => { const db = blocked(); startDrain(db, NOW); return { db, limit: 1 }; }],
