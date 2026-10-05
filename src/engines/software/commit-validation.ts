@@ -144,10 +144,15 @@ export async function validateRound(deps: ValidationDeps, conflictHead: string |
     if (after) reject(deps, after);
   }
   const head = facts.head;
-  if (head === deps.seedSha) return { kind: 'validated', head, commitCount: 0, commits: [] };
 
+  // Verification runs even when the agent left HEAD on the seed (no changes).
   const failure = await deps.verify();
-  if (failure) return { kind: 'fix', ...failure, head };
+  if (failure) {
+    if (head === deps.seedSha) {
+      throw new EffectError(`verification failed on the unchanged seed${failure.command === undefined ? '' : `: ${failure.command}`}`, 'runner_error');
+    }
+    return { kind: 'fix', ...failure, head };
+  }
   const after = await deps.inspect();
   if (after.trackedDirtyFiles.length > 0) {
     deps.events('verify.dirty', { files: after.trackedDirtyFiles.length });

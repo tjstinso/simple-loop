@@ -64,7 +64,9 @@ describe('the agent commits, the engine validates and pushes', () => {
     expect(await h.deliver(h.claim()!)).toBe('dead_lettered');
     expect(h.deadLetters()[0]!.error).toContain('no changes produced');
     expect(h.remoteBranches()).not.toContain(BRANCH);
-    expect(events(h, 'commit.validated')).toHaveLength(0);
+    const validated = events(h, 'commit.validated');
+    expect(validated).toHaveLength(1);
+    expect(validated[0]!.detail).toMatchObject({ commits: 0 });
   });
 
   it('commits a dirty tree itself and records one fallback event', async () => {

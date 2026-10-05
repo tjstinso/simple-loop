@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { checkState, listCommits, verifyDirtyFeedback, violationMessage, type StateExpectations } from '../../../src/engines/software/commit-validation.js';
+import { checkState, listCommits, validateRound, verifyDirtyFeedback, violationMessage, type StateExpectations, type ValidationDeps, type VerifyFailure } from '../../../src/engines/software/commit-validation.js';
 import { parseGitlinkCommits, parseStatus, type CommitFact, type WorkspaceFacts } from '../../../src/engines/software/git-ports.js';
 
 const sha = (c: string) => c.repeat(40);
@@ -97,5 +97,51 @@ describe('git output parsers', () => {
     const rec = (m: string, p: string) => `:000000 ${m} ${'0'.repeat(40)} ${'1'.repeat(40)} A\0${p}\0`;
     const out = `\u0001${sha('a')}\u0002\0${rec('100644', 'f')}\u0001${sha('b')}\u0002\0${rec('160000', 'sub')}`;
     expect(parseGitlinkCommits(out)).toEqual([sha('b')]);
+  });
+});
+
+describe('validateRound', () => {
+  const harness = (seed: string, f: WorkspaceFacts, failure: VerifyFailure | null = null) => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    let verifyCalls = 0;
+    const deps: ValidationDeps = {
+      expect: expectations,
+      seedSha: seed,
+      fallbackMessage: 'fallback',
+      conflictRound: false,
+      inspect: async () => f,
+      commitAll: async () => undefined,
+      markersLeft: async () => [],
+      verify: async () => {
+        verifyCalls++;
+        return failure;
+      },
+      headSha: async () => f.head,
+      events: (kind, detail) => events.push([kind, detail]),
+    };
+    return { deps, events, verifyCalls: () => verifyCalls };
+  };
+  const unchanged = facts({ head: sha('b'), commits: [], commitCount: 0 });
+
+  it('verifies and records commit.validated with 0 commits when HEAD equals the seed', async () => {
+    const h = harness(sha('b'), unchanged);
+    const outcome = await validateRound(h.deps, undefined);
+    expect(h.verifyCalls()).toBe(1);
+    expect(outcome).toEqual({ kind: 'validated', head: sha('b'), commitCount: 0, commits: [] });
+    expect(h.events).toEqual([['commit.validated', { commits: 0, head: sha('b').slice(0, 12) }]]);
+  });
+
+  it('fails the chain when verification fails on the unchanged seed', async () => {
+    const h = harness(sha('b'), unchanged, { feedback: 'x', command: 'npm test', exitCode: 1 });
+    await expect(validateRound(h.deps, undefined)).rejects.toThrow(/unchanged seed/);
+    expect(h.events).toEqual([]);
+  });
+
+  it('verifies and records the commits when the agent kept its changes', async () => {
+    const h = harness(sha('0'), facts());
+    const outcome = await validateRound(h.deps, undefined);
+    expect(h.verifyCalls()).toBe(1);
+    expect(outcome).toMatchObject({ kind: 'validated', commitCount: 1 });
+    expect(h.events).toEqual([['commit.validated', { commits: 1, head: sha('a').slice(0, 12) }]]);
   });
 });
