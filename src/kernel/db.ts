@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at INTEGER NOT NULL,
   chain_id INTEGER NOT NULL,
+  -- NULL for chain-level events. A job.throttled event always names a claimable job; none is
+  -- recorded while every queued job is still waiting for its available_at time.
   job_id INTEGER,
   delivery INTEGER,
   kind TEXT NOT NULL,
