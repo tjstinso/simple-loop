@@ -187,19 +187,29 @@ export const THROTTLE_EVENT_INTERVAL_MS = 60_000;
  * queued, unless one was recorded within the last minute by any worker. Returns whether it recorded.
  */
 export function recordThrottled(db: Db, now: number, limit: number): boolean {
+  /** The throttle checks; the event to record, or null when nothing needs recording. */
+  const check = () => {
+    if (isDraining(db)) return null;
+    const running = countRunning(db);
+    if (running < limit) return null;
+    const next = db
+      .prepare(`SELECT id, chain_id FROM jobs WHERE status = 'queued' AND (available_at IS NULL OR available_at <= ?) ORDER BY id LIMIT 1`)
+      .get(now) as { id: number; chain_id: number } | undefined;
+    if (!next) return null;
+    const recent = db
+      .prepare(`SELECT 1 FROM events WHERE at > ? AND kind = 'job.throttled' LIMIT 1`)
+      .get(now - THROTTLE_EVENT_INTERVAL_MS);
+    if (recent !== undefined) return null;
+    return { next, running };
+  };
+  // A plain read first: most polls need nothing recorded and must not take the write lock.
+  if (check() === null) return false;
   return db
     .transaction((): boolean => {
-      if (isDraining(db)) return false;
-      const running = countRunning(db);
-      if (running < limit) return false;
-      const next = db
-        .prepare(`SELECT id, chain_id FROM jobs WHERE status = 'queued' AND (available_at IS NULL OR available_at <= ?) ORDER BY id LIMIT 1`)
-        .get(now) as { id: number; chain_id: number } | undefined;
-      if (!next) return false;
-      const recent = db
-        .prepare(`SELECT 1 FROM events WHERE at > ? AND kind = 'job.throttled' LIMIT 1`)
-        .get(now - THROTTLE_EVENT_INTERVAL_MS);
-      if (recent !== undefined) return false;
+      // Repeat the checks under the write lock: another worker may have recorded in between.
+      const found = check();
+      if (found === null) return false;
+      const { next, running } = found;
       recordEvent(db, {
         at: now,
         chainId: next.chain_id,

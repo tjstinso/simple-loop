@@ -151,3 +151,47 @@ describe('intake loop', () => {
     expect(await run(['intake', '--once'], deps)).toBe(1);
   });
 });
+
+describe('intake loop open subjects', () => {
+  const issue = (number: number) => ({ number, title: `Issue ${number}`, body: '', labels: ['factory:ready'], state: 'open' as const, authorAssociation: 'OWNER' });
+
+  function stubbed(over: Partial<IntakeConfig>) {
+    const listed: Record<string, number[]> = { 'o/a': [1, 2], 'o/b': [1, 2] };
+    const calls = { openSubjects: 0 };
+    const enqueued: string[] = [];
+    const open: string[] = [];
+    const host = {
+      listIssuesByLabel: async (repo: string) => (listed[repo] ?? []).map(issue),
+      setLabels: async () => {},
+    };
+    const kernel = {
+      enqueue: async (_engine: string, input: { issueUrl: string }) => {
+        const m = /github\.com\/(.+)\/issues\/(\d+)$/.exec(input.issueUrl)!;
+        enqueued.push(`${m[1]}#${m[2]}`);
+        open.push(`${m[1]}#${m[2]}`); // the chain is now open in the database
+        return { chain: { id: enqueued.length }, job: { id: enqueued.length } };
+      },
+    };
+    const intake = new Intake({
+      host: host as never, kernel: kernel as never, config: config({ repos: ['o/a', 'o/b'], ...over }), engine: 'software',
+      openSubjects: () => { calls.openSubjects++; return [...open]; }, isDraining: () => false,
+      redact: (t) => t, stdout: () => {}, stderr: () => {},
+    });
+    return { intake, calls, enqueued, open };
+  }
+
+  it('reads the open subjects once per pass for several repositories', async () => {
+    const { intake, calls } = stubbed({ maxOpenChains: 5 });
+    await intake.pass();
+    expect(calls.openSubjects).toBe(1);
+    await intake.pass();
+    expect(calls.openSubjects).toBe(2);
+  });
+
+  it("respects a repository's capacity across two issues in one pass", async () => {
+    const { intake, enqueued } = stubbed({ maxOpenChains: 1 });
+    await intake.pass();
+    expect(enqueued).toEqual(['o/a#1', 'o/b#1']);
+  });
+});
+
