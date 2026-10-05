@@ -623,6 +623,26 @@ describe('GhCliHost getChecks', () => {
     await expect(new GhCliHost({ exec }).getChecks(R, SHA)).rejects.toMatchObject({ status: 502 });
   });
 
+  it('retries on 404 when checks have not started', async () => {
+    const { exec, calls } = stub([
+      { stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 },
+      { stdout: runs([run(1)]) },
+      { stdout: statuses([]) },
+    ]);
+    const r = await new GhCliHost({ exec }).getChecks(R, SHA);
+    expect(r.state).toBe('passing');
+    expect(calls.length).toBeGreaterThan(1);
+  });
+
+  it('gives up on 404 after retries', async () => {
+    const { exec } = stub([
+      { stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 },
+      { stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 },
+      { stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 },
+    ]);
+    await expect(new GhCliHost({ exec }).getChecks(R, SHA)).rejects.toMatchObject({ status: 404 });
+  });
+
   it('reads the end of the failing log with gh run view --log-failed', async () => {
     const { exec, calls } = stub([{ stdout: `${Array.from({ length: 10 }, (_, i) => `l${i + 1}`).join('\n')}\n` }]);
     expect(await new GhCliHost({ exec }).getFailedLogExcerpt(R, 77, 3)).toBe('l8\nl9\nl10');
