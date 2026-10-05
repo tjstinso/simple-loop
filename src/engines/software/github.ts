@@ -7,6 +7,8 @@ export interface Issue {
   body: string;
   labels: string[];
   state: 'open' | 'closed';
+  /** GitHub's `author_association` of the issue's author (`NONE` when unknown). */
+  authorAssociation: string;
 }
 
 /** Whether GitHub can merge the pull request into its base: `unknown` while GitHub is still computing it. */
@@ -116,6 +118,8 @@ export function summarizeChecks(checks: readonly CheckInfo[]): ChecksStatus['sta
 
 export interface GitHost {
   getIssue(repo: string, n: number): Promise<Issue>;
+  /** The open issues (no pull requests) with the label, oldest first by number, all pages. */
+  listIssuesByLabel(repo: string, label: string): Promise<Issue[]>;
   findPrByHead(repo: string, branch: string): Promise<Pr | null>;
   openPr(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<Pr>;
   getPr(repo: string, n: number): Promise<Pr>;
@@ -303,6 +307,13 @@ export const buildListIssuesByLabelArgs = (repo: string, label: string, page: nu
   '-f', 'state=all', '-f', `labels=${label}`, '-f', 'per_page=100', '-f', `page=${page}`,
 ];
 
+/** Open issues with a label, oldest first; `-X GET` makes gh send the `-f` fields as query parameters. */
+export const buildListOpenIssuesByLabelArgs = (repo: string, label: string, page: number): string[] => [
+  'api', '-X', 'GET', `repos/${repo}/issues`,
+  '-f', 'state=open', '-f', `labels=${label}`, '-f', 'sort=created', '-f', 'direction=asc',
+  '-f', 'per_page=100', '-f', `page=${page}`,
+];
+
 export const buildCreateIssueArgs = (repo: string): string[] => [
   'api', '-X', 'POST', `repos/${repo}/issues`, '--input', '-',
 ];
@@ -330,6 +341,8 @@ interface RestIssue {
   body?: string | null;
   state?: string;
   labels?: Array<{ name: string } | string>;
+  author_association?: string | null;
+  pull_request?: unknown;
 }
 
 interface RestPr {
@@ -491,15 +504,27 @@ export class GhCliHost implements GitHost {
     return u.login ?? '';
   }
 
-  async getIssue(repo: string, n: number): Promise<Issue> {
-    const i = await this.json<RestIssue>(buildGetIssueArgs(repo, n));
+  private mapIssue(i: RestIssue): Issue {
     return {
       number: i.number,
       title: i.title ?? '',
       body: i.body ?? '',
       labels: (i.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
       state: String(i.state).toLowerCase() === 'closed' ? 'closed' : 'open',
+      authorAssociation: i.author_association ?? 'NONE',
     };
+  }
+
+  async getIssue(repo: string, n: number): Promise<Issue> {
+    return this.mapIssue(await this.json<RestIssue>(buildGetIssueArgs(repo, n)));
+  }
+
+  async listIssuesByLabel(repo: string, label: string): Promise<Issue[]> {
+    const items = await this.pages<RestIssue>((p) => buildListOpenIssuesByLabelArgs(repo, label, p));
+    return items
+      .filter((i) => !i.pull_request)
+      .map((i) => this.mapIssue(i))
+      .sort((a, b) => a.number - b.number);
   }
 
   async findPrByHead(repo: string, branch: string): Promise<Pr | null> {

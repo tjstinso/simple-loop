@@ -196,3 +196,41 @@ describe('breaker settings', () => {
     expect(deprecationWarnings(load({}))).toEqual([]);
   });
 });
+
+describe('intake block', () => {
+  const load = (intake?: unknown) => {
+    const d = tmp();
+    writeFileSync(join(d, 'factory.config.json'), JSON.stringify(intake === undefined ? {} : { intake }));
+    return loadConfig(undefined, d);
+  };
+
+  it('is absent without the block', () => {
+    expect(load().intake).toBeUndefined();
+  });
+
+  it('applies the defaults', () => {
+    expect(load({ repos: ['o/r'] }).intake).toEqual({
+      repos: ['o/r'],
+      readyLabel: 'factory:ready',
+      pollIntervalMs: 60_000,
+      maxOpenChains: 2,
+      allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'],
+    });
+  });
+
+  it('accepts overrides', () => {
+    const c = load({ repos: ['o/r', 'a/b'], readyLabel: 'go', pollIntervalMs: 5000, maxOpenChains: 1, allowedAuthorAssociations: ['OWNER'] });
+    expect(c.intake).toMatchObject({ readyLabel: 'go', pollIntervalMs: 5000, maxOpenChains: 1, allowedAuthorAssociations: ['OWNER'] });
+  });
+
+  it.each([
+    [{ repos: [] }],
+    [{ repos: ['nope'] }],
+    [{ repos: ['o/r'], pollIntervalMs: 4999 }],
+    [{ repos: ['o/r'], maxOpenChains: 0 }],
+    [{ repos: ['o/r'], extra: 1 }],
+    [{}],
+  ])('rejects %j', (intake) => {
+    expect(() => load(intake)).toThrow(/invalid config/);
+  });
+});

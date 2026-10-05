@@ -12,6 +12,13 @@
   "breakers": {
     "conflict": { "failureThreshold": 3, "cooldownMs": 600000, "maxOpens": 3 }
   },
+  "intake": {
+    "repos": ["owner/name"],
+    "readyLabel": "factory:ready",
+    "pollIntervalMs": 60000,
+    "maxOpenChains": 2,
+    "allowedAuthorAssociations": ["OWNER", "MEMBER", "COLLABORATOR"]
+  },
   "chainBudgetUsd": 25,
   "cloneUrlTemplate": "https://github.com/{repo}.git"
 }

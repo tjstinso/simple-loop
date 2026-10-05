@@ -19,6 +19,7 @@ interface StoredIssue {
   title: string;
   body: string;
   state: 'open' | 'closed';
+  authorAssociation: string;
 }
 
 interface StoredPr extends Pr {
@@ -54,10 +55,10 @@ export class FakeGitHost implements GitHost {
   headShaOf: ((branch: string) => string | null) | null = null;
 
   // ---- seeding / inspection ----
-  addIssue(a: { number?: number; title: string; body: string; labels: string[]; state?: 'open' | 'closed' }): number {
+  addIssue(a: { number?: number; title: string; body: string; labels: string[]; state?: 'open' | 'closed'; authorAssociation?: string }): number {
     const number = a.number ?? this.nextNumber;
     this.nextNumber = Math.max(this.nextNumber, number + 1);
-    this.issues.set(number, { number, title: a.title, body: a.body, state: a.state ?? 'open' });
+    this.issues.set(number, { number, title: a.title, body: a.body, state: a.state ?? 'open', authorAssociation: a.authorAssociation ?? 'NONE' });
     this.labels.set(number, new Set(a.labels));
     return number;
   }
@@ -199,8 +200,16 @@ export class FakeGitHost implements GitHost {
     const i = this.issues.get(n);
     if (i) return { ...i, labels: this.getLabels(n) };
     const pr = this.prs.get(n); // PRs are issues on GitHub
-    if (pr) return { number: n, title: pr.title, body: pr.body, labels: this.getLabels(n), state: pr.state === 'open' ? 'open' : 'closed' };
+    if (pr) return { number: n, title: pr.title, body: pr.body, labels: this.getLabels(n), state: pr.state === 'open' ? 'open' : 'closed', authorAssociation: 'NONE' };
     throw new GitHostError('Not Found', 404);
+  }
+
+  async listIssuesByLabel(repo: string, label: string): Promise<Issue[]> {
+    this.enter('listIssuesByLabel', [repo, label]);
+    return [...this.issues.values()]
+      .filter((i) => i.state === 'open' && this.labels.get(i.number)?.has(label))
+      .sort((a, b) => a.number - b.number)
+      .map((i) => ({ ...i, labels: this.getLabels(i.number) }));
   }
 
   async findPrByHead(repo: string, branch: string): Promise<Pr | null> {
