@@ -352,6 +352,15 @@ describe('fenced writes', () => {
     expect(rawJobs(db)).toEqual(before);
     expect(getJob(db, job.id)).toMatchObject({ status: 'running', claimedBy: 'w2', delivery: second.delivery });
   });
+
+  it('requeueJob with resetBackoff resets transient_retries and available_at for manual requeue', () => {
+    const db = mk();
+    const { job } = seed(db, 'a', 1);
+    const claimed = claimNext(db, 'w1', 10, 1000)!;
+    db.prepare('UPDATE jobs SET transient_retries = 3, available_at = ? WHERE id = ?').run(5000, job.id);
+    expect(requeueJob(db, job.id, { delivery: claimed.delivery, resetBackoff: true })).toBe(true);
+    expect(getJob(db, job.id)).toMatchObject({ status: 'queued', transientRetries: 0, availableAt: null });
+  });
 });
 
 describe('commitTransition', () => {

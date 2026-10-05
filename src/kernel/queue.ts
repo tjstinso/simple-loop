@@ -449,11 +449,18 @@ export function failJob(db: Db, fence: Fence, error: string): void {
  * (a no-op) otherwise. `result` and `delivery` are kept, so the next claim gets
  * delivery + 1 and any write from the previous holder is rejected.
  * `updated_at` is left unchanged because no clock value is passed in.
+ * When `resetBackoff` is true, transient_retries is reset to 0 and available_at is cleared
+ * to start fresh with a clean backoff window for manual requeues.
  */
-export function requeueJob(db: Db, jobId: number, opts: { delivery?: number; now?: number; why?: string } = {}): boolean {
+export function requeueJob(db: Db, jobId: number, opts: { delivery?: number; now?: number; why?: string; resetBackoff?: boolean } = {}): boolean {
   // A stop handback is not a failure of the job: it must not count against maxDeliveries.
-  const uncounted = opts.why === 'worker stopping' ? ', transient_retries = transient_retries + 1' : '';
-  const sql = `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL${uncounted}
+  let extra = '';
+  if (opts.why === 'worker stopping') {
+    extra = ', transient_retries = transient_retries + 1';
+  } else if (opts.resetBackoff) {
+    extra = ', transient_retries = 0, available_at = NULL';
+  }
+  const sql = `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL${extra}
                 WHERE id = ? AND status = 'running'`;
   return db
     .transaction((): boolean => {
