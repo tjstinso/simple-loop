@@ -1063,6 +1063,15 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       } catch (e) {
         errors.push(e);
       }
+      if (outcome.outcome === 'completed') {
+        // Best effort: an already closed issue or a missing permission must not stall reconciliation.
+        try {
+          const pr = await deps.host.findPrByHead(s.repo, s.branch);
+          if (pr) await deps.host.closeIssue(s.repo, s.issueNumber, `Closed by #${pr.number}`);
+        } catch (e) {
+          console.warn(`could not close issue ${s.repo}#${s.issueNumber}: ${e instanceof Error ? redact(e.message) : 'unknown error'}`);
+        }
+      }
       if (errors.length > 0) throw errors[0];
     },
 

@@ -29,8 +29,9 @@ afterEach(() => {
   for (const h of harnesses.splice(0)) h.cleanup();
 });
 
-/** The issue's comments without the queued / started notices every chain gets. */
-const outcomeComments = (h: Harness): string[] => h.comments(N).filter((c) => !/event=(queued|started) -->/.test(c));
+/** The issue's comments without the queued / started notices every chain gets and the "Closed by" note of a completed chain. */
+const outcomeComments = (h: Harness): string[] =>
+  h.comments(N).filter((c) => !/event=(queued|started) -->/.test(c) && !/^Closed by #\d+$/.test(c));
 
 const ws = (input: RunInput) => input.workspace as SoftwareWorkspace;
 

@@ -126,6 +126,8 @@ export interface GitHost {
   setLabels(repo: string, n: number, add: string[], remove: string[]): Promise<void>;
   findComment(repo: string, n: number, marker: string): Promise<boolean>;
   comment(repo: string, n: number, body: string): Promise<void>;
+  /** Comments on the issue, then closes it (state `closed`, reason `completed`). */
+  closeIssue(repo: string, n: number, comment: string): Promise<void>;
   findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null>;
   createIssue(repo: string, args: { title: string; body: string; labels: string[] }): Promise<number>;
   /**
@@ -278,6 +280,10 @@ export const buildFailedLogArgs = (repo: string, runId: number): string[] => [
 
 export const buildCommentArgs = (repo: string, n: number): string[] => [
   'api', '-X', 'POST', `repos/${repo}/issues/${n}/comments`, '--input', '-',
+];
+
+export const buildCloseIssueArgs = (repo: string, n: number): string[] => [
+  'api', '-X', 'PATCH', `repos/${repo}/issues/${n}`, '--input', '-',
 ];
 
 export const buildReplyToReviewCommentArgs = (repo: string, n: number, commentId: number): string[] => [
@@ -584,6 +590,11 @@ export class GhCliHost implements GitHost {
 
   async comment(repo: string, n: number, body: string): Promise<void> {
     await this.run(buildCommentArgs(repo, n), { body });
+  }
+
+  async closeIssue(repo: string, n: number, comment: string): Promise<void> {
+    await this.run(buildCommentArgs(repo, n), { body: comment });
+    await this.run(buildCloseIssueArgs(repo, n), { state: 'closed', state_reason: 'completed' });
   }
 
   /** Every page of a REST list (100 per page, a short page is the last). */
