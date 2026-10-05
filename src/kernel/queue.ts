@@ -179,6 +179,14 @@ export function countRunning(db: Db): number {
   return (db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'`).get() as { n: number }).n;
 }
 
+/** The earliest `available_at` time for queued jobs, or null if no queued jobs have a future `available_at`. */
+export function minAvailableAt(db: Db, now: number): number | null {
+  const r = db
+    .prepare(`SELECT MIN(available_at) AS earliest FROM jobs WHERE status = 'queued' AND available_at > ?`)
+    .get(now) as { earliest: number | null } | undefined;
+  return r?.earliest ?? null;
+}
+
 /** At most one `job.throttled` event per this interval. */
 export const THROTTLE_EVENT_INTERVAL_MS = 60_000;
 

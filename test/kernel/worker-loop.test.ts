@@ -707,6 +707,32 @@ describe('worker loop', () => {
     await w.stop();
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it('wakes idle worker when nearest transient retry becomes available', async () => {
+    const NETWORK = new Error("fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com");
+    const s = track(setup());
+    s.echo.workspace.prepare = async () => {
+      throw NETWORK;
+    };
+    const { job } = await s.kernel.enqueue('echo', { key: 'a' });
+    const w = s.start({ pollMs: 10_000 });
+    await tick(100);
+
+    expect(getJob(s.db, job.id)).toMatchObject({ status: 'queued', transientRetries: 1 });
+    const availableAt = getJob(s.db, job.id).availableAt!;
+
+    // Worker is idle; should sleep until availableAt, not the full pollMs.
+    // availableAt is now + 15_000 ms (first retry delay).
+    // Tick 14_000 ms: job still queued, waiting for availableAt.
+    await tick(14_000);
+    expect(getJob(s.db, job.id).status).toBe('queued');
+
+    // Tick to availableAt: job becomes claimable and is claimed/processed.
+    await tick(1_001);
+    expect(getJob(s.db, job.id)).toMatchObject({ status: 'queued', transientRetries: 2 });
+
+    await w.stop();
+  });
 });
 
 describe('kernel.enqueue', () => {
