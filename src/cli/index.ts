@@ -18,6 +18,7 @@ import { countRunning } from '../kernel/queue.js';
 import type { ChainView } from '../kernel/types.js';
 import { describePolicy } from '../policy/resolve.js';
 import { routeEngine } from '../router/router.js';
+import { planIntake } from '../intake/plan.js';
 import { loadConfig } from './config.js';
 import { buildRuntime, type Runtime } from './runtime.js';
 
@@ -41,6 +42,7 @@ const USAGE = `Usage:
   factory [--config <path>] dlq discard <job-id>
   factory [--config <path>] cancel <chain-id>
   factory [--config <path>] policies
+  factory [--config <path>] intake --once --dry-run
   factory [--config <path>] dashboard [--port <n>] [--host <addr>]
 Options:
   --config <path>   config file (default ./factory.config.json)
@@ -328,6 +330,40 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
         return 1;
       }
     }
+    case 'intake': {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { once: { type: 'boolean' }, 'dry-run': { type: 'boolean' } },
+      });
+      if (positionals.length > 0) throw new UsageError('intake takes no arguments');
+      const intake = rt.intake;
+      if (intake === undefined) {
+        stderr('error: intake is not configured');
+        return 1;
+      }
+      if (values.once !== true || values['dry-run'] !== true) {
+        throw new UsageError('intake needs --once --dry-run; the polling loop arrives in a later phase');
+      }
+      const host = rt.host;
+      if (host === undefined) throw new Error('no GitHub adapter available');
+      rt.requireGithub?.();
+      let failed = false;
+      for (const repo of intake.repos) {
+        try {
+          const issues = await host.listIssuesByLabel(repo, intake.readyLabel);
+          const rows = rt.db
+            .prepare(`SELECT subject_key FROM chains WHERE status IN ('active', 'waiting', 'dead_lettered')`)
+            .all() as Array<{ subject_key: string }>;
+          const decisions = planIntake(issues, rows.map((r) => r.subject_key), { ...intake, repo });
+          for (const d of decisions) stdout(`${repo}#${d.number} ${d.decision} ${d.reason}`);
+        } catch (e) {
+          stderr(`error: ${message(e)}`);
+          failed = true;
+        }
+      }
+      return failed ? 1 : 0;
+    }
     default:
       throw new UsageError(cmd === undefined ? 'missing command' : `unknown command: ${cmd}`);
   }
@@ -415,7 +451,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   try {
     if (command[0] === undefined) return usageError('missing command');
     if (command[0] === 'dashboard') return await runDashboard(command.slice(1), config, cwd, { stdout, stderr, onSignal });
-    if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel', 'policies'].includes(command[0])) {
+    if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel', 'policies', 'intake'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));

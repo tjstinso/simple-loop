@@ -314,6 +314,26 @@ $ factory cancel 1
 cancelled chain 1
 ```
 
+## Intake
+
+The optional `intake` block of `factory.config.json` lets the factory find the issues a person marked ready with a label. In this first phase it only reads: it enqueues, comments and labels nothing.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `repos` | required, at least one | `owner/name` of each repository to watch. |
+| `readyLabel` | `factory:ready` | Label that marks an open issue as ready. |
+| `pollIntervalMs` | `60000` | At least 5000. For the polling loop of a later phase. |
+| `maxOpenChains` | `2` | At least 1. Open chains (active, waiting or dead-lettered) allowed per repository. |
+| `allowedAuthorAssociations` | `["OWNER", "MEMBER", "COLLABORATOR"]` | Only issues by authors with one of these GitHub `author_association` values may cause work. |
+
+Unknown keys in the block are an error. Without the block `factory intake` exits 1 with `intake is not configured`.
+
+```
+factory intake --once --dry-run
+```
+
+prints one line per ready issue, oldest first, as `<owner/repo>#<n> <decision> <reason>`, and exits 0. The decision is `enqueue ready`, or `skip` with the reason `author not allowed`, `already queued` or `at capacity`. If `gh` fails for a repository, `error: <message>` goes to stderr, the other repositories are still processed and the exit code is 1. The command reads the GitHub token and calls GitHub, but writes nothing to GitHub or the database. Both flags are required until the loop exists.
+
 ## Dashboard
 
 `factory dashboard [--port <n>] [--host <addr>]` serves a page in the browser that shows where every chain is and who has to act next, so you do not have to combine `status`, `show` and `workers`. It listens on `127.0.0.1:4173` by default and runs until SIGINT or SIGTERM, then shuts down cleanly.

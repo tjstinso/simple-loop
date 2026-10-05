@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { run, type CliDeps } from '../../src/cli/index.js';
 import type { Runtime } from '../../src/cli/runtime.js';
+import { GitHostError } from '../../src/engines/software/github.js';
 import { LABEL_DEAD_LETTER } from '../../src/engines/software/index.js';
 import { ISSUE_BODY, makeHarness, ok, REPO, type Harness } from '../support/harness.js';
 
@@ -406,5 +407,56 @@ describe('factory cli', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('intake command', () => {
+  const intake = { repos: ['o/r', 'o/other'], readyLabel: 'factory:ready', pollIntervalMs: 60_000, maxOpenChains: 2, allowedAuthorAssociations: ['OWNER', 'MEMBER', 'COLLABORATOR'] };
+  const counts = (h: Harness) =>
+    ['chains', 'jobs', 'events'].map((t) => (h.db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n);
+
+  it('exits 1 when intake is not configured', async () => {
+    const { deps, err } = setup();
+    expect(await run(['intake', '--once', '--dry-run'], deps)).toBe(1);
+    expect(err).toEqual(['error: intake is not configured']);
+  });
+
+  it('needs --once and --dry-run', async () => {
+    const { h, deps, err } = setup();
+    const runtime: Runtime = { ...deps.runtime!, host: h.host, intake };
+    expect(await run(['intake'], { ...deps, runtime })).toBe(2);
+    expect(await run(['intake', '--once'], { ...deps, runtime })).toBe(2);
+    expect(err.join('\n')).toContain('later phase');
+  });
+
+  it('prints one line per issue and writes nothing', async () => {
+    const { h, out, err, deps } = setup();
+    h.host.addIssue({ number: 1, title: 'a', body: ISSUE_BODY, labels: ['factory:ready'], authorAssociation: 'OWNER' });
+    h.host.addIssue({ number: 2, title: 'b', body: ISSUE_BODY, labels: ['factory:ready'], authorAssociation: 'NONE' });
+    h.host.addIssue({ number: 3, title: 'c', body: ISSUE_BODY, labels: ['factory:ready'], authorAssociation: 'MEMBER' });
+    h.host.addIssue({ number: 4, title: 'd', body: ISSUE_BODY, labels: ['factory:ready'], authorAssociation: 'MEMBER' });
+    h.host.addIssue({ number: 5, title: 'e', body: ISSUE_BODY, labels: ['other'], authorAssociation: 'OWNER' });
+    await h.submit(3);
+    h.host.addIssue({ number: 3, title: 'c', body: ISSUE_BODY, labels: ['factory:ready'], authorAssociation: 'MEMBER' });
+    const before = counts(h);
+    const runtime: Runtime = { ...deps.runtime!, host: h.host, intake: { ...intake, repos: ['o/r'] } };
+    expect(await run(['intake', '--once', '--dry-run'], { ...deps, runtime })).toBe(0);
+    expect(err).toEqual([]);
+    expect(out).toEqual(['o/r#1 enqueue ready', 'o/r#2 skip author not allowed', 'o/r#3 skip already queued', 'o/r#4 skip at capacity']);
+    expect(counts(h)).toEqual(before);
+    expect(h.host.getComments(1)).toEqual([]);
+    expect(h.host.getLabels(1)).toEqual(['factory:ready']);
+  });
+
+  it('reports a failing repository and still processes the others', async () => {
+    const { h, out, err, deps } = setup();
+    h.host.addIssue({ number: 1, title: 'a', body: ISSUE_BODY, labels: ['factory:ready'], authorAssociation: 'OWNER' });
+    h.host.failNext('listIssuesByLabel', new GitHostError('boom', 500));
+    const before = counts(h);
+    const runtime: Runtime = { ...deps.runtime!, host: h.host, intake };
+    expect(await run(['intake', '--once', '--dry-run'], { ...deps, runtime })).toBe(1);
+    expect(err).toEqual(['error: boom']);
+    expect(out).toEqual(['o/other#1 enqueue ready']);
+    expect(counts(h)).toEqual(before);
   });
 });

@@ -22,7 +22,7 @@ const ws: SoftwareWorkspace = {
   repo: 'acme/widgets', path: '/ws', localBranch: 'l', remoteBranch: 'factory/issue-7', remoteUrl: '/r.git',
   remoteHeadSha: null, seedSha: 'seed', baseBranch: 'main', cacheDir: '/cache/o__r.git',
 };
-const issue = { number: 7, title: 'Add thing', body: '## Goal\nx', labels: ['bug'], state: 'open', author: 'eve', url: 'http://x' } as Issue;
+const issue = { number: 7, title: 'Add thing', body: '## Goal\nx', labels: ['bug'], state: 'open', authorAssociation: 'NONE', author: 'eve', url: 'http://x' } as Issue;
 const pr = { number: 12, baseBranch: 'main' };
 
 const policiesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../../policies');

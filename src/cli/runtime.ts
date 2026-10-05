@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { FOLLOWUPS_DDL } from '../engines/software/followups.js';
 import { ExecGitPorts, FACTORY_GIT_EMAIL, FACTORY_GIT_NAME } from '../engines/software/git-ports.js';
-import { GhCliHost } from '../engines/software/github.js';
+import { GhCliHost, type GitHost } from '../engines/software/github.js';
 import { createLazyGithubAuth, verifyLogin, type GithubAuth, type LazyGithubAuth } from '../engines/software/identity.js';
 import { createSoftwareEngine } from '../engines/software/index.js';
 import { secretEnvValues } from '../engines/software/secret-scan.js';
@@ -14,12 +14,16 @@ import { resolvePolicies, type EffectivePolicy } from '../policy/resolve.js';
 import { PolicyStore } from '../policy/store.js';
 import { ClaudeCliRunner } from '../runner/claude-cli.js';
 import { RunnerRegistry } from '../runner/registry.js';
-import { deprecationWarnings, resolveBreakers, type FactoryConfig } from './config.js';
+import { deprecationWarnings, resolveBreakers, type FactoryConfig, type IntakeConfig } from './config.js';
 
 export interface Runtime {
   kernel: Kernel;
   db: Database.Database;
   defaultEngine: string;
+  /** The GitHub adapter (for `factory intake`). */
+  host?: GitHost;
+  /** The `intake` block of the config; absent when intake is not configured. */
+  intake?: IntakeConfig;
   /** Interval of the worker's periodic maintenance. */
   maintenanceMs?: number;
   /** The policies in effect (name, source and merged value), for `factory policies`. */
@@ -130,6 +134,8 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       kernel,
       db,
       defaultEngine: config.defaultEngine,
+      host,
+      ...(config.intake === undefined ? {} : { intake: config.intake }),
       maintenanceMs: config.maintenanceMs,
       effectivePolicies,
       ...(lazy !== undefined ? { requireGithub: () => void lazy?.ensure() } : {}),

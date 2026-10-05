@@ -30,6 +30,17 @@ describe('FakeGitHost', () => {
     expect(gh.getComments(1)).toEqual(['hello <!-- m -->']);
   });
 
+  it('listIssuesByLabel returns open labeled issues oldest first with their author association', async () => {
+    const gh = new FakeGitHost();
+    gh.addIssue({ number: 5, title: 'e', body: '', labels: ['x'], authorAssociation: 'OWNER' });
+    gh.addIssue({ number: 2, title: 'b', body: '', labels: ['x'] });
+    gh.addIssue({ number: 3, title: 'closed', body: '', labels: ['x'], state: 'closed' });
+    gh.addIssue({ number: 4, title: 'other', body: '', labels: ['y'] });
+    const list = await gh.listIssuesByLabel(R, 'x');
+    expect(list.map((i) => [i.number, i.authorAssociation])).toEqual([[2, 'NONE'], [5, 'OWNER']]);
+    expect(await gh.listIssuesByLabel(R, 'none')).toEqual([]);
+  });
+
   it('failNext makes the next call throw GitHostError', async () => {
     const gh = new FakeGitHost();
     gh.addIssue({ number: 1, title: 't', body: '', labels: [] });
@@ -171,7 +182,7 @@ describe('GhCliHost', () => {
       { stdout: JSON.stringify({ number: 7, title: 'T', body: null, state: 'open', labels: [{ name: 'a' }, { name: 'b' }] }) },
     ]);
     const issue = await new GhCliHost({ exec }).getIssue(R, 7);
-    expect(issue).toEqual({ number: 7, title: 'T', body: '', labels: ['a', 'b'], state: 'open' });
+    expect(issue).toEqual({ number: 7, title: 'T', body: '', labels: ['a', 'b'], state: 'open', authorAssociation: 'NONE' });
     expect(calls).toEqual([['gh', ['api', '-X', 'GET', 'repos/o/r/issues/7']]]);
   });
 
@@ -261,6 +272,47 @@ describe('GhCliHost', () => {
       ['api', '-X', 'GET', 'repos/o/r/issues/4/comments', '-f', 'per_page=100', '-f', 'page=1'],
       ['api', '-X', 'GET', 'repos/o/r/issues/4/comments', '-f', 'per_page=100', '-f', 'page=2'],
     ]);
+  });
+
+  describe('listIssuesByLabel', () => {
+    const item = (n: number, extra: object = {}) => ({ number: n, title: `t${n}`, body: 'b', state: 'open', labels: [{ name: 'factory:ready' }], author_association: 'MEMBER', ...extra });
+    const items = (from: number, count: number) => JSON.stringify(Array.from({ length: count }, (_, i) => item(from + i)));
+    const pageArgs = (page: number) => [
+      'api', '-X', 'GET', 'repos/o/r/issues',
+      '-f', 'state=open', '-f', 'labels=factory:ready', '-f', 'sort=created', '-f', 'direction=asc', '-f', 'per_page=100', '-f', `page=${page}`,
+    ];
+
+    it('maps issues with their author association', async () => {
+      const { exec, calls } = stub([{ stdout: JSON.stringify([item(3), item(4, { author_association: undefined })]) }]);
+      const list = await new GhCliHost({ exec }).listIssuesByLabel(R, 'factory:ready');
+      expect(list.map((i) => [i.number, i.authorAssociation, i.labels])).toEqual([[3, 'MEMBER', ['factory:ready']], [4, 'NONE', ['factory:ready']]]);
+      expect(calls.map((c) => c[1])).toEqual([pageArgs(1)]);
+    });
+
+    it('asks for the next page after exactly 100 items and stops at the empty page', async () => {
+      const { exec, calls } = stub([{ stdout: items(1, 100) }, { stdout: '[]' }]);
+      expect(await new GhCliHost({ exec }).listIssuesByLabel(R, 'factory:ready')).toHaveLength(100);
+      expect(calls.map((c) => c[1])).toEqual([pageArgs(1), pageArgs(2)]);
+    });
+
+    it('stops at a short last page', async () => {
+      const { exec, calls } = stub([{ stdout: items(1, 100) }, { stdout: items(101, 3) }, { stdout: '[]' }]);
+      expect(await new GhCliHost({ exec }).listIssuesByLabel(R, 'factory:ready')).toHaveLength(103);
+      expect(calls).toHaveLength(2);
+    });
+
+    it('excludes pull requests and orders by number', async () => {
+      const { exec } = stub([{ stdout: JSON.stringify([item(9), item(5, { pull_request: { url: 'x' } }), item(2)]) }]);
+      const list = await new GhCliHost({ exec }).listIssuesByLabel(R, 'factory:ready');
+      expect(list.map((i) => i.number)).toEqual([2, 9]);
+    });
+
+    it('maps failures like the other calls', async () => {
+      const failed = stub([{ exitCode: 1, stderr: 'gh: Not Found (HTTP 404)' }]);
+      await expect(new GhCliHost({ exec: failed.exec }).listIssuesByLabel(R, 'l')).rejects.toMatchObject({ name: 'GitHostError', status: 404 });
+      const timedOut: ExecFn = async () => ({ stdout: '', stderr: '', exitCode: 1, timedOut: true });
+      await expect(new GhCliHost({ exec: timedOut, ghTimeoutMs: 5 }).listIssuesByLabel(R, 'l')).rejects.toThrow(/timed out/);
+    });
   });
 
   describe('listPrFeedback', () => {

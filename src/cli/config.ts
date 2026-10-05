@@ -38,6 +38,18 @@ const BreakerConfigSchema = z
   })
   .strict();
 
+/** Automatic intake: which repositories to watch for ready issues and how much work to take on. */
+export const IntakeSchema = z
+  .object({
+    repos: z.array(z.string().regex(/^[^/\s]+\/[^/\s]+$/, 'must be owner/name')).min(1),
+    readyLabel: z.string().min(1).default('factory:ready'),
+    pollIntervalMs: z.number().int().min(5_000).default(60_000),
+    maxOpenChains: z.number().int().min(1).default(2),
+    allowedAuthorAssociations: z.array(z.string().min(1)).default(['OWNER', 'MEMBER', 'COLLABORATOR']),
+  })
+  .strict();
+export type IntakeConfig = z.infer<typeof IntakeSchema>;
+
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
   policiesDir: z.string().min(1).optional(),
@@ -70,6 +82,7 @@ const ConfigSchema = z.object({
   maxTransientRetries: z.number().int().min(1).default(8),
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
+  intake: IntakeSchema.optional(),
   repos: z.record(z.string().regex(/^[^/\s]+\/[^/\s]+$/, 'must be owner/name'), RepoToolSchema).optional(),
 }).superRefine((c, ctx) => {
   for (const [name, override] of Object.entries(c.policyOverrides ?? {})) {
