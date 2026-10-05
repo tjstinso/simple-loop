@@ -23,6 +23,8 @@ export interface DashboardOptions {
   now?: () => number;
   /** The configured `maxConcurrentJobs`, shown in the overview (absent: no limit). */
   maxConcurrentJobs?: number;
+  /** The configured `maintenanceMs`, which sets when a waiting chain counts as not checked recently (absent: the default). */
+  maintenanceMs?: number;
 }
 
 export interface DashboardServer {
@@ -75,7 +77,7 @@ export function startDashboard(opts: DashboardOptions): Promise<DashboardServer>
         return;
       }
       if (path === '/api/overview') {
-        json(res, 200, buildOverview(opts.db, now(), { maxConcurrentJobs: opts.maxConcurrentJobs ?? null }));
+        json(res, 200, buildOverview(opts.db, now(), { maxConcurrentJobs: opts.maxConcurrentJobs ?? null, ...(opts.maintenanceMs === undefined ? {} : { maintenanceMs: opts.maintenanceMs }) }));
         return;
       }
       const m = /^\/api\/chains\/([0-9]+)$/.exec(path);

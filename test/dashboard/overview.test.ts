@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { buildOverview, waitingOn, type WaitingInput } from '../../src/dashboard/overview.js';
+import { buildOverview, readDraining, waitingOn, type WaitingInput } from '../../src/dashboard/overview.js';
 import { addChain, addJob, addWorker, event, makeDb, NOW, type TempDb } from './support.js';
 
 const base: WaitingInput = { status: 'active', phase: 'executing', branch: 'b', jobs: [], workerAlive: {}, deadLetter: null, waitingSince: NOW - 60_000, now: NOW };
@@ -225,7 +225,8 @@ describe('buildOverview', () => {
     expect(alive.currentChainId).toBe(ids.running);
     expect(alive.currentJobId).not.toBeNull();
     expect(dead.alive).toBe(false);
-    expect(o.summary).toMatchObject({ workers: 1, aliveWorkers: 1, stoppedWorkers: 1, runningJobs: 3, waitingOnPerson: 3 });
+    expect(o.summary).toMatchObject({ workers: 1, stoppedWorkers: 1, runningJobs: 3, waitingOnPerson: 3 });
+    expect(o.summary).not.toHaveProperty('aliveWorkers');
   });
 
   it('lists alive workers first, then only the 5 most recently seen dead ones', () => {
@@ -235,7 +236,8 @@ describe('buildOverview', () => {
     addWorker(t.db, 'alive-2', NOW - 2000);
     const o = buildOverview(t.db, NOW);
     expect(o.workers.map((w) => w.id)).toEqual(['alive-1', 'alive-2', 'dead-00', 'dead-01', 'dead-02', 'dead-03', 'dead-04']);
-    expect(o.summary).toMatchObject({ workers: 2, aliveWorkers: 2, stoppedWorkers: 13 });
+    expect(o.summary).toMatchObject({ workers: 2, stoppedWorkers: 13 });
+    expect(o.summary).not.toHaveProperty('aliveWorkers');
   });
 
   it('counts an idle worker with an old heartbeat as alive when its process exists', () => {
@@ -265,5 +267,29 @@ describe('buildOverview', () => {
     expect(o.openChains).toEqual([]);
     expect(o.finishedChains).toEqual([]);
     expect(o.workers).toEqual([]);
+  });
+});
+
+describe('readDraining', () => {
+  it('is false for a database without the control table', () => {
+    t = makeDb();
+    t.db.exec('DROP TABLE control');
+    expect(readDraining(t.db)).toBe(false);
+    expect(buildOverview(t.db, NOW).draining).toBe(false);
+  });
+
+  it('follows the drain row when the control table exists', () => {
+    t = makeDb();
+    expect(readDraining(t.db)).toBe(false);
+    t.db.prepare(`INSERT INTO control (key, value, updated_at) VALUES ('drain', '1', ?)`).run(NOW);
+    expect(readDraining(t.db)).toBe(true);
+  });
+
+  it('rethrows any other error', () => {
+    t = makeDb();
+    t.db.close();
+    expect(() => readDraining(t!.db)).toThrow(/not open/);
+    const stub = { prepare: () => { throw new Error('database is locked'); } } as unknown as Parameters<typeof readDraining>[0];
+    expect(() => readDraining(stub)).toThrow('database is locked');
   });
 });

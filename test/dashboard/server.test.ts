@@ -291,4 +291,18 @@ describe('page rendering', () => {
   it('never uses a markup-parsing API', () => {
     expect(PAGE_HTML).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function/);
   });
+
+  it('passes the maintenanceMs option to the overview staleness check', async () => {
+    t = makeDb();
+    const c = addChain(t.db, { status: 'waiting', phase: 'awaiting_merge', issue: 1 });
+    t.db.prepare('UPDATE chains SET last_checked_at = ? WHERE id = ?').run(NOW - 31_000, c);
+    const stale = async (maintenanceMs?: number) => {
+      dash = await startDashboard({ db: openReadOnlyDb(t!.path), port: 0, now: () => NOW, ...(maintenanceMs === undefined ? {} : { maintenanceMs }) });
+      const o = (await (await fetch(url('/api/overview'))).json()) as { openChains: { checkStale: boolean }[] };
+      await dash.close();
+      return o.openChains[0]!.checkStale;
+    };
+    expect(await stale()).toBe(false);
+    expect(await stale(10_000)).toBe(true);
+  });
 });
