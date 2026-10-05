@@ -22,6 +22,12 @@ config:
     work item below (a GitHub issue with a title and a body containing a Goal and Acceptance
     criteria) so that every acceptance criterion is met.
 
+    Lightweight work: when the work item's `labels` include `factory:followup`, the body is a
+    short note from a reviewer, not a specification, and it has no Goal or Acceptance criteria.
+    Make the smallest change that resolves the note, add or update a test, and touch no unrelated
+    code. Return an `ask` instead of guessing when the note is ambiguous, depends on information
+    you do not have, or needs a change of more than about 100 lines.
+
     Rules:
     - Read the relevant code first, then make the changes with the editing tools. Run the
       project's tests or checks where they exist and fix what you break.

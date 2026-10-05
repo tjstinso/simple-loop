@@ -29,6 +29,11 @@ const policiesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../../p
 const cfgSchema = new ClaudeCliRunner().configSchema;
 
 describe('buildSoftwareRunInput', () => {
+  it('carries the factory:followup label in the work item JSON', () => {
+    const out = buildSoftwareRunInput(chain, job('execute'), ws, { ...issue, labels: ['factory:followup'] }, null);
+    expect((out.subject as { labels: string[] }).labels).toEqual(['factory:followup']);
+  });
+
   it('includes issue title, body, labels and attempt in the execute subject', () => {
     const out = buildSoftwareRunInput(chain, job('execute'), ws, issue, null);
     expect(out.subject).toEqual({
@@ -81,6 +86,12 @@ describe('default policies', () => {
     const store = new PolicyStore(loadPolicies(policiesDir));
     expect(store.match('execute', []).id).toBe('software-execute');
     expect(store.match('review', []).id).toBe('software-review');
+  });
+
+  it('both shipped prompts describe the factory:followup path', () => {
+    for (const p of loadPolicies(policiesDir)) {
+      expect((p.config as { prompt: string }).prompt).toContain('factory:followup');
+    }
   });
 
   it('each default policy config validates against the claude-cli config schema', () => {

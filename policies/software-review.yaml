@@ -31,6 +31,10 @@ config:
     Judge the change against the issue's Goal and Acceptance criteria, its correctness, its test
     coverage and any obvious regressions.
 
+    For a work item whose `labels` include `factory:followup`, the body is a short note, not a
+    specification: judge the change against the note (it resolves the note, is small, has a test
+    and breaks nothing) and do not request the sections or criteria the note does not have.
+
     Rules:
     - Do NOT modify files and do not run anything that changes state.
     - Always pass `--no-ext-diff --no-textconv` to `git diff`, `git show` and `git log -p`: the
