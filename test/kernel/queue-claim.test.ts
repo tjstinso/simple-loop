@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type Database from 'better-sqlite3';
+import { isDraining, startDrain, stopDrain } from '../../src/kernel/control.js';
 import { openDb, migrate } from '../../src/kernel/db.js';
 import {
   claimNext,
@@ -444,5 +445,54 @@ describe('claimNext with a concurrency limit', () => {
     seed(db, 'b', 20);
     expect(claimNext(db, 'w1', 100, 1000)).not.toBeNull();
     expect(claimNext(db, 'w2', 100, 1000)).not.toBeNull();
+  });
+});
+
+describe('claimNext while draining', () => {
+  it('claims nothing while the drain flag is set and claims again after resume', () => {
+    const db = mk();
+    const a = seed(db, 'a', 10).job;
+    startDrain(db, 11);
+    expect(claimNext(db, 'w1', 20, 1000)).toBeNull();
+    expect(getJob(db, a.id).status).toBe('queued');
+    expect(getJob(db, a.id).delivery).toBe(0);
+    stopDrain(db, 21);
+    expect(claimNext(db, 'w1', 30, 1000)?.id).toBe(a.id);
+  });
+
+  it('applies to requeued jobs too', () => {
+    const db = mk();
+    const a = seed(db, 'a', 10).job;
+    db.prepare(`UPDATE jobs SET available_at = 5 WHERE id = ?`).run(a.id);
+    startDrain(db, 11);
+    expect(claimNext(db, 'w1', 20, 1000)).toBeNull();
+    stopDrain(db, 21);
+    expect(claimNext(db, 'w1', 30, 1000)?.id).toBe(a.id);
+  });
+
+  it('checks the flag inside the claim transaction', () => {
+    const db = mk();
+    seed(db, 'a', 10);
+    const real = db.prepare.bind(db);
+    // The flag is read only from within the immediate transaction that claims.
+    let inTransaction: boolean[] = [];
+    (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+      if (/FROM control/.test(sql)) inTransaction.push(db.inTransaction);
+      return real(sql);
+    }) as typeof db.prepare;
+    claimNext(db, 'w1', 20, 1000);
+    expect(inTransaction).toEqual([true]);
+  });
+
+  it('drain is idempotent and records events once; resume only when set', () => {
+    const db = mk();
+    expect(stopDrain(db, 1)).toBe(false);
+    expect(startDrain(db, 2)).toBe(true);
+    expect(startDrain(db, 3)).toBe(false);
+    expect(isDraining(db)).toBe(true);
+    expect(db.prepare(`SELECT updated_at FROM control WHERE key = 'drain'`).get()).toEqual({ updated_at: 2 });
+    expect(stopDrain(db, 4)).toBe(true);
+    expect(stopDrain(db, 5)).toBe(false);
+    expect(db.prepare(`SELECT kind FROM events ORDER BY id`).all()).toEqual([{ kind: 'drain.started' }, { kind: 'drain.resumed' }]);
   });
 });

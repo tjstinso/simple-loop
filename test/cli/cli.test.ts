@@ -138,6 +138,73 @@ describe('factory cli', () => {
     expect(out[out.length - 1]).toBe('slots: 1 of 3');
   });
 
+  it('status ends with the DRAINING line only while the drain flag is set', async () => {
+    const { h, out, deps } = setup();
+    await h.submit(5);
+    h.claim();
+    expect(await run(['drain'], deps)).toBe(0);
+    expect(out.pop()).toBe('draining: 1 job(s) running');
+    expect(await run(['status'], deps)).toBe(0);
+    expect(out[out.length - 1]).toBe('DRAINING (1 job(s) still running)');
+    out.length = 0;
+    expect(await run(['resume'], deps)).toBe(0);
+    expect(out).toEqual(['resumed']);
+    out.length = 0;
+    expect(await run(['status'], deps)).toBe(0);
+    expect(out[out.length - 1]).toMatch(/^slots: 1/);
+  });
+
+  it('drain and resume are idempotent and record their events once', async () => {
+    const { h, deps } = setup();
+    await run(['resume'], deps);
+    await run(['drain'], deps);
+    const at = h.db.prepare(`SELECT updated_at FROM control WHERE key = 'drain'`).get();
+    await run(['drain'], deps);
+    expect(h.db.prepare(`SELECT updated_at FROM control WHERE key = 'drain'`).get()).toEqual(at);
+    await run(['resume'], deps);
+    await run(['resume'], deps);
+    expect(h.db.prepare(`SELECT kind FROM events WHERE kind LIKE 'drain.%' ORDER BY id`).all()).toEqual([
+      { kind: 'drain.started' },
+      { kind: 'drain.resumed' },
+    ]);
+  });
+
+  it('drain --wait polls until the last running job finishes, then prints drained', async () => {
+    const { h, out, deps } = setup();
+    await h.submit(5);
+    h.claim();
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+      if (sleeps.length === 2) h.db.prepare(`UPDATE jobs SET status = 'succeeded' WHERE status = 'running'`).run();
+    };
+    expect(await run(['drain', '--wait'], { ...deps, sleep })).toBe(0);
+    expect(sleeps).toEqual([2000, 2000]);
+    expect(out).toEqual(['drained']);
+    expect(h.db.prepare(`SELECT 1 FROM control WHERE key = 'drain'`).get()).toBeDefined();
+  });
+
+  it('drain --wait --timeout exits 1 and leaves the flag set', async () => {
+    const { h, err, deps } = setup();
+    await h.submit(5);
+    h.claim();
+    let now = 0;
+    h.kernel.deps.clock = () => now;
+    const sleep = async (ms: number) => {
+      now += ms;
+    };
+    expect(await run(['drain', '--wait', '--timeout', '5'], { ...deps, sleep })).toBe(1);
+    expect(err).toEqual(['still draining: 1 job(s) running']);
+    expect(h.db.prepare(`SELECT 1 FROM control WHERE key = 'drain'`).get()).toBeDefined();
+  });
+
+  it('drain rejects --timeout without --wait and stray arguments', async () => {
+    const { deps } = setup();
+    expect(await run(['drain', '--timeout', '5'], deps)).toBe(2);
+    expect(await run(['drain', 'x'], deps)).toBe(2);
+    expect(await run(['resume', 'x'], deps)).toBe(2);
+  });
+
   it('show and status print when a waiting chain was last checked, or that it never was', async () => {
     const { h, out, deps } = setup();
     const { chain } = await h.submit(5);

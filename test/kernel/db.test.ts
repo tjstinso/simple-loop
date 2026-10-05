@@ -88,3 +88,18 @@ describe('chain check columns', () => {
     expect(columns(db)).toHaveLength(2);
   });
 });
+
+describe('control table', () => {
+  it('is added to a database created before it, leaving existing data untouched', () => {
+    const db = openDb(':memory:');
+    db.exec(`CREATE TABLE chains (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, engine TEXT NOT NULL, subject_key TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('active','waiting','dead_lettered','completed','cancelled')),
+      engine_state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    db.prepare(`INSERT INTO chains (engine, subject_key, status, engine_state, created_at, updated_at) VALUES ('e', 'old', 'active', '{}', 1, 2)`).run();
+    migrate(db);
+    expect((db.pragma('table_info(control)') as { name: string }[]).map((c) => c.name)).toEqual(['key', 'value', 'updated_at']);
+    expect(db.prepare('SELECT count(*) c FROM control').get()).toEqual({ c: 0 });
+    expect(db.prepare('SELECT subject_key FROM chains').all()).toEqual([{ subject_key: 'old' }]);
+  });
+});

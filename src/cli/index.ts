@@ -14,6 +14,7 @@ import {
   parseDuration,
 } from '../kernel/inspect.js';
 import type { Kernel } from '../kernel/kernel.js';
+import { isDraining, startDrain, stopDrain } from '../kernel/control.js';
 import { countRunning } from '../kernel/queue.js';
 import type { ChainView } from '../kernel/types.js';
 import { describePolicy } from '../policy/resolve.js';
@@ -27,12 +28,16 @@ export interface CliDeps {
   stderr?: (line: string) => void;
   runtime?: Runtime;
   onSignal?: (signal: 'SIGINT' | 'SIGTERM', handler: () => void) => void;
+  /** Waits between polls of `drain --wait` (default: a real timer). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 const USAGE = `Usage:
   factory [--config <path>] submit <issue-url> [--label <l>]... [--engine <id>]
   factory [--config <path>] worker [--poll-ms <n>] [--id <name>]
   factory [--config <path>] status [--json]
+  factory [--config <path>] drain [--wait [--timeout <seconds>]]
+  factory [--config <path>] resume
   factory [--config <path>] show <chain-id> [--json]
   factory [--config <path>] events [--since <duration>] [--chain <id>] [--limit <n>] [--json]
   factory [--config <path>] workers [--json]
@@ -142,7 +147,11 @@ function parseCount(raw: string, what: string): number {
   return Number(raw);
 }
 
-async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps, 'stdout' | 'stderr' | 'onSignal'>>): Promise<number> {
+async function execute(
+  argv: string[],
+  rt: Runtime,
+  deps: Required<Pick<CliDeps, 'stdout' | 'stderr' | 'onSignal'>> & Pick<CliDeps, 'sleep'>,
+): Promise<number> {
   const { stdout, stderr } = deps;
   const [cmd, ...rest] = argv;
   const { kernel } = rt;
@@ -212,6 +221,43 @@ async function execute(argv: string[], rt: Runtime, deps: Required<Pick<CliDeps,
       if (lines.length === 0) stdout('no open chains');
       for (const l of lines) stdout(l);
       stdout(`slots: ${running}${max === undefined ? ' (no limit)' : ` of ${max}`}`);
+      if (isDraining(rt.db)) stdout(`DRAINING (${running} job(s) still running)`);
+      return 0;
+    }
+    case 'drain': {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { wait: { type: 'boolean' }, timeout: { type: 'string' } },
+      });
+      if (positionals.length > 0) throw new UsageError('drain takes no arguments');
+      if (values.timeout !== undefined && !values.wait) throw new UsageError('--timeout needs --wait');
+      let timeoutMs: number | undefined;
+      if (values.timeout !== undefined) timeoutMs = parseCount(values.timeout, '--timeout') * 1000;
+      startDrain(rt.db, kernel.deps.clock());
+      if (!values.wait) {
+        stdout(`draining: ${countRunning(rt.db)} job(s) running`);
+        return 0;
+      }
+      const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+      const deadline = timeoutMs === undefined ? undefined : kernel.deps.clock() + timeoutMs;
+      for (;;) {
+        const n = countRunning(rt.db);
+        if (n === 0) {
+          stdout('drained');
+          return 0;
+        }
+        if (deadline !== undefined && kernel.deps.clock() >= deadline) {
+          stderr(`still draining: ${n} job(s) running`);
+          return 1;
+        }
+        await sleep(2000);
+      }
+    }
+    case 'resume': {
+      if (rest.length > 0) throw new UsageError('resume takes no arguments');
+      stopDrain(rt.db, kernel.deps.clock());
+      stdout('resumed');
       return 0;
     }
     case 'show': {
@@ -415,7 +461,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
   try {
     if (command[0] === undefined) return usageError('missing command');
     if (command[0] === 'dashboard') return await runDashboard(command.slice(1), config, cwd, { stdout, stderr, onSignal });
-    if (!['submit', 'worker', 'status', 'show', 'events', 'workers', 'dlq', 'cancel', 'policies'].includes(command[0])) {
+    if (!['submit', 'worker', 'status', 'drain', 'resume','show', 'events', 'workers', 'dlq', 'cancel', 'policies'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
     if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));
@@ -429,7 +475,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
         });
       }
     }
-    return await execute(command, runtime, { stdout, stderr, onSignal });
+    return await execute(command, runtime, { stdout, stderr, onSignal, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }) });
   } catch (e) {
     if (e instanceof UsageError || (e instanceof TypeError && (e as { code?: string }).code?.startsWith('ERR_PARSE_ARGS'))) {
       return usageError(message(e));

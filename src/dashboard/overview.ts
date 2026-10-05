@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { isDraining } from '../kernel/control.js';
 import { recentEvents, type EventRow } from '../kernel/events.js';
 import { HEARTBEAT_MS, isWorkerAlive, jobStateLabel, type LivenessProbe } from '../kernel/inspect.js';
 import { costOf } from '../kernel/queue.js';
@@ -189,6 +190,8 @@ export interface WorkerOverview {
 export interface Overview {
   generatedAt: number;
   limits: { maxConcurrentJobs: number | null };
+  /** The drain flag is set: workers claim nothing new. */
+  draining: boolean;
   /** `workers` counts alive workers only; `aliveWorkers` is an alias kept for one release; `stoppedWorkers` is the total of dead ones. */
   summary: { workers: number; aliveWorkers: number; stoppedWorkers: number; runningJobs: number; waitingOnPerson: number };
   openChains: ChainOverview[];
@@ -244,6 +247,15 @@ function subjectOf(key: string, state: Record<string, unknown>): { repo: string;
   if (repo !== null && n !== null) return { repo, issueNumber: n };
   const m = /^(.+)#([0-9]+)$/.exec(key);
   return m ? { repo: m[1]!, issueNumber: Number(m[2]) } : null;
+}
+
+/** The drain flag; false for a database that predates the `control` table. */
+function readDraining(db: Db): boolean {
+  try {
+    return isDraining(db);
+  } catch {
+    return false;
+  }
 }
 
 /** Everything the dashboard shows, from one read-only pass over the database. */
@@ -383,6 +395,7 @@ export function buildOverview(
   return {
     generatedAt: now,
     limits: { maxConcurrentJobs: opts.maxConcurrentJobs ?? null },
+    draining: readDraining(db),
     summary: {
       workers: aliveWorkers.length,
       aliveWorkers: aliveWorkers.length,
