@@ -485,6 +485,45 @@ describe('ClaudeCliRunner bare mode (R47)', () => {
     expect(argv.filter((a) => a.startsWith('--plugin-dir=/p/'))).toEqual(['--plugin-dir=/p/one', '--plugin-dir=/p/two']);
   });
 
+  it('buildArgs passes --model=<value> as one element in both modes and nothing when unset', () => {
+    const schema = new ClaudeCliRunner().configSchema;
+    for (const bare of [true, false]) {
+      const cfg = schema.parse(config({ bare, model: 'sonnet' })) as Parameters<typeof buildArgs>[0];
+      expect(buildArgs(cfg, 'P').filter((a) => a.includes('model'))).toEqual(['--model=sonnet']);
+      const none = schema.parse(config({ bare })) as Parameters<typeof buildArgs>[0];
+      expect(buildArgs(none, 'P').some((a) => a.includes('--model'))).toBe(false);
+    }
+  });
+
+  it('the shipped execute policy runs on sonnet and the review policy on haiku', () => {
+    const schema = new ClaudeCliRunner().configSchema;
+    const want: Record<string, string> = { 'software-execute': 'sonnet', 'software-review': 'haiku' };
+    const policies = loadPolicies(join(import.meta.dirname, '../../policies'));
+    for (const [id, model] of Object.entries(want)) {
+      const pol = policies.find((p) => p.id === id)!;
+      const argv = buildArgs(schema.parse(pol.config) as Parameters<typeof buildArgs>[0], 'P');
+      expect(argv).toContain(`--model=${model}`);
+    }
+  });
+
+  it('every shipped policy declares a model', () => {
+    const policies = loadPolicies(join(import.meta.dirname, '../../policies'));
+    expect(policies.length).toBeGreaterThan(0);
+    for (const p of policies) {
+      expect((p.config as { model?: unknown }).model, `policy ${p.id} must set config.model`).toBeTypeOf('string');
+    }
+  });
+
+  it('the config schema rejects a malformed model', () => {
+    const schema = new ClaudeCliRunner().configSchema;
+    for (const bad of ['-x', 'a b', '', 'a'.repeat(101), 5]) {
+      expect(schema.safeParse(config({ model: bad })).success).toBe(false);
+    }
+    for (const good of ['sonnet', 'claude-sonnet-5-5', 'a'.repeat(100), 'claude-opus-4-1[1m]', 'us.anthropic.x:0']) {
+      expect(schema.safeParse(config({ model: good })).success).toBe(true);
+    }
+  });
+
   it('the config schema rejects a malformed pluginDirs', () => {
     const schema = new ClaudeCliRunner().configSchema;
     for (const bad of ['tools/x', [1], [''], [null]]) {

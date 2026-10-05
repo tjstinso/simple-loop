@@ -10,6 +10,8 @@ config:
   timeoutMs: 1800000
   inactivityTimeoutMs: 600000
   resultFormat: execution
+  # Spend control: developer agents run on Sonnet.
+  model: sonnet
   # Bare mode: `claude --bare`, an allow-listed environment and an empty per-run HOME, so the agent
   # starts with no credentials in its environment or HOME (ssh still finds ~/.ssh). Needs
   # ANTHROPIC_API_KEY in the worker's environment (or a provider's variables in passEnv).
