@@ -475,10 +475,14 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     for (const c of failing.slice(0, MAX_CI_EXCERPTS)) {
       if (c.runId === undefined) continue;
       if (!byRun.has(c.runId)) {
+        const runId = c.runId;
         try {
-          byRun.set(c.runId, await deps.host.getFailedLogExcerpt(s.repo, c.runId, CI_EXCERPT_LINES));
+          byRun.set(runId, await withHostRetry(
+            () => deps.host.getFailedLogExcerpt(s.repo, runId, CI_EXCERPT_LINES),
+            deps.sleep ?? defaultSleep,
+          ));
         } catch {
-          byRun.set(c.runId, null);
+          byRun.set(runId, null);
         }
       }
       const log = byRun.get(c.runId);

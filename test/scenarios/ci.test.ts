@@ -98,6 +98,18 @@ describe('revising the pull request when required checks fail', () => {
     expect(h.chain(chain.id).state.ciActive).toBe(true);
   });
 
+  it('retries on transient getFailedLogExcerpt failures (429, 500+)', async () => {
+    const h = harness();
+    const { chain, head } = await awaitingMerge(h);
+    h.host.setChecks(head, [failure('check (node 22)')]);
+    h.host.setFailedLog(900, 'FAIL test/status.test.ts\nexpected 1 to be 2');
+    h.host.failNext('getFailedLogExcerpt', new GitHostError('rate limited', 429));
+    await h.maintain();
+    await h.runOne();
+    expect(h.callsOf('execute').at(-1)!.feedback).toContain('expected 1 to be 2');
+    expect(h.chain(chain.id).state.ciActive).toBe(true);
+  });
+
   it.each([
     ['pending', [{ name: 'a', status: 'in_progress', conclusion: null } as CheckInfo]],
     ['passing', [passed('a')]],
