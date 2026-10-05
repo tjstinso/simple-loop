@@ -76,6 +76,27 @@ export const ModelsSchema = z
     }
   });
 
+const ProfileNameSchema = z.enum(['supervised', 'automatic']);
+
+/** Which profiles an issue label may select (`factory:profile:<name>` and `byLabel`); an operator allowlist. */
+export const ProfilesSchema = z
+  .object({
+    allowed: z.array(ProfileNameSchema).default(['automatic', 'supervised']),
+    byLabel: z.record(z.string().min(1), ProfileNameSchema).default({ 'factory:supervised': 'supervised' }),
+  })
+  .strict()
+  .superRefine((p, ctx) => {
+    for (const [label, profile] of Object.entries(p.byLabel)) {
+      if (!p.allowed.includes(profile)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['byLabel', label],
+          message: `profile "${profile}" is not in profiles.allowed (${p.allowed.join(', ')})`,
+        });
+      }
+    }
+  });
+
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
   policiesDir: z.string().min(1).optional(),
@@ -112,6 +133,7 @@ const ConfigSchema = z.object({
   github: GithubSchema.optional(),
   intake: IntakeSchema.optional(),
   models: ModelsSchema.default({ allowed: ['haiku', 'sonnet'], byLabel: { 'factory:followup': 'haiku' } }),
+  profiles: ProfilesSchema.default({ allowed: ['automatic', 'supervised'], byLabel: { 'factory:supervised': 'supervised' } }),
   repos: z.record(z.string().regex(/^[^/\s]+\/[^/\s]+$/, 'must be owner/name'), RepoToolSchema).optional(),
 }).superRefine((c, ctx) => {
   for (const [name, override] of Object.entries(c.policyOverrides ?? {})) {

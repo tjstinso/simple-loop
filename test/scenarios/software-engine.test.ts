@@ -143,6 +143,23 @@ describe('software engine scenarios', () => {
     expect(deliveryDirs(h, chain.id)).toEqual([]);
   });
 
+  it('a factory:supervised label overrides an automatic default: ready-for-merge label, no auto-merge', async () => {
+    const h = harness({ defaultProfile: 'automatic' });
+    const { chain } = await h.submit(N, ['factory:supervised']);
+    writesPerAttempt(h);
+    h.scriptReview([{ verdict: 'approve', feedback: 'ship it' }]);
+
+    await h.runUntilIdle();
+
+    const c = h.chain(chain.id);
+    expect(c.state.profile).toBe('supervised');
+    expect(c.status).toBe('waiting');
+    expect(h.pr(BRANCH)).toMatchObject({ number: 8, state: 'open', labels: [READY] });
+    expect(h.host.autoMergeEnabled(8)).toBe(false);
+    expect(h.host.calls.filter((x) => x.method === 'mergePr')).toEqual([]);
+    expect(chainEvents(h.db, chain.id).map((e) => e.kind)).not.toContain('merge.requested');
+  });
+
   it('automatic: a pull request closed without merging cancels the chain', async () => {
     const h = harness();
     const { chain } = await h.submit(N, ['factory:profile:automatic']);

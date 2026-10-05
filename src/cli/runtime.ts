@@ -105,6 +105,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       policies,
       config: {
         defaultProfile: config.defaultProfile,
+        profiles: config.profiles,
         requiredSections: config.requiredSections,
         historyRetentionDays: config.historyRetentionDays,
         keptWorktreeMaxAgeMs: config.keptWorktreeMaxAgeMs,

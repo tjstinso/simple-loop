@@ -110,6 +110,29 @@ describe('softwareSubmit', () => {
     expect((await softwareSubmit({ issueUrl: c.url }, c.deps)).state.profile).toBe('automatic');
   });
 
+  it.each([
+    ['no label, supervised default', [], 'supervised', 'supervised'],
+    ['no label, automatic default', [], 'automatic', 'automatic'],
+    ['factory:supervised overrides an automatic default', ['factory:supervised'], 'automatic', 'supervised'],
+    ['factory:profile:automatic overrides a supervised default', ['factory:profile:automatic'], 'supervised', 'automatic'],
+    ['an explicit label wins over byLabel', ['factory:supervised', 'factory:profile:automatic'], 'supervised', 'automatic'],
+  ] as const)('selects the profile: %s', async (_name, labels, def, expected) => {
+    const s = setup({ labels: [...labels] });
+    s.deps.config.defaultProfile = def;
+    expect((await softwareSubmit({ issueUrl: s.url }, s.deps)).state.profile).toBe(expected);
+  });
+
+  it('rejects two explicit profile labels and a profile outside the allowlist', async () => {
+    const two = setup({ labels: ['factory:profile:automatic', 'factory:profile:supervised'] });
+    await expect(softwareSubmit({ issueUrl: two.url }, two.deps)).rejects.toThrow(/multiple profile labels/);
+    const bad = setup({ labels: ['factory:profile:automatic'] });
+    (bad.deps.config as any).profiles = { allowed: ['supervised'], byLabel: {} };
+    await expect(softwareSubmit({ issueUrl: bad.url }, bad.deps)).rejects.toThrow('profile "automatic" is not allowed');
+    const viaMap = setup({ labels: ['x'] });
+    (viaMap.deps.config as any).profiles = { allowed: ['automatic'], byLabel: { x: 'supervised' } };
+    await expect(softwareSubmit({ issueUrl: viaMap.url }, viaMap.deps)).rejects.toThrow('profile "supervised" is not allowed');
+  });
+
   it('builds the first job as execute attempt 1 with the issue labels', async () => {
     const s = setup({ labels: ['bug', 'x'] });
     const r = await softwareSubmit({ issueUrl: s.url }, s.deps);

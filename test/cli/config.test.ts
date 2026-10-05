@@ -37,6 +37,7 @@ describe('loadConfig', () => {
       maxTransientRetries: 8,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
       models: { allowed: ['haiku', 'sonnet'], byLabel: { 'factory:followup': 'haiku' } },
+      profiles: { allowed: ['automatic', 'supervised'], byLabel: { 'factory:supervised': 'supervised' } },
     });
   });
 
