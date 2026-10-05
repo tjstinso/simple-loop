@@ -141,7 +141,7 @@ export async function processDelivery(
     } catch (e) {
       if (isTransientError(e)) {
         const text = `surfacing dead letter: ${message(e)}`;
-        const max = Math.max(1, deps.config.maxTransientRetries ?? 8);
+        const max = deps.config.maxTransientRetries ?? 8;
         if ((job.transientRetries ?? 0) < max) {
           // Put job back to running temporarily to schedule transient retry
           db.prepare('UPDATE jobs SET status = ? WHERE id = ?').run('running', fence.jobId);
@@ -161,7 +161,7 @@ export async function processDelivery(
    * `maxTransientRetries` retries were used. Anything else is `fail`ed by the caller.
    */
   const failOrRetry = async (e: unknown, what: string): Promise<DeliveryOutcome> => {
-    const max = Math.max(1, deps.config.maxTransientRetries ?? 8);
+    const max = deps.config.maxTransientRetries ?? 8;
     const text = `${what}: ${message(e)}`;
     if ((job.transientRetries ?? 0) >= max) {
       return fail('runner_error', `transient_retries_exhausted after ${job.transientRetries ?? 0} retries: ${text}`);
