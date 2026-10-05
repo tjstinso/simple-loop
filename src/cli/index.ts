@@ -464,7 +464,7 @@ async function runDashboard(
   }
   const host = values.host ?? DEFAULT_HOST;
   if (host === '') throw new UsageError('--host needs an address');
-  const cfg = loadConfig(config, cwd);
+  const cfg = loadConfig(config, cwd, deps.stderr);
   const db = openReadOnlyDb(cfg.dbPath);
   let dash;
   try {
@@ -529,7 +529,7 @@ export async function run(argv: string[], deps: CliDeps = {}): Promise<number> {
     if (!['submit', 'worker', 'status', 'drain', 'resume', 'show', 'events', 'workers', 'dlq', 'cancel', 'policies', 'intake'].includes(command[0])) {
       return usageError(`unknown command: ${command[0]}`);
     }
-    if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd));
+    if (runtime === undefined) runtime = buildRuntime(loadConfig(config, cwd, stderr));
     if (built && command[0] !== 'worker' && !(command[0] === 'intake' && !command.includes('--once') && !command.includes('--dry-run'))) {
       // The worker and the intake loop stop gracefully on a signal; other commands remove the auth directory and exit.
       const rt = runtime;

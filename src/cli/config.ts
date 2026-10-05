@@ -101,6 +101,8 @@ const ConfigSchema = z.object({
   }).strict().optional(),
   chainBudgetUsd: z.number().min(1).default(25),
   maxConcurrentJobs: z.number().int().min(1).optional(),
+  // Treat unknown top-level keys as an error instead of a warning (default false).
+  warnUnknownKeys: z.boolean().optional(),
   leaseMs: z.number().int().min(10_000).default(300_000),
   heartbeatMs: z.number().int().min(1_000).default(30_000),
   maintenanceMs: z.number().int().min(5_000).default(60_000),
@@ -171,9 +173,10 @@ export const DEFAULT_CONFIG_FILE = 'factory.config.json';
 /**
  * Load the config from `path`, or `factory.config.json` in `cwd`. A missing default file yields
  * the defaults; an explicit path that does not exist is an error. Relative paths resolve against
- * the config file's directory (the cwd when there is no file).
+ * the config file's directory (the cwd when there is no file). Unknown top-level keys are reported
+ * through `warn`, or throw when `warnUnknownKeys` is true.
  */
-export function loadConfig(path: string | undefined, cwd: string): FactoryConfig {
+export function loadConfig(path: string | undefined, cwd: string, warn: (line: string) => void = console.error): FactoryConfig {
   const file = path === undefined ? resolve(cwd, DEFAULT_CONFIG_FILE) : resolve(cwd, path);
   let raw: unknown = {};
   let baseDir = cwd;
@@ -193,6 +196,12 @@ export function loadConfig(path: string | undefined, cwd: string): FactoryConfig
     throw new Error(`invalid config ${file}: ${detail}`);
   }
   const c = res.data;
+  const known = new Set(Object.keys(ConfigSchema.shape));
+  const unknown = typeof raw === 'object' && raw !== null ? Object.keys(raw).filter((k) => !known.has(k)) : [];
+  if (unknown.length > 0) {
+    if (c.warnUnknownKeys === true) throw new Error(`invalid config ${file}: Unknown config keys: ${unknown.join(', ')}`);
+    warn(`Unknown config keys: ${unknown.join(', ')}`);
+  }
   // Before policiesDir was optional it defaulted to ./policies; keep reading that directory when it exists.
   const legacyDir = resolve(baseDir, 'policies');
   const policiesDir = c.policiesDir === undefined ? (existsSync(legacyDir) ? legacyDir : undefined) : resolve(baseDir, c.policiesDir);

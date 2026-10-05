@@ -126,6 +126,35 @@ describe('loadConfig', () => {
     });
   });
 
+  describe('unknown keys', () => {
+    const load = (cfg: unknown, warn: (l: string) => void) => {
+      const d = tmp();
+      writeFileSync(join(d, 'factory.config.json'), JSON.stringify(cfg));
+      return loadConfig(undefined, d, warn);
+    };
+
+    it('warns and still loads when warnUnknownKeys is not set or false', () => {
+      for (const extra of [{}, { warnUnknownKeys: false }]) {
+        const lines: string[] = [];
+        const c = load({ maxConcurrentJob: 1, other: true, ...extra }, (l) => lines.push(l));
+        expect(lines).toEqual(['Unknown config keys: maxConcurrentJob, other']);
+        expect(c.maxConcurrentJobs).toBeUndefined();
+      }
+    });
+
+    it('throws naming the keys when warnUnknownKeys is true', () => {
+      const lines: string[] = [];
+      expect(() => load({ maxConcurrentJob: 1, warnUnknownKeys: true }, (l) => lines.push(l))).toThrow(/Unknown config keys: maxConcurrentJob/);
+      expect(lines).toEqual([]);
+    });
+
+    it('does not warn when all keys are known', () => {
+      const lines: string[] = [];
+      load({ maxConcurrentJobs: 1, warnUnknownKeys: true }, (l) => lines.push(l));
+      expect(lines).toEqual([]);
+    });
+  });
+
   it('example config file parses to the defaults', () => {
     const d = tmp();
     const example = readFileSync(join(import.meta.dirname, '../../factory.config.example.json'), 'utf8');
