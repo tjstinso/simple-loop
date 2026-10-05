@@ -609,21 +609,33 @@ export class GhCliHost implements GitHost {
 
   async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
     if (!/^[0-9a-f]{7,64}$/i.test(sha)) throw new GitHostError(`not a commit sha: ${sha.slice(0, 80)}`);
-    const checks: CheckInfo[] = [];
-    // The check-runs endpoint wraps its page in an object; stop on a short page.
-    for (let page = 1; ; page++) {
-      const body = await this.json<{ check_runs?: RestCheckRun[] }>(buildListCheckRunsArgs(repo, sha, page));
-      const runs = body.check_runs ?? [];
-      checks.push(...runs.map(checkFromRun));
-      if (runs.length < 100) break;
+    const MAX_RETRIES = 2;
+    const DELAY_MS = 50;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const checks: CheckInfo[] = [];
+        // The check-runs endpoint wraps its page in an object; stop on a short page.
+        for (let page = 1; ; page++) {
+          const body = await this.json<{ check_runs?: RestCheckRun[] }>(buildListCheckRunsArgs(repo, sha, page));
+          const runs = body.check_runs ?? [];
+          checks.push(...runs.map(checkFromRun));
+          if (runs.length < 100) break;
+        }
+        for (let page = 1; ; page++) {
+          const body = await this.json<{ statuses?: RestCommitStatus[] }>(buildListStatusesArgs(repo, sha, page));
+          const statuses = body.statuses ?? [];
+          checks.push(...statuses.map(checkFromStatus));
+          if (statuses.length < 100) break;
+        }
+        return { state: summarizeChecks(checks), checks };
+      } catch (e) {
+        if (e instanceof GitHostError && e.status === 404 && attempt <= MAX_RETRIES) {
+          await new Promise<void>((r) => setTimeout(r, DELAY_MS * attempt));
+        } else {
+          throw e;
+        }
+      }
     }
-    for (let page = 1; ; page++) {
-      const body = await this.json<{ statuses?: RestCommitStatus[] }>(buildListStatusesArgs(repo, sha, page));
-      const statuses = body.statuses ?? [];
-      checks.push(...statuses.map(checkFromStatus));
-      if (statuses.length < 100) break;
-    }
-    return { state: summarizeChecks(checks), checks };
   }
 
   async getFailedLogExcerpt(repo: string, runId: number, maxLines: number): Promise<string> {
