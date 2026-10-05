@@ -425,7 +425,9 @@ export function failJob(db: Db, fence: Fence, error: string): void {
  * `updated_at` is left unchanged because no clock value is passed in.
  */
 export function requeueJob(db: Db, jobId: number, opts: { delivery?: number; now?: number; why?: string } = {}): boolean {
-  const sql = `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL
+  // A stop handback is not a failure of the job: it must not count against maxDeliveries.
+  const uncounted = opts.why === 'worker stopping' ? ', transient_retries = transient_retries + 1' : '';
+  const sql = `UPDATE jobs SET status = 'queued', claimed_by = NULL, lease_expires_at = NULL${uncounted}
                 WHERE id = ? AND status = 'running'`;
   return db
     .transaction((): boolean => {

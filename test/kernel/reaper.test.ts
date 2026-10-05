@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { openDb, migrate } from '../../src/kernel/db.js';
-import { claimNext, createChain, getChain, getJob, recordResult } from '../../src/kernel/queue.js';
+import { claimNext, createChain, getChain, getJob, recordResult, requeueJob } from '../../src/kernel/queue.js';
 import { recordChild, registerWorker, liveChildrenFor, setWorkerJob } from '../../src/kernel/workers.js';
 import { listDeadLetters } from '../../src/kernel/dlq.js';
 import { reapExpired } from '../../src/kernel/reaper.js';
@@ -73,6 +73,27 @@ describe('reaper', () => {
     expect(dl.reason).toBe('max_deliveries');
     expect(dl.error).toContain(String(job.id));
     expect(dl.error).toContain(String(job.delivery));
+  });
+
+  it('does not dead-letter a job handed back by a stopping worker three times, but does one that lost its lease three times', () => {
+    const db = mk();
+    const job = claimed(db);
+    let d = job.delivery;
+    for (let i = 0; i < 3; i++) {
+      expect(requeueJob(db, job.id, { delivery: d, now: 200, why: 'worker stopping' })).toBe(true);
+      d = claimNext(db, 'w1', 300 + i, 1000)!.delivery;
+    }
+    expect(d).toBe(4);
+    const opts = { now: 5000, maxDeliveries: 3, groupProbe: () => false, isAlive: () => false, killGroup: boom, killPid: boom };
+    expect(reapExpired(db, opts)).toMatchObject({ requeued: [job.id], deadLettered: [] });
+
+    const db2 = mk();
+    const j2 = claimed(db2);
+    for (let i = 0; i < 2; i++) {
+      expect(requeueJob(db2, j2.id, { delivery: j2.delivery + i, now: 200, why: 'lease expired' })).toBe(true);
+      claimNext(db2, 'w1', 300 + i, 1000);
+    }
+    expect(reapExpired(db2, opts)).toMatchObject({ requeued: [], deadLettered: [j2.id] });
   });
 
   it('kills the claiming worker by pid (never its group) when still alive', () => {
