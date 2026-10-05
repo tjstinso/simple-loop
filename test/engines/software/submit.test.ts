@@ -23,6 +23,25 @@ function setup(over: { body?: string; labels?: string[]; state?: 'open' | 'close
   return { host, deps, n, url };
 }
 
+describe('softwareSubmit follow-up issues', () => {
+  const NOTE = 'Validate greet() input.';
+  it('accepts a factory:followup issue with a one-line body and no sections', async () => {
+    const { deps, url } = setup({ body: NOTE, labels: ['factory:followup'] });
+    const r = await softwareSubmit({ issueUrl: url }, deps);
+    expect(r.state.labels).toContain('factory:followup');
+  });
+
+  it('rejects the same body without the label', async () => {
+    const { deps, url } = setup({ body: NOTE });
+    await expect(softwareSubmit({ issueUrl: url }, deps)).rejects.toThrow(/missing required section/);
+  });
+
+  it('rejects an empty follow-up body', async () => {
+    const { deps, url } = setup({ body: '  \n', labels: ['factory:followup'] });
+    await expect(softwareSubmit({ issueUrl: url }, deps)).rejects.toThrow(/empty body/);
+  });
+});
+
 describe('parseIssueUrl', () => {
   it('rejects a malformed issue URL', () => {
     for (const u of [

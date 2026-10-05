@@ -85,7 +85,7 @@ Commands run without a shell, in their own process group (killed on timeout and 
 
 **GitHub settings the factory expects.** In the repository's settings, an operator enables "Allow auto-merge" and protects `main` with a branch protection rule that requires the status checks `check (node 22)` and `check (node 24)` (the jobs of `.github/workflows/ci.yml`), also for administrators. Without both, the `automatic` profile cannot merge by itself: auto-merge is refused and the chain waits for a person. The factory does not configure either setting.
 
-The profile is `supervised` unless the issue carries the label `factory:profile:automatic` at submit time (or `defaultProfile` in the config says otherwise). Both profiles allow 3 attempts. Follow-up items that the agent or reviewer report are filed as new issues labeled `factory:followup`.
+The profile is `supervised` unless the issue carries the label `factory:profile:automatic` at submit time (or `defaultProfile` in the config says otherwise). Both profiles allow 3 attempts. Follow-up items that the agent or reviewer report are filed as new issues labeled `factory:followup`. A follow-up is lightweight work: its body is a one- or two-sentence note, so submit and the intake skip the required-sections check for it (an empty body, a closed issue and policy mismatches are still rejected), and the execute and review prompts tell the agents to make the smallest correct change with a test, to judge it against the note, and to raise an `ask` when the note is too vague. Nothing queues a follow-up automatically: a person labels it `factory:ready` to run it (on Haiku by default, see the model selection below).
 
 ## Prerequisites
 
@@ -426,7 +426,7 @@ When a chain is queued the software engine posts one short comment on the issue,
 | `factory:ready-for-merge` | PR | `supervised` profile: the reviewer approved; a human merges. |
 | `factory:needs-human` | issue | The factory raised an ask and waits for a person's answer (a legacy `needs_human` chain also carries it on the PR). |
 | `factory:dead-letter` | issue | A job failed beyond what the kernel can recover; the factory also comments with the reason, error and job id. Removed by `dlq retry`, `dlq discard`, `cancel`, and the next execute job of a resubmitted issue. |
-| `factory:followup` | new issues | Issues the factory filed from `followups` in agent or reviewer output. Nothing queues them automatically. |
+| `factory:followup` | new issues | Issues the factory filed from `followups` in agent or reviewer output. Nothing queues them automatically: a person labels one `factory:ready` to run it as lightweight work (no required sections). |
 | `factory:profile:automatic` | issue (set by you, before submit) | Selects the `automatic` profile. |
 | `factory:model:<alias>` | issue (set by you, before submit) | Selects the model for the chain's execute and review runs (`--model=<alias>`). The alias must be in `models.allowed`; more than one distinct model label, or an alias outside the allowlist, rejects the submit. See [Choosing the model by label](#choosing-the-model-by-label). |
 | `factory:engine:<id>` | `--label` value | Router label naming the engine. More than one distinct engine label is an error; an unknown id is an error. |
@@ -453,6 +453,8 @@ A policy is one YAML file (shipped in the package's `policies/`, or in `policies
 | `config` | Runner-specific settings, validated against the runner's schema at startup. |
 
 Matching: among the non-default policies of the kind, those whose `match.labels` are all present are candidates. Exactly one wins; more than one is an `ambiguous policy match` error; none falls back to the default of that kind; no default is an error. Files are loaded and validated at startup: each policy's `kind` must be declared by a registered engine, its `runner` must be registered, and its `config` must pass that runner's schema; otherwise every command fails with an error naming the policy. Restart the worker after editing them.
+
+The shipped execute and review prompts each carry a paragraph that applies only when the work item's `labels` include `factory:followup`: the body is then a short note, not a specification, the agent makes the smallest change that resolves it (with a test, and an `ask` when the note is ambiguous, needs outside information or a change of more than about 100 lines) and the reviewer judges the change against the note without requesting sections or criteria. Other issues are unaffected.
 
 ### Overriding policy settings
 

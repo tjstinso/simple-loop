@@ -1,6 +1,7 @@
 import type { NewJob } from '../../kernel/types.js';
 import type { PolicyStore } from '../../policy/store.js';
 import type { GitHost } from './github.js';
+import { FOLLOWUP_LABEL } from './followups.js';
 import { SoftwareStateSchema, type SoftwareState } from './state.js';
 
 const SEGMENT_RE = /^[\w.-]+$/;
@@ -64,7 +65,8 @@ export async function softwareSubmit(
   const issue = await deps.host.getIssue(repo, number);
   if (issue.state !== 'open') throw new SubmitRejectedError(`issue ${repo}#${number} is closed`);
   if (issue.body.trim() === '') throw new SubmitRejectedError(`issue ${repo}#${number} has an empty body`);
-  const missing = missingSections(issue.body, deps.config.requiredSections);
+  // A follow-up is a one- or two-sentence note from a reviewer: it has no sections to require.
+  const missing = issue.labels.includes(FOLLOWUP_LABEL) ? [] : missingSections(issue.body, deps.config.requiredSections);
   if (missing.length > 0) {
     throw new SubmitRejectedError(`issue ${repo}#${number} is missing required section(s): ${missing.join(', ')}`);
   }
