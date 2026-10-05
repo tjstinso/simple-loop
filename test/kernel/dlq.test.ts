@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { openDb, migrate } from '../../src/kernel/db.js';
-import { claimNext, commitTransition, createChain, getChain, getJob, listJobsForChain, recordResult } from '../../src/kernel/queue.js';
+import { claimNext, commitTransition, createChain, getChain, getJob, listJobsForChain, recordResult, scheduleTransientRetry, transientRetryDelayMs } from '../../src/kernel/queue.js';
 import {
   DeadLetterStateError,
   cancelChain,
@@ -53,6 +53,27 @@ describe('dead-letter queue', () => {
     const b = deadLetter(db, { jobId: job.id, reason: 'runner_error', error: 'b' }, 300);
     expect(b).toEqual(a);
     expect(listDeadLetters(db)).toHaveLength(1);
+  });
+
+  it('retry resets the transient-retry backoff so it is driven by the count, not the history', () => {
+    const db = mk();
+    const { job } = setup(db);
+    db.prepare('UPDATE jobs SET transient_retries = 3 WHERE id = ?').run(job.id);
+    const n = scheduleTransientRetry(db, { jobId: job.id, delivery: job.delivery }, 1000, 'net')!;
+    expect(n.count).toBe(4);
+    expect(getJob(db, job.id).availableAt).toBe(1000 + transientRetryDelayMs(3));
+
+    const again = claimNext(db, 'w1', 1000 + transientRetryDelayMs(3), 1000)!;
+    deadLetter(db, { jobId: job.id, reason: 'runner_error', error: 'boom' }, 2000);
+    const r = retryDeadLetter(db, job.id, 3000);
+    expect(r.transientRetries).toBe(0);
+    expect(r.availableAt).toBeNull();
+
+    const claimed = claimNext(db, 'w2', 3000, 1000)!;
+    expect(claimed.delivery).toBe(again.delivery + 1);
+    const s = scheduleTransientRetry(db, { jobId: job.id, delivery: claimed.delivery }, 4000, 'net')!;
+    expect(s).toEqual({ delayMs: transientRetryDelayMs(0), count: 1 });
+    expect(getJob(db, job.id).availableAt).toBe(4000 + transientRetryDelayMs(0));
   });
 
   it('retry re-queues the same job with the same type, attempt and payload', () => {
