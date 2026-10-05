@@ -78,6 +78,8 @@ const SoftwareStateObject = z.object({
   pendingUnanswered: z.object({ round: z.number().int(), ids: z.array(z.string()) }).optional(),
   /** How the latest round's items were answered, for the round summary comment. */
   lastCounts: z.object({ changed: z.number().int(), explained: z.number().int(), declined: z.number().int() }).optional(),
+  /** Consecutive maintenance passes the pull request reported `unknown` mergeability (persisted across worker restarts). */
+  unknown_mergeability_attempts: z.number().int().min(0).optional(),
 });
 
 /**
