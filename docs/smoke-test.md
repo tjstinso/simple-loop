@@ -137,6 +137,16 @@ Recover:
 3. Clean up: `factory dlq discard <job-id>` and delete the kept worktree.
 4. Optional, binary variant: ask instead for `fixtures/data.bin` holding a NUL byte followed by the same token text (for example written with `printf`). Expected: the same refusal; the scan extracts the printable strings of binary files.
 
+## (g) Intake
+
+Needs an `intake` block in the config with the sandbox repository in `repos` (see "Intake" in the README) and an issue author whose association is allowed (you, as the owner).
+
+1. Start the loop in a third terminal: `factory --config /tmp/factory-smoke/factory.config.json intake`.
+2. Create a test issue with the `## Goal` and `## Acceptance criteria` sections and add the label `factory:ready`.
+3. Within `pollIntervalMs` the loop prints `<owner/repo>#<n> enqueued chain <c> job <j>`, and the issue now has `factory:queued` instead of `factory:ready`. `factory status` shows the chain.
+4. Create a second issue with no `## Acceptance criteria` section and label it `factory:ready`. Expected: one comment starting with the hidden marker `factory:intake-rejected` and the label `factory:rejected`; later passes add nothing.
+5. Stop the loop with Ctrl-C; it exits with code 130.
+
 ## What only a real run can confirm
 
 Each item is an assumption the automated tests could not verify. Check them while doing the runs above.

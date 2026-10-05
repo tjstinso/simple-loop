@@ -12,6 +12,14 @@ export interface SubmitDeps {
   config: { defaultProfile: 'supervised' | 'automatic'; requiredSections: string[] };
 }
 
+/** The issue itself cannot be taken on (closed, empty, a required section missing); retrying cannot help until it changes. */
+export class SubmitRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SubmitRejectedError';
+  }
+}
+
 export function parseIssueUrl(url: string): { repo: string; number: number } {
   let u: URL;
   try {
@@ -54,11 +62,11 @@ export async function softwareSubmit(
 ): Promise<{ subjectKey: string; state: SoftwareState; firstJob: NewJob }> {
   const { repo, number } = parseIssueUrl(input.issueUrl);
   const issue = await deps.host.getIssue(repo, number);
-  if (issue.state !== 'open') throw new Error(`issue ${repo}#${number} is closed`);
-  if (issue.body.trim() === '') throw new Error(`issue ${repo}#${number} has an empty body`);
+  if (issue.state !== 'open') throw new SubmitRejectedError(`issue ${repo}#${number} is closed`);
+  if (issue.body.trim() === '') throw new SubmitRejectedError(`issue ${repo}#${number} has an empty body`);
   const missing = missingSections(issue.body, deps.config.requiredSections);
   if (missing.length > 0) {
-    throw new Error(`issue ${repo}#${number} is missing required section(s): ${missing.join(', ')}`);
+    throw new SubmitRejectedError(`issue ${repo}#${number} is missing required section(s): ${missing.join(', ')}`);
   }
   const profile = issue.labels.includes(PROFILE_AUTOMATIC_LABEL) ? 'automatic' : deps.config.defaultProfile;
   deps.policies.match('execute', issue.labels);
