@@ -54,6 +54,13 @@ export class Intake {
   async pass(stop: () => boolean = () => false): Promise<boolean> {
     const { host, config, stderr } = this.deps;
     let failed = false;
+    let open: string[];
+    try {
+      open = [...this.deps.openSubjects()];
+    } catch (e) {
+      stderr(`error: ${message(e)}`);
+      return true;
+    }
     for (const repo of config.repos) {
       if (stop()) break;
       try {
@@ -65,14 +72,14 @@ export class Intake {
           continue;
         }
         this.lastLine.delete(`${repo}#draining`);
-        const decisions = planIntake(issues, this.deps.openSubjects(), { ...config, repo });
+        const decisions = planIntake(issues, open,{ ...config, repo });
         for (const d of decisions) {
           if (stop()) break;
           const issue = issues.find((i) => i.number === d.number)!;
           const key = `${repo}#${d.number}`;
           try {
             if (d.decision === 'enqueue') {
-              await this.enqueue(repo, issue);
+              if (await this.enqueue(repo, issue)) open.push(key);
             } else {
               this.note(key, `${key} ${d.decision} ${d.reason}`);
               // A chain exists but the label swap failed earlier: retry the acknowledgement.
@@ -95,18 +102,25 @@ export class Intake {
     await this.deps.host.setLabels(repo, n, [QUEUED_LABEL], [this.deps.config.readyLabel]);
   }
 
-  private async enqueue(repo: string, issue: Issue): Promise<void> {
+  /** Returns whether a new chain was created. */
+  private async enqueue(repo: string, issue: Issue): Promise<boolean> {
     const { kernel, engine, stdout } = this.deps;
     const key = `${repo}#${issue.number}`;
+    let created = false;
     try {
       const { chain, job } = await kernel.enqueue(engine, { issueUrl: `https://github.com/${repo}/issues/${issue.number}` });
+      created = true;
       this.lastLine.delete(key);
       stdout(`${key} enqueued chain ${chain.id} job ${job.id}`);
     } catch (e) {
-      if (e instanceof SubmitRejectedError || e instanceof NoPolicyError || e instanceof AmbiguousMatchError) return this.reject(repo, issue, e);
+      if (e instanceof SubmitRejectedError || e instanceof NoPolicyError || e instanceof AmbiguousMatchError) {
+        await this.reject(repo, issue, e);
+        return false;
+      }
       if (!(e instanceof DuplicateChainError)) throw e;
     }
     await this.acknowledge(repo, issue.number);
+    return created;
   }
 
   private async reject(repo: string, issue: Issue, e: Error): Promise<void> {
