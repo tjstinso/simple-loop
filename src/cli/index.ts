@@ -1,5 +1,7 @@
 import { parseArgs } from 'node:util';
-import { DEFAULT_HOST, DEFAULT_PORT, isLoopback, startDashboard } from '../dashboard/server.js';
+import { existsSync, unwatchFile, watchFile } from 'node:fs';
+import { resolve } from 'node:path';
+import { DEFAULT_HOST, DEFAULT_PORT, isLoopback, startDashboard, type ConfigWatcher } from '../dashboard/server.js';
 import { openReadOnlyDb } from '../kernel/db.js';
 import { listDeadLetters } from '../kernel/dlq.js';
 import { recentEvents, type EventRow } from '../kernel/events.js';
@@ -22,7 +24,7 @@ import { routeEngine } from '../router/router.js';
 import { planIntake } from '../intake/plan.js';
 import { Intake, runIntakeLoop } from '../intake/loop.js';
 import { redactSecrets } from '../engines/software/secret-scan.js';
-import { loadConfig } from './config.js';
+import { DEFAULT_CONFIG_FILE, loadConfig } from './config.js';
 import { buildRuntime, type Runtime } from './runtime.js';
 
 export interface CliDeps {
@@ -468,7 +470,18 @@ async function runDashboard(
   const db = openReadOnlyDb(cfg.dbPath);
   let dash;
   try {
-    dash = await startDashboard({ db, host, port, ...(cfg.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: cfg.maxConcurrentJobs }), ...(cfg.maintenanceMs === undefined ? {} : { maintenanceMs: cfg.maintenanceMs }) });
+    const configFile = resolve(cwd, config ?? DEFAULT_CONFIG_FILE);
+    const configWatcher: ConfigWatcher = {
+      read: () => {
+        if (!existsSync(configFile)) throw new Error(`config ${configFile}: file not found`);
+        return loadConfig(config, cwd).maxConcurrentJobs;
+      },
+      watch: (onChange) => {
+        watchFile(configFile, { interval: 1000 }, onChange);
+        return () => unwatchFile(configFile, onChange);
+      },
+    };
+    dash = await startDashboard({ db, host, port, configWatcher, warn: deps.stderr, ...(cfg.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: cfg.maxConcurrentJobs }), ...(cfg.maintenanceMs === undefined ? {} : { maintenanceMs: cfg.maintenanceMs }) });
   } catch (e) {
     db.close();
     throw e;
