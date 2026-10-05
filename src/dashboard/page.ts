@@ -165,6 +165,7 @@ const SCRIPT = `
       el('span', { class: 'stat' }, el('b', null, s.workers), ' workers alive'),
       el('span', { class: 'stat' }, el('b', null, s.runningJobs), ' running'),
       el('span', { class: 'stat' }, 'slots: ' + s.runningJobs + (data.limits && data.limits.maxConcurrentJobs !== null ? ' of ' + data.limits.maxConcurrentJobs : ' (no limit)')),
+      data.draining ? el('span', { class: 'stat' }, el('b', null, 'DRAINING (' + s.runningJobs + ' job(s) still running)')) : null,
       el('span', { class: 'stat' }, el('b', null, s.waitingOnPerson), ' waiting on a person'),
       el('span', { class: 'muted' }, 'total cost ' + money(data.totalCostUsd)),
       el('span', { class: 'muted' }, 'last refresh ' + (lastOk ? clock(lastOk) : 'never')));
