@@ -459,7 +459,7 @@ describe('software engine', () => {
       expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
       open(host, 'open');
       expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'none' });
-      expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead', 'findPrByHead', 'listPrFeedback']);
+      expect(host.calls.map((c) => c.method)).toEqual(['findPrByHead', 'findPrByHead', 'getChecks', 'listPrFeedback']);
     });
 
     it.each([undefined, 429, 503])('treats host error status %s as transient', async (status) => {

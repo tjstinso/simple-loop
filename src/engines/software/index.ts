@@ -432,14 +432,14 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
   }
 
   /**
-   * The waiting chain's pull request still has the commit the chain pushed, and the required checks of
-   * exactly that commit failed: starts a CI round (the agent gets the failing checks and the end of
+   * The waiting chain's pull request has checks pending or failing: starts a CI round (the agent gets the failing checks and the end of
    * their logs) unless the CI breaker or the chain budget holds it back. Null when there is nothing to do:
-   * checks pending, passing or absent, another head, or a transient host failure (retried next pass).
+   * checks pending, passing or absent, or a transient host failure (retried next pass). Reads checks on the current PR head,
+   * whether it is the commit the chain pushed or a newer commit a person pushed.
    * Merging stays with GitHub's branch protection; nothing here blocks or performs a merge.
    */
   async function reconcileCi(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
-    if (s.phase !== 'awaiting_merge' || !s.lastPushedSha || pr.headSha !== s.lastPushedSha) return null;
+    if (s.phase !== 'awaiting_merge') return null;
     const event = (kind: string, detail: Record<string, unknown>) =>
       recordEvent(deps.db, { at: deps.now(), chainId, kind, engine: 'software', detail });
     let status;

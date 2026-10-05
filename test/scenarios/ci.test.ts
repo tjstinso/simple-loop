@@ -111,7 +111,7 @@ describe('revising the pull request when required checks fail', () => {
     expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
   });
 
-  it('ignores failing checks of another commit and never reads checks for a head the chain did not push', async () => {
+  it('reads checks on the current PR head, whether factory-pushed or person-pushed', async () => {
     const h = harness();
     const { chain, head } = await awaitingMerge(h);
     h.host.setChecks('0000000aaaa', [failure('old')]);
@@ -120,12 +120,13 @@ describe('revising the pull request when required checks fail', () => {
     expect(h.host.calls.filter((c) => c.method === 'getChecks').map((c) => c.args[1])).toEqual([head]);
 
     // A person pushed: the head is not the commit the chain pushed.
-    h.host.headShaOf = () => '1111111bbbb';
-    h.host.setChecks('1111111bbbb', [failure('theirs')]);
+    const personHead = '1111111bbbb';
+    h.host.headShaOf = () => personHead;
+    h.host.setChecks(personHead, [failure('theirs')]);
     h.host.calls.length = 0;
     await h.maintain();
-    expect(h.host.calls.filter((c) => c.method === 'getChecks')).toEqual([]);
-    expect(executes(h, chain.id)).toHaveLength(1);
+    expect(h.host.calls.filter((c) => c.method === 'getChecks').map((c) => c.args[1])).toEqual([personHead]);
+    expect(executes(h, chain.id)).toHaveLength(2);
   });
 
   it('a failure that disappears (a re-run passed) starts nothing', async () => {
