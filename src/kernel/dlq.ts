@@ -124,7 +124,8 @@ export function markDeadLetterSurfaced(db: Db, id: number, now: number): void {
 /**
  * Re-queue the dead-lettered job in place (the unique (chain_id, type, attempt)
  * index forbids a new row): status queued, error/claim/lease cleared, delivery
- * kept so the next claim gets delivery + 1. `result` is cleared unless the
+ * kept so the next claim gets delivery + 1. The transient-retry backoff is
+ * reset (`transient_retries` 0, `available_at` cleared). `result` is cleared unless the
  * reason was effect_error, so post-processing resumes without rerunning the
  * runner. The chain returns to active. Refuses a resolved dead letter or a
  * chain that is no longer dead_lettered (e.g. cancelled).
@@ -146,6 +147,7 @@ export function retryDeadLetter(db: Db, jobId: number, now: number): Job {
         `UPDATE jobs
             SET status = 'queued', error = NULL, claimed_by = NULL, lease_expires_at = NULL,
                 result = CASE WHEN ? = 'effect_error' THEN result ELSE NULL END,
+                transient_retries = 0, available_at = NULL,
                 updated_at = ?
           WHERE id = ?`,
       ).run(dl.reason, now, jobId);
