@@ -6,6 +6,7 @@ import { run, type CliDeps } from '../../src/cli/index.js';
 import type { Runtime } from '../../src/cli/runtime.js';
 import { GitHostError } from '../../src/engines/software/github.js';
 import { LABEL_DEAD_LETTER } from '../../src/engines/software/index.js';
+import type { Worker, WorkerOptions } from '../../src/kernel/worker-loop.js';
 import { ISSUE_BODY, makeHarness, ok, REPO, type Harness } from '../support/harness.js';
 
 const url = (n: number) => `https://github.com/${REPO}/issues/${n}`;
@@ -434,6 +435,32 @@ describe('factory cli', () => {
     handlers.get('SIGTERM')!();
     expect(await exit).toBe(0);
     expect(out).toContain('worker w-test stopped');
+  });
+
+  describe('worker passes maintenanceMs from the runtime to startWorker', () => {
+    async function startedWith(maintenanceMs?: number) {
+      const { deps } = setup();
+      const calls: WorkerOptions[] = [];
+      const kernel = {
+        ...deps.runtime!.kernel,
+        startWorker: (o?: WorkerOptions) => {
+          calls.push(o ?? {});
+          return { id: 'w-spy', done: Promise.resolve(), stop: async () => {} } as unknown as Worker;
+        },
+      } as Runtime['kernel'];
+      const runtime: Runtime = { ...deps.runtime!, kernel, ...(maintenanceMs === undefined ? {} : { maintenanceMs }) };
+      expect(await run(['worker', '--id', 'w-spy'], { ...deps, runtime })).toBe(0);
+      expect(calls).toHaveLength(1);
+      return calls[0]!;
+    }
+
+    it('forwards a configured maintenanceMs', async () => {
+      expect(await startedWith(15_000)).toMatchObject({ id: 'w-spy', maintenanceMs: 15_000 });
+    });
+
+    it('omits maintenanceMs when the config does not set it', async () => {
+      expect(await startedWith()).not.toHaveProperty('maintenanceMs');
+    });
   });
 
   it('worker refuses to start when the identity check fails, and starts nothing', async () => {
