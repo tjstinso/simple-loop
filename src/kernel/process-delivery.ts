@@ -139,6 +139,17 @@ export async function processDelivery(
       await engine.surfaceDeadLetter(view, dl);
       markDeadLetterSurfaced(db, dl.id, clock());
     } catch (e) {
+      if (isTransientError(e)) {
+        const text = `surfacing dead letter: ${message(e)}`;
+        const max = Math.max(1, deps.config.maxTransientRetries ?? 8);
+        if ((job.transientRetries ?? 0) < max) {
+          // Put job back to running temporarily to schedule transient retry
+          db.prepare('UPDATE jobs SET status = ? WHERE id = ?').run('running', fence.jobId);
+          const scheduled = scheduleTransientRetry(db, fence, clock(), text);
+          // scheduleTransientRetry already set the job to queued with backoff
+          return scheduled === null ? 'stale' : 'retry_scheduled';
+        }
+      }
       // Left unsurfaced: kernel maintenance retries it (surfacePending).
       report(deps, e, `surfacing the dead letter of job ${job.id}`);
     }
