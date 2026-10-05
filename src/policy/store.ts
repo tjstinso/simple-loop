@@ -6,6 +6,20 @@ import { matchPolicy } from './matcher.js';
 
 export { AmbiguousMatchError, NoPolicyError } from './matcher.js';
 
+/** The label prefix that selects a model for a chain's execute and review runs. */
+export const MODEL_LABEL_PREFIX = 'factory:model:';
+
+/** Which models labels may select: the allowed aliases and the labels that select one by default. */
+export interface ModelSelection {
+  allowed: string[];
+  byLabel: Record<string, string>;
+}
+
+export const DEFAULT_MODEL_SELECTION: ModelSelection = {
+  allowed: ['haiku', 'sonnet'],
+  byLabel: { 'factory:followup': 'haiku' },
+};
+
 export interface NamedPolicy {
   /** The file name without its extension. */
   name: string;
@@ -48,8 +62,11 @@ export class PolicyStore {
   private readonly policies: Policy[];
   private readonly ids = new Map<string, Policy>();
 
-  constructor(policies: Policy[]) {
+  private readonly models: ModelSelection;
+
+  constructor(policies: Policy[], models: ModelSelection = DEFAULT_MODEL_SELECTION) {
     this.policies = policies;
+    this.models = models;
     const defaults = new Map<string, string>();
     for (const p of policies) {
       if (this.ids.has(p.id)) throw new Error(`duplicate policy id '${p.id}'`);
@@ -84,7 +101,42 @@ export class PolicyStore {
     return p;
   }
 
+  /**
+   * The policy for `kind` and `labels`. For a `claude-cli` policy, `config.model` is replaced by the
+   * model the labels choose (a copy: the stored policy is not changed): a `factory:model:<alias>`
+   * label, else the first `models.byLabel` entry whose label is present, else the policy's own.
+   */
   match(kind: string, labels: string[]): Policy {
-    return matchPolicy(this.policies, kind, labels);
+    return this.withModel(matchPolicy(this.policies, kind, labels), labels);
+  }
+
+  /** The stored policy `id`, with the model its chain's `labels` choose (see `match`). */
+  forLabels(id: string, labels: string[]): Policy {
+    return this.withModel(this.byId(id), labels);
+  }
+
+  private withModel(policy: Policy, labels: string[]): Policy {
+    if (policy.runner !== 'claude-cli') return policy;
+    const model = this.chooseModel(labels);
+    if (model === undefined) return policy;
+    const config = typeof policy.config === 'object' && policy.config !== null ? policy.config : {};
+    return { ...policy, config: { ...config, model } };
+  }
+
+  private chooseModel(labels: string[]): string | undefined {
+    const explicit = [...new Set(labels.filter((l) => l.startsWith(MODEL_LABEL_PREFIX)))];
+    if (explicit.length > 1) throw new Error(`multiple model labels: ${explicit.join(', ')}`);
+    if (explicit.length === 1) {
+      const alias = explicit[0]!.slice(MODEL_LABEL_PREFIX.length);
+      if (!this.models.allowed.includes(alias)) {
+        throw new Error(`model "${alias}" is not allowed (allowed: ${this.models.allowed.join(', ')})`);
+      }
+      return alias;
+    }
+    const have = new Set(labels);
+    for (const [label, model] of Object.entries(this.models.byLabel)) {
+      if (have.has(label)) return model;
+    }
+    return undefined;
   }
 }

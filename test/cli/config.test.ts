@@ -36,6 +36,7 @@ describe('loadConfig', () => {
       maxDeliveries: 3,
       maxTransientRetries: 8,
       cloneUrlTemplate: 'https://github.com/{repo}.git',
+      models: { allowed: ['haiku', 'sonnet'], byLabel: { 'factory:followup': 'haiku' } },
     });
   });
 
@@ -232,5 +233,32 @@ describe('intake block', () => {
     [{}],
   ])('rejects %j', (intake) => {
     expect(() => load(intake)).toThrow(/invalid config/);
+  });
+});
+
+describe('models block', () => {
+  const load = (models?: unknown) => {
+    const d = tmp();
+    writeFileSync(join(d, 'factory.config.json'), JSON.stringify(models === undefined ? {} : { models }));
+    return loadConfig(undefined, d).models;
+  };
+
+  it('defaults to haiku and sonnet, with factory:followup on haiku', () => {
+    expect(load()).toEqual({ allowed: ['haiku', 'sonnet'], byLabel: { 'factory:followup': 'haiku' } });
+    expect(load({ allowed: ['haiku', 'opus'] }).byLabel).toEqual({ 'factory:followup': 'haiku' });
+  });
+
+  it('accepts a custom allowlist and map', () => {
+    const models = { allowed: ['haiku', 'opus'], byLabel: { 'size:small': 'haiku', 'size:large': 'opus' } };
+    expect(load(models)).toEqual(models);
+  });
+
+  it('rejects a byLabel value outside allowed, naming the key', () => {
+    expect(() => load({ allowed: ['haiku'], byLabel: { 'size:large': 'opus' } })).toThrow(/models\.byLabel\.size:large/);
+  });
+
+  it('rejects an unknown key and a malformed alias', () => {
+    expect(() => load({ extra: 1 })).toThrow(/models/);
+    expect(() => load({ allowed: ['--bad'] })).toThrow(/models\.allowed/);
   });
 });

@@ -711,6 +711,8 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
 
     workspace,
 
+    policyLabels: (chain) => chain.state.labels,
+
     async buildRunInput(chain, job, ws) {
       const s = chain.state;
       // Transient GitHub failures are retried like the effects' (a final failure dead-letters as runner_error).

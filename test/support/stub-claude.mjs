@@ -13,6 +13,9 @@
 //   noise      print non-JSON lines only, exit 0
 //   no-result  emit assistant events but no result event, exit 0
 //   exit-nonzero  write to stderr and exit 3 with no result event
+//   scripted   append { argv } as a line to STUB_ARGV_FILE, then answer with the entry of the JSON
+//              array STUB_RESULTS whose index is the number of lines already in that file; when
+//              STUB_WRITE_FILE is set and the answer is an execute result, also write that file
 //   orphan     spawn a grandchild that holds stdout open, emit a result, exit 0
 //
 // When STUB_PID_FILE is set, the stub writes {"pid":..,"grandchild":..,"home":..} to it
@@ -20,7 +23,7 @@
 // the removal of the per-run HOME. With STUB_LIST_HOME set, echo mode also reports
 // the entries of HOME and of each XDG_*_HOME directory as `homeEntries`.
 import { spawn } from 'node:child_process';
-import { readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 
 const mode = process.env.STUB_MODE ?? 'echo';
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
@@ -77,6 +80,16 @@ switch (mode) {
     const json = JSON.stringify(payload).replace(/`/g, '\\u0060');
     const text = 'echo done\n```json\n' + json + '\n```';
     out({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
+    out(result(text));
+    break;
+  }
+  case 'scripted': {
+    const file = process.env.STUB_ARGV_FILE;
+    const call = existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).length : 0;
+    appendFileSync(file, JSON.stringify({ argv: process.argv.slice(2) }) + '\n');
+    const text = JSON.parse(process.env.STUB_RESULTS)[call];
+    if (process.env.STUB_WRITE_FILE && text.includes('"status"')) writeFileSync(process.env.STUB_WRITE_FILE, 'stub change\n');
+    out({ type: 'system', subtype: 'init' });
     out(result(text));
     break;
   }

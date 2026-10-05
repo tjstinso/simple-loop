@@ -16,13 +16,15 @@ import { EngineRegistry } from '../../src/kernel/engine-registry.js';
 import { createKernel, type Kernel } from '../../src/kernel/kernel.js';
 import { processDelivery, type DeliveryOutcome } from '../../src/kernel/process-delivery.js';
 import { claimNext, getChain, rowToJob, type JobRow } from '../../src/kernel/queue.js';
+import { registerWorker } from '../../src/kernel/workers.js';
 import { reapExpired, type ReapReport } from '../../src/kernel/reaper.js';
 import type { Chain, ChainView, DeadLetter, Effect, Job, RunEffectContext } from '../../src/kernel/types.js';
 import { runMaintenance } from '../../src/kernel/worker-loop.js';
+import type { Policy } from '../../src/policy/schema.js';
 import { PolicyStore } from '../../src/policy/store.js';
 import { FakeRunner } from '../../src/runner/fake.js';
 import { RunnerRegistry } from '../../src/runner/registry.js';
-import type { RunInput } from '../../src/runner/types.js';
+import type { Runner, RunInput } from '../../src/runner/types.js';
 import { FakeGitHost } from './fake-github.js';
 import { GIT_TEST_ENV, makeRemote, type TempRemote } from './temp-repo.js';
 
@@ -42,6 +44,10 @@ export interface HarnessOptions {
   allowedAuthorAssociations?: string[];
   repos?: Record<string, RepoToolSettings>;
   env?: () => NodeJS.ProcessEnv;
+  /** Replaces the default `fake`-runner policies; pair with `runners` for the runners they name. */
+  policies?: Policy[];
+  /** Registered next to the FakeRunner. */
+  runners?: Runner[];
 }
 
 export interface DeliveryRecord {
@@ -184,13 +190,18 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
       return teardown(c, j, outcome);
     };
 
-    const policies = new PolicyStore([
+    const policies = new PolicyStore(opts.policies ?? [
       { id: 'default-execute', kind: 'execute', match: { labels: [] }, runner: 'fake', config: {}, default: true },
       { id: 'default-review', kind: 'review', match: { labels: [] }, runner: 'fake', config: {}, default: true },
     ]);
     const runner = new FakeRunner();
     const runners = new RunnerRegistry();
     runners.register(runner);
+    for (const extra of opts.runners ?? []) runners.register(extra);
+    // A real runner records its child process against the worker row.
+    if (opts.runners !== undefined) {
+      registerWorker(theDb, { id: 'w1', pid: process.pid, pgid: process.pid, startTime: 0, host: 'harness' }, clock());
+    }
 
     const engine = createSoftwareEngine({
       db: theDb,

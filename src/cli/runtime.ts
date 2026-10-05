@@ -69,7 +69,7 @@ export function buildRuntime(config: FactoryConfig): Runtime {
       shippedPolicies: config.shippedPolicies,
       policyOverrides: config.policyOverrides,
     });
-    const policies = new PolicyStore(effectivePolicies.map((e) => e.policy));
+    const policies = new PolicyStore(effectivePolicies.map((e) => e.policy), config.models);
     const forwarded = passEnvNames(policies.all());
     const gh = config.github;
     const tokenEnv = gh?.tokenEnv;
