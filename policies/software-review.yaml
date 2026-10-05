@@ -11,6 +11,8 @@ config:
   timeoutMs: 900000
   inactivityTimeoutMs: 600000
   resultFormat: json
+  # Spend control: the reviewer reads and judges, so the smaller model is enough.
+  model: haiku
   # Bare mode: `claude --bare`, an allow-listed environment and an empty per-run HOME, so the agent
   # starts with no credentials in its environment or HOME (ssh still finds ~/.ssh). Needs
   # ANTHROPIC_API_KEY in the worker's environment (or a provider's variables in passEnv).

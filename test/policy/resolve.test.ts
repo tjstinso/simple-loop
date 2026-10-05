@@ -2,6 +2,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { EngineRegistry } from '../../src/kernel/engine-registry.js';
+import type { Engine } from '../../src/kernel/types.js';
+import { validatePolicies } from '../../src/policy/validate.js';
+import { ClaudeCliRunner } from '../../src/runner/claude-cli.js';
+import { RunnerRegistry } from '../../src/runner/registry.js';
 import { deepMerge, describePolicy, redactConfig, resolvePolicies, shippedPoliciesDir } from '../../src/policy/resolve.js';
 
 const dirs: string[] = [];
@@ -76,6 +81,22 @@ describe('resolvePolicies', () => {
     expect((find(ps, 'software-review').policy.config as { settingSources: string }).settingSources).toBe('user');
   });
 
+  it('lets policyOverrides change the model and rejects an invalid one at load', () => {
+    const ps = resolvePolicies({ policyOverrides: { 'software-review': { config: { model: 'sonnet' } } } });
+    expect((find(ps, 'software-review').policy.config as { model: string }).model).toBe('sonnet');
+    expect((find(ps, 'software-execute').policy.config as { model: string }).model).toBe('sonnet');
+    const engines = new EngineRegistry();
+    engines.register({ id: 'software', policyKinds: ['execute', 'review'] } as unknown as Engine<any>);
+    const runners = new RunnerRegistry();
+    runners.register(new ClaudeCliRunner());
+    for (const bad of ['-x', 'a b', '', 'a'.repeat(101)]) {
+      const bp = resolvePolicies({ policyOverrides: { 'software-review': { config: { model: bad } } } });
+      expect(() =>
+        validatePolicies(bp.map((x) => x.policy), engines, runners),
+      ).toThrow(/software-review.*model/);
+    }
+  });
+
   it('rejects an override of kind or match, naming the key', () => {
     for (const key of ['kind', 'match']) {
       expect(() => resolvePolicies({ policyOverrides: { 'software-execute': { [key]: 'x' } } })).toThrow(
@@ -105,6 +126,7 @@ describe('describePolicy', () => {
     expect(text).toContain('software-execute source=overridden kind=execute labels=(none)');
     expect(text).toContain('runner: claude-cli');
     expect(text).toContain('"bare": false');
+    expect(text).toContain('"model": "sonnet"');
     expect(text).not.toContain(token);
     expect(text).not.toContain('plain-value');
     expect(text).toContain('[redacted]');

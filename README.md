@@ -448,8 +448,10 @@ Example for an operator with a subscription and no API key (the whole run direct
 
 Two default policies ship:
 
-- `policies/software-execute.yaml` (`software-execute`): tools `Read, Edit, Write, Bash, Glob, Grep`, budget `maxBudgetUsd: 5`, `timeoutMs: 1800000`, `inactivityTimeoutMs: 600000`, `resultFormat: execution`, `bare: true`.
-- `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `bare: true`, `settingSources: user`.
+- `policies/software-execute.yaml` (`software-execute`): tools `Read, Edit, Write, Bash, Glob, Grep`, budget `maxBudgetUsd: 5`, `timeoutMs: 1800000`, `inactivityTimeoutMs: 600000`, `resultFormat: execution`, `model: sonnet`, `bare: true`.
+- `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `model: haiku`, `bare: true`, `settingSources: user`.
+
+The `model` key of the `claude-cli` config (optional, 1 to 100 characters matching `^[A-Za-z0-9][A-Za-z0-9._:\[\]/-]*$`, so it cannot be read as an option) is passed as `--model=<value>`: an alias such as `sonnet`, `haiku` or `opus`, or a full model id. When it is unset the claude CLI's default (or `ANTHROPIC_MODEL`) applies. The shipped defaults are `sonnet` for execute and `haiku` for review; change either without editing a policy file, for example `"policyOverrides": { "software-review": { "config": { "model": "sonnet" } } }`. Rule: every shipped policy must declare a `model` (a test enforces it).
 
 `claude-cli` config fields (`src/runner/claude-cli.ts`):
 

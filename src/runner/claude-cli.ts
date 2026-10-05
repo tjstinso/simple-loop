@@ -24,6 +24,17 @@ const configSchema = z.object({
   resultFormat: z.enum(['execution', 'json']),
   permissionMode: z.string().min(1).optional(),
   /**
+   * Passed as `--model=<value>` (an alias such as `sonnet`, `haiku`, `opus`, or a full model id).
+   * Unset: the CLI default (or `ANTHROPIC_MODEL`) applies. No leading dash or whitespace, so the
+   * value can never be read as another option.
+   */
+  model: z
+    .string()
+    .min(1)
+    .max(100)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._:[\]/-]*$/)
+    .optional(),
+  /**
    * Passed as `--setting-sources` (comma-separated: user, project, local). The review policy sets
    * `user` so the branch under review cannot supply hooks or permission rules through its own
    * `.claude/settings.json`.
@@ -380,6 +391,8 @@ export function buildArgs(cfg: ClaudeCliConfig, prompt: string, claudeMdFile?: s
   // `--allowedTools` is variadic; the `=` form stops it from swallowing the
   // positional prompt. Entries may contain spaces (e.g. `Bash(git *)`).
   if (cfg.allowedTools.length > 0) args.push(`--allowedTools=${cfg.allowedTools.join(',')}`);
+  // One argv element (`=` form), in both modes.
+  if (cfg.model !== undefined) args.push(`--model=${cfg.model}`);
   if (cfg.permissionMode !== undefined) args.push('--permission-mode', cfg.permissionMode);
   if (cfg.settingSources !== undefined) args.push('--setting-sources', cfg.settingSources);
   // `--` keeps a prompt that starts with `-` from being read as an option.
