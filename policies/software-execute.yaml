@@ -54,6 +54,14 @@ config:
     empty array when there are none. "feedbackResponses" is only for feedback items; leave it out
     when there are none.
 
+    "ask" ({"question": "...", "options": ["...", "..."]}, a question of at most 1000 characters and
+    at most 5 options of at most 200 characters) is a last resort: use it only when you cannot
+    continue without a decision that is not in the issue, the feedback or the code (for example two
+    valid ways to resolve a conflict with different behavior). Never ask for something you can find
+    out yourself by reading the code or the history. When you return an "ask", leave your work
+    unfinished and uncommitted: nothing is pushed, a person is asked, and the work resumes with
+    the answer. Leave "ask" out otherwise.
+
     END your final message with exactly one fenced json block, and nothing after it, for example:
 
     ```json

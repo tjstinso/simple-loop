@@ -341,8 +341,9 @@ const countsText = (c: { changed: number; explained: number; declined: number })
 
 /** After the factory's review approved a revision for a human round: one summary comment with the new commit. */
 async function roundSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
-  const { repo, humanRounds, lastCounts } = ctx.chain.state;
-  const round = humanRounds ?? 0;
+  const { repo, attempt, lastCounts } = ctx.chain.state;
+  // Rounds are told apart by the attempt that began them (the counters were replaced by breakers).
+  const round = attempt;
   const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
   if (!pr) throw new EffectError('no PR found for the round summary', 'effect_error');
   const commit = pr.headSha ? `https://github.com/${repo}/commit/${pr.headSha}` : '(unknown)';
@@ -357,8 +358,7 @@ async function roundSummary(ctx: EffectContext, fence: EffectFence): Promise<voi
 
 /** After the factory's review approved a conflict resolution: one comment per round with the new commit. */
 async function conflictSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
-  const { repo, conflictRounds } = ctx.chain.state;
-  const round = conflictRounds ?? 0;
+  const { repo, attempt: round } = ctx.chain.state;
   const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
   if (!pr) throw new EffectError('no PR found for the conflict summary', 'effect_error');
   const sha = pr.headSha.slice(0, 7);
@@ -374,8 +374,7 @@ async function conflictSummary(ctx: EffectContext, fence: EffectFence): Promise<
 
 /** After the factory's review approved a CI fix: one comment per round with the new commit. */
 async function ciSummary(ctx: EffectContext, fence: EffectFence): Promise<void> {
-  const { repo, ciRounds } = ctx.chain.state;
-  const round = ciRounds ?? 0;
+  const { repo, attempt: round } = ctx.chain.state;
   const pr = await ctx.host.findPrByHead(repo, ctx.chain.state.branch);
   if (!pr) throw new EffectError('no PR found for the CI summary', 'effect_error');
   const sha = pr.headSha.slice(0, 7);

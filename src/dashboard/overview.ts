@@ -14,7 +14,7 @@ export const EVENTS_PER_CHAIN = 10;
 export const MAINTENANCE_MS = 60_000;
 export const STALE_CHECK_INTERVALS = 3;
 
-export type WaitingKind = 'worker' | 'running' | 'reviewer' | 'person_merge' | 'person_attention' | 'dead_letter' | 'stuck' | 'none';
+export type WaitingKind = 'worker' | 'running' | 'reviewer' | 'person_merge' | 'person_attention' | 'person_answer' | 'cool_down' | 'dead_letter' | 'stuck' | 'none';
 
 export interface WaitingOn {
   kind: WaitingKind;
@@ -49,6 +49,8 @@ export interface WaitingInput {
   status: string;
   phase: string | null;
   branch: string | null;
+  /** The circuit breakers of the chain (`openUntil` in epoch ms), when its engine has them. */
+  breakers?: Record<string, { openUntil?: number } | undefined>;
   jobs: WaitingJob[];
   /** Worker id -> whether its heartbeat is recent. A worker that is not listed is dead. */
   workerAlive: Record<string, boolean>;
@@ -114,6 +116,16 @@ export function waitingOn(input: WaitingInput): WaitingOn {
       label: 'a worker',
       detail: `${queued.type} job ${queued.id} is queued${retry}${live ? '' : '; no live worker'}`,
     };
+  }
+  if (input.phase === 'needs_input') {
+    return { ...base, kind: 'person_answer', label: 'an answer to a question', detail: 'the factory asked a question on the pull request and waits for an answer', since: input.waitingSince };
+  }
+  const cooling = Object.entries(input.breakers ?? {})
+    .filter(([, b]) => b?.openUntil !== undefined && b.openUntil > now)
+    .sort((a, b) => a[1]!.openUntil! - b[1]!.openUntil!)[0];
+  if (cooling !== undefined) {
+    const until = new Date(cooling[1]!.openUntil!).toISOString();
+    return { ...base, kind: 'cool_down', label: `cool-down (${cooling[0]}, until ${until})`, detail: `the ${cooling[0]} circuit breaker is open until ${until}`, since: input.waitingSince };
   }
   if (input.phase === 'awaiting_merge') {
     const pr = input.branch === null ? 'the pull request' : `the pull request for ${input.branch}`;
@@ -310,6 +322,7 @@ export function buildOverview(
         status: c.status,
         phase,
         branch,
+        breakers: (state.breakers ?? undefined) as WaitingInput['breakers'],
         jobs: jobRows.map((j, i) => ({
           id: j.id, type: j.type, attempt: j.attempt, status: j.status, workerId: j.claimed_by,
           leaseExpiresAt: j.lease_expires_at, startedAt: jobs[i]!.startedAt, createdAt: j.created_at,

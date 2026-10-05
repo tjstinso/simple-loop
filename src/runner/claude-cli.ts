@@ -68,6 +68,8 @@ export interface ExecutionResult {
   followups?: { title: string; body: string }[];
   /** Passed through unchecked; the engine validates it against the feedback round. */
   feedbackResponses?: unknown;
+  /** Passed through unchecked; the engine's result schema validates it. */
+  ask?: unknown;
 }
 
 export interface ClaudeCliRunnerOptions {
@@ -155,6 +157,7 @@ const blockSchema = z.object({
   summary: z.string().optional(),
   followups: z.array(z.object({ title: z.string(), body: z.string() })).optional(),
   feedbackResponses: z.unknown().optional(),
+  ask: z.unknown().optional(),
 });
 
 function abortError(): Error {
@@ -437,6 +440,7 @@ function buildResult(cfg: ClaudeCliConfig, o: Outcome): unknown {
   if (cost !== undefined) result.costUsd = cost;
   if (fromBlock?.followups !== undefined) result.followups = fromBlock.followups;
   if (fromBlock?.feedbackResponses !== undefined) result.feedbackResponses = fromBlock.feedbackResponses;
+  if (fromBlock?.ask !== undefined) result.ask = fromBlock.ask;
   return result;
 }
 

@@ -37,9 +37,22 @@ export const FeedbackResponseSchema = z.object({
 });
 export type FeedbackResponse = z.infer<typeof FeedbackResponseSchema>;
 
+export const ASK_QUESTION_MAX = 1000;
+export const ASK_OPTIONS_MAX = 5;
+export const ASK_OPTION_MAX = 200;
+
+/** A question the agent cannot continue without an answer to: the chain waits for a person. */
+export const AskSchema = z.object({
+  question: z.string().min(1).max(ASK_QUESTION_MAX),
+  options: z.array(z.string().max(ASK_OPTION_MAX)).max(ASK_OPTIONS_MAX).optional(),
+});
+export type Ask = z.infer<typeof AskSchema>;
+
 export const ExecutionResultSchema = z.object({
   status: z.enum(['ok', 'error']),
   summary: z.string(),
+  /** Set instead of finishing the work: no push, the engine raises the ask and the chain waits. */
+  ask: AskSchema.optional(),
   costUsd: z.number().optional(),
   /** Set by the engine when verification ran: verify rounds used and the time verification took. */
   verifyRounds: z.number().optional(),

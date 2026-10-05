@@ -121,6 +121,18 @@ export async function processDelivery(
   const view: ChainView<any> = parsed.success ? { ...rawView, state: parsed.data } : rawView;
 
   const fail = async (reason: DeadLetterReason, error: string): Promise<DeliveryOutcome> => {
+    if (reason === 'runner_error' && engine.absorbFailure && parsed.success) {
+      try {
+        const absorbed = await engine.absorbFailure(view, job, reason, error);
+        if (absorbed !== null) {
+          commitTransition(db, fence, { chainId: view.id, engineState: absorbed, chainStatus: 'waiting', newJobs: [] }, clock());
+          return 'succeeded';
+        }
+      } catch (e) {
+        if (e instanceof StaleDeliveryError) return 'stale';
+        report(deps, e, `absorbing the failure of job ${job.id}`);
+      }
+    }
     const dl = deadLetterFenced(reason, error);
     if (dl === 'stale') return 'stale';
     try {

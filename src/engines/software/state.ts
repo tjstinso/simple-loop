@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import { BreakersSchema } from './breaker.js';
 
-export const PhaseSchema = z.enum(['executing', 'reviewing', 'awaiting_merge', 'needs_human', 'merged']);
+export const PhaseSchema = z.enum(['executing', 'reviewing', 'awaiting_merge', 'needs_human', 'needs_input', 'merged']);
 export type Phase = z.infer<typeof PhaseSchema>;
 
 /** One answer to a feedback item that still has to be posted (and its thread resolved). */
@@ -18,7 +19,7 @@ export const PendingReplySchema = z.object({
 });
 export type PendingReply = z.infer<typeof PendingReplySchema>;
 
-export const SoftwareStateSchema = z.object({
+const SoftwareStateObject = z.object({
   repo: z.string(),
   issueNumber: z.number().int(),
   labels: z.array(z.string()),
@@ -30,22 +31,45 @@ export const SoftwareStateSchema = z.object({
   prNumber: z.number().int().min(1).optional(),
   /** ISO time up to which people's pull request feedback was handled (initially: when the PR was opened). */
   feedbackHandledAt: z.string().optional(),
-  /** Feedback rounds started by people (absent: 0); counted apart from the factory's own review attempts. */
+  /** Legacy (migrated away when a state is read): lifetime counter of feedback rounds. */
   humanRounds: z.number().int().min(0).optional(),
+  /** True while the round being worked (or reviewed) answers a person's feedback. */
+  humanActive: z.boolean().optional(),
+  /** `feedbackHandledAt` before the current human round began: restored when the round fails, so the feedback is seen again. */
+  feedbackBefore: z.string().optional(),
   /** `attempt` when the current human round began (absent: 0): the automated retry budget counts from here. */
   attemptBase: z.number().int().min(0).optional(),
-  /** Conflict rounds started for this chain (absent: 0); counted apart from review attempts and human rounds. */
+  /** Legacy (migrated away): lifetime counter of conflict rounds. */
   conflictRounds: z.number().int().min(0).optional(),
   /** True while the round being worked (or reviewed) resolves a merge conflict with the base branch. */
   conflictActive: z.boolean().optional(),
-  /** True once the factory handed the conflict to a person (limit reached or not resolvable by the agent). */
+  /** Legacy (migrated away, cleared): the sticky flag of a conflict handed to a person. */
   conflictGaveUp: z.boolean().optional(),
   /** The commit the chain last pushed to its branch; CI is read for exactly this head. */
   lastPushedSha: z.string().optional(),
-  /** CI rounds started for this chain (absent: 0); counted apart from review attempts, human and conflict rounds. */
+  /** Legacy (migrated away): lifetime counter of CI rounds. */
   ciRounds: z.number().int().min(0).optional(),
   /** True while the round being worked (or reviewed) fixes failing CI checks. */
   ciActive: z.boolean().optional(),
+  /** True once a CI round was approved and the checks of the pushed head are still to be seen (pass: success, fail: failure). */
+  ciVerifying: z.boolean().optional(),
+  /** Circuit breakers per failure class (see breaker.ts). */
+  breakers: BreakersSchema.optional(),
+  /** A round the reviewer rejected while its breaker was open: retried when the cool-down passed. */
+  pendingFix: z.object({ cls: z.enum(['conflict', 'ci', 'human', 'review']), feedback: z.string() }).optional(),
+  /** The open question the chain waits for an answer to (phase `needs_input`). */
+  ask: z
+    .object({
+      id: z.string(),
+      question: z.string(),
+      reason: z.string(),
+      class: z.string().optional(),
+      /** ISO time the ask was raised: answers are comments, reviews and pushes after it. */
+      at: z.string(),
+    })
+    .optional(),
+  /** The chain's recorded cost when its budget was last acknowledged by an answer (the budget counts from here). */
+  costBaseUsd: z.number().optional(),
   /** The agent's summary of the latest execute (capped), for the human round's summary comment. */
   lastSummary: z.string().optional(),
   /** Answers to a round's feedback items not posted yet (a failed reply is retried by maintenance). */
@@ -56,4 +80,15 @@ export const SoftwareStateSchema = z.object({
   lastCounts: z.object({ changed: z.number().int(), explained: z.number().int(), declined: z.number().int() }).optional(),
 });
 
-export type SoftwareState = z.infer<typeof SoftwareStateSchema>;
+/**
+ * The lifetime counters and the sticky `conflictGaveUp` flag were replaced by breaker states: a state
+ * with the old fields is read with the counters dropped and the flag cleared (accepted for one release).
+ */
+function migrate<T extends { conflictRounds?: unknown; ciRounds?: unknown; humanRounds?: unknown; conflictGaveUp?: unknown }>(s: T) {
+  const { conflictRounds: _c, ciRounds: _i, humanRounds: _h, conflictGaveUp: _g, ...rest } = s;
+  return rest;
+}
+
+export const SoftwareStateSchema = SoftwareStateObject.transform(migrate);
+
+export type SoftwareState = Omit<z.infer<typeof SoftwareStateObject>, 'conflictRounds' | 'ciRounds' | 'humanRounds' | 'conflictGaveUp'>;

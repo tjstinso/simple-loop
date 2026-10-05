@@ -223,8 +223,9 @@ describe('conflict rounds', () => {
     });
     await h.maintain();
     await h.runUntilIdle();
-    expect(h.chain(chain.id).status).toBe('dead_lettered');
-    expect(h.deadLetters()[0]!.error).toContain('commit validation failed (conflict_commit)');
+    // The refused round is a failure of the conflict class: no dead letter, the chain waits.
+    expect(h.deadLetters()).toEqual([]);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { breakers: { conflict: { consecutiveFailures: 1 } } } });
     expect(h.remoteHead(BRANCH)).toBe(before);
   });
 

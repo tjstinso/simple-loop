@@ -64,7 +64,7 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     expect(await h.maintain()).toEqual([]);
     expect(h.chain(chain.id)).toMatchObject({
       status: 'active',
-      state: { phase: 'executing', attempt: 2, attemptBase: 1, conflictRounds: 1, conflictActive: true },
+      state: { phase: 'executing', attempt: 2, attemptBase: 1, conflictActive: true },
     });
     // A second pass does not start a second round for the same conflict.
     await h.maintain();
@@ -81,7 +81,7 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     expect(input.feedback).toContain('Do not reformat unrelated code');
 
     await h.runUntilIdle();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', conflictRounds: 1 } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
     expect(h.chain(chain.id).state.conflictActive).toBeUndefined();
     // The merge commit has both parents and the push was a fast-forward of the branch.
     const head = h.remoteHead(BRANCH)!;
@@ -92,12 +92,12 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     expect(h.callsOf('review').length).toBeGreaterThanOrEqual(2);
     expect(h.pr(BRANCH)!.labels).toEqual([READY]);
     expect(h.issueLabels(N)).not.toContain(IN_PROGRESS);
-    const comments = prComments(h, pr, 'conflict-round-1');
+    const comments = prComments(h, pr, 'conflict-round-2');
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain(`Resolved conflicts with \`main\` in ${head.slice(0, 7)}`);
     expect(eventKinds(h, chain.id)).toEqual(expect.arrayContaining(['conflict.detected', 'conflict.resolved']));
     const detected = chainEvents(h.db, chain.id).find((e) => e.kind === 'conflict.detected')!;
-    expect(detected.detail).toEqual({ baseBranch: 'main', round: 1, paths: 1 });
+    expect(detected.detail).toEqual({ baseBranch: 'main', round: 2, paths: 1 });
   });
 
   it('refuses leftover conflict markers and publishes nothing', async () => {
@@ -110,15 +110,12 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     await h.maintain();
     await h.runUntilIdle();
 
-    expect(h.chain(chain.id).status).toBe('dead_lettered');
-    expect(h.deadLetters()).toEqual([
-      expect.objectContaining({
-        reason: 'runner_error',
-        error: 'refusing to push: conflict markers remain in README.md',
-      }),
-    ]);
+    // A refused push is a failure of the conflict class, not a dead letter: the chain waits.
+    expect(h.deadLetters()).toEqual([]);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', breakers: { conflict: { consecutiveFailures: 1, opens: 0 } } } });
+    expect(eventKinds(h, chain.id)).toContain('round.failed');
     expect(h.remoteHead(BRANCH)).toBe(before);
-    expect(prComments(h, pr, 'conflict-round-1')).toHaveLength(0);
+    expect(prComments(h, pr, 'conflict-round-2')).toHaveLength(0);
   });
 
   it('refuses a round whose agent aborted the merge and changed nothing', async () => {
@@ -133,8 +130,8 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     });
     await h.maintain();
     await h.runUntilIdle();
-    expect(h.chain(chain.id).status).toBe('dead_lettered');
-    expect(h.deadLetters()[0]!.error).toContain('the conflict round produced no merge commit');
+    expect(h.deadLetters()).toEqual([]);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { breakers: { conflict: { consecutiveFailures: 1 } } } });
     expect(h.remoteHead(BRANCH)).toBe(before);
   });
 
@@ -148,47 +145,21 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     await h.runUntilIdle();
 
     expect(h.runner.calls.length).toBe(runs);
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human', conflictGaveUp: true } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_input', ask: { reason: 'conflict not resolvable by the agent', class: 'conflict' } } });
     expect(h.issueLabels(N)).toContain(NEEDS_HUMAN);
     expect(h.issueLabels(N)).not.toContain(IN_PROGRESS);
-    expect(prComments(h, pr, 'conflict-gave-up')).toHaveLength(1);
+    expect(h.comments(pr).filter((c) => c.includes('event=ask id='))).toHaveLength(1);
     expect(h.jobs(chain.id).at(-1)).toMatchObject({ type: 'execute', status: 'succeeded' });
     expect(eventKinds(h, chain.id)).toContain('conflict.gave_up');
 
     await h.maintain();
     await h.maintain();
     expect(h.jobs(chain.id).filter((j) => j.type === 'execute')).toHaveLength(2);
-    expect(prComments(h, pr, 'conflict-gave-up')).toHaveLength(1);
+    expect(h.comments(pr).filter((c) => c.includes('event=ask id='))).toHaveLength(1);
   });
 
-  it('stops at maxConflictRounds: needs_human, still waiting, one comment', async () => {
-    const h = harness({ maxConflictRounds: 1 });
-    const { chain, pr } = await awaitingMerge(h);
-    h.remote.commit('main', 'README.md', 'main version\n');
-    h.host.setMergeable(pr, 'conflicting');
-    h.scriptExecute((input, call) => {
-      h.write(input, 'README.md', `resolution ${call}\n`);
-      return ok('resolved');
-    });
-    await h.maintain();
-    await h.runUntilIdle();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', conflictRounds: 1 } });
-
-    // Conflicts again: beyond the limit.
-    h.remote.commit('main', 'README.md', 'main version 2\n');
-    await h.maintain();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'needs_human', conflictRounds: 1 } });
-    await h.maintain();
-    await h.maintain();
-
-    expect(h.jobs(chain.id).filter((j) => j.type === 'execute')).toHaveLength(2);
-    expect(prComments(h, pr, 'conflict-round-limit')).toHaveLength(1);
-    expect(h.issueLabels(N)).toContain(NEEDS_HUMAN);
-    expect(chainEvents(h.db, chain.id).filter((e) => e.kind === 'conflict.gave_up')).toHaveLength(1);
-  });
-
-  it('conflict rounds use up neither the review attempts nor the human rounds', async () => {
-    const h = harness({ maxHumanRounds: 1 });
+  it('a conflict round does not count as a human round', async () => {
+    const h = harness();
     const { chain, pr } = await awaitingMerge(h);
     h.remote.commit('main', 'README.md', 'main version\n');
     h.host.setMergeable(pr, 'conflicting');
@@ -199,7 +170,7 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     await h.maintain();
     await h.runUntilIdle();
     const s = h.chain(chain.id).state;
-    expect(s.humanRounds ?? 0).toBe(0);
+    expect(s.humanActive).toBeFalsy();
     expect(s.attemptBase).toBe(s.attempt - 1);
   });
 
@@ -219,7 +190,7 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     // GitHub finally says it conflicts: a round starts.
     h.host.setMergeable(pr, 'conflicting');
     await h.maintain();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { conflictRounds: 1 } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { conflictActive: true } });
   });
 
   it('leaves a pull request that is only behind its base alone', async () => {
@@ -262,21 +233,21 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     });
     await h.maintain();
     const first = h.jobs(chain.id).filter((j) => j.status === 'queued');
-    expect(first.map((j) => j.payload)).toEqual([{ conflictRound: 1 }]);
-    expect(h.chain(chain.id).state.humanRounds ?? 0).toBe(0);
+    expect(first.map((j) => j.payload)).toEqual([{ conflictRound: 2 }]);
+    expect(h.chain(chain.id).state.humanActive).toBeFalsy();
 
     await h.runUntilIdle();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge', conflictRounds: 1 } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
     h.host.setMergeable(pr, 'mergeable');
     await h.maintain();
-    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { phase: 'executing', humanRounds: 1, conflictActive: false } });
+    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { phase: 'executing', humanActive: true, conflictActive: false } });
     expect(h.jobs(chain.id).filter((j) => j.status === 'queued').map((j) => j.payload)).toEqual([
-      expect.objectContaining({ humanRound: 1 }),
+      expect.objectContaining({ humanRound: 3 }),
     ]);
     await h.runUntilIdle();
     expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
-    expect(prComments(h, pr, 'conflict-round-1')).toHaveLength(1);
-    expect(prComments(h, pr, 'human-round-1')).toHaveLength(1);
+    expect(prComments(h, pr, 'conflict-round-2')).toHaveLength(1);
+    expect(prComments(h, pr, 'human-round-3')).toHaveLength(1);
   });
 
   it('a person who pushes while the round runs makes the push fail, and the retry starts from the new head', async () => {
@@ -296,9 +267,11 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     });
     await h.maintain();
     await h.runOne();
-    expect(h.deadLetters()).toEqual([expect.objectContaining({ reason: 'runner_error', error: expect.stringContaining('remote branch moved by someone else') })]);
+    // The refused push is a failure of the class: the chain waits (no dead letter) and the next pass retries.
+    expect(h.deadLetters()).toEqual([]);
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { breakers: { conflict: { consecutiveFailures: 1 } } } });
+    await h.maintain();
 
-    await h.kernel.retryDeadLetter(h.deadLetters()[0]!.jobId);
     await h.runUntilIdle();
     expect(h.remoteLog(BRANCH)).toContain(personSha);
     expect(h.remoteFile(BRANCH, 'README.md')).toBe('resolved again');

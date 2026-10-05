@@ -61,7 +61,7 @@ describe('answering review comments', () => {
     expect(replies[0]).toContain(`(commit ${sha})`);
     expect(replies[0]).toContain(`<!-- factory:reply comment=${id} -->`);
     expect(h.host.isThreadResolved(h.host.threadOf(pr, id)!)).toBe(true);
-    const summary = h.comments(pr).filter((c) => c.includes('event=human-round-1 -->'));
+    const summary = h.comments(pr).filter((c) => c.includes('event=human-round-2 -->'));
     expect(summary).toHaveLength(1);
     expect(summary[0]).toContain('1 changed, 0 explained, 0 declined');
     expect(summary[0]).toContain(h.remoteHead(BRANCH)!);
@@ -93,7 +93,7 @@ describe('answering review comments', () => {
     expect(replies[0]).toContain('Because the task only needs a marker file.');
     expect(replies[0]).not.toContain('(commit');
     expect(h.host.isThreadResolved(h.host.threadOf(pr, id)!)).toBe(true);
-    const summary = h.comments(pr).filter((c) => c.includes('event=human-round-1 -->'));
+    const summary = h.comments(pr).filter((c) => c.includes('event=human-round-2 -->'));
     expect(summary).toHaveLength(1);
     expect(summary[0]).toContain('0 changed, 1 explained, 0 declined');
     expect(h.comments(pr).some((c) => c.includes('unchanged'))).toBe(false);
@@ -108,7 +108,7 @@ describe('answering review comments', () => {
     await h.runUntilIdle();
     expect(await inlineBodies(h, pr)).toHaveLength(1);
     expect(h.host.isThreadResolved(h.host.threadOf(pr, id)!)).toBe(false);
-    expect(h.comments(pr).find((c) => c.includes('event=human-round-1 -->'))).toContain('0 changed, 0 explained, 1 declined');
+    expect(h.comments(pr).find((c) => c.includes('event=human-round-2 -->'))).toContain('0 changed, 0 explained, 1 declined');
   });
 
   it('replies to a conversation comment with a quoting comment and resolves nothing', async () => {
@@ -281,6 +281,6 @@ describe('resolved threads are not fed back', () => {
     scriptRound(h, [{ id: `comment ${again}`, action: 'changed', reply: 'Added more.' }]);
     await h.maintain();
     expect(h.jobs(chain.id).filter((j) => j.type === 'execute')).toHaveLength(3);
-    expect(h.chain(chain.id).state.humanRounds).toBe(2);
+    expect(h.chain(chain.id).state.humanActive).toBe(true);
   });
 });
