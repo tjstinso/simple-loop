@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { GitHost, Issue } from '../engines/software/github.js';
 import { SubmitRejectedError } from '../engines/software/submit.js';
+import { AmbiguousMatchError, NoPolicyError } from '../policy/store.js';
 import { DuplicateChainError } from '../kernel/queue.js';
 import type { Kernel } from '../kernel/kernel.js';
 import type { IntakeConfig } from '../cli/config.js';
@@ -102,13 +103,13 @@ export class Intake {
       this.lastLine.delete(key);
       stdout(`${key} enqueued chain ${chain.id} job ${job.id}`);
     } catch (e) {
-      if (e instanceof SubmitRejectedError) return this.reject(repo, issue, e);
+      if (e instanceof SubmitRejectedError || e instanceof NoPolicyError || e instanceof AmbiguousMatchError) return this.reject(repo, issue, e);
       if (!(e instanceof DuplicateChainError)) throw e;
     }
     await this.acknowledge(repo, issue.number);
   }
 
-  private async reject(repo: string, issue: Issue, e: SubmitRejectedError): Promise<void> {
+  private async reject(repo: string, issue: Issue, e: Error): Promise<void> {
     const { host, config } = this.deps;
     const key = `${repo}#${issue.number}`;
     const reason = this.deps.redact(e.message);

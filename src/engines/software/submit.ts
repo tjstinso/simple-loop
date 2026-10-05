@@ -12,7 +12,7 @@ export interface SubmitDeps {
   config: { defaultProfile: 'supervised' | 'automatic'; requiredSections: string[] };
 }
 
-/** The issue itself cannot be taken on (closed, empty, a required section missing, no matching policy); retrying cannot help until it changes. */
+/** The issue itself cannot be taken on (closed, empty, a required section missing); retrying cannot help until it changes. */
 export class SubmitRejectedError extends Error {
   constructor(message: string) {
     super(message);
@@ -69,14 +69,10 @@ export async function softwareSubmit(
     throw new SubmitRejectedError(`issue ${repo}#${number} is missing required section(s): ${missing.join(', ')}`);
   }
   const profile = issue.labels.includes(PROFILE_AUTOMATIC_LABEL) ? 'automatic' : deps.config.defaultProfile;
-  try {
-    deps.policies.match('execute', issue.labels);
-    // The review job is matched with the same labels later; an ambiguous or missing review policy must
-    // fail here, not after the agent ran.
-    deps.policies.match('review', issue.labels);
-  } catch (e) {
-    throw new SubmitRejectedError(e instanceof Error ? e.message : String(e));
-  }
+  deps.policies.match('execute', issue.labels);
+  // The review job is matched with the same labels later; an ambiguous or missing review policy must
+  // fail here, not after the agent ran.
+  deps.policies.match('review', issue.labels);
   const state = SoftwareStateSchema.parse({
     repo,
     issueNumber: number,
