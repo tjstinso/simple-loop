@@ -353,6 +353,20 @@ Labels: `factory:ready` (set by a person) marks an issue to take on, `factory:qu
 
 Issues whose author's association is not in `allowedAuthorAssociations` are never enqueued, commented on or relabeled. If `gh` fails for a repository, the other repositories are still processed.
 
+## Maintenance
+
+To update or restart a running factory without losing work:
+
+1. Drain: `factory drain --wait [--timeout <seconds>]`. It stops every worker from claiming new jobs, waits until no job is running, prints `drained` and exits 0. With `--timeout` it gives up with exit 1 and `still draining: <n> job(s) running`, leaving the flag set; run it again, or see below.
+2. Stop the workers (`factory worker`) and the intake (`factory intake`) with SIGINT or SIGTERM. Workers print `worker <id> stopped`; the intake exits 130 or 143.
+3. Make the change, for example pull and rebuild the checkout the workers run (see Install and build).
+4. Start the workers and the intake again.
+5. Resume: `factory resume`. It clears the flag and prints `resumed`; queued jobs are claimed again and the intake enqueues again.
+
+**Stopping without draining.** A worker stopped by SIGINT or SIGTERM aborts its running job and hands it back to the queue. This does not count against `maxDeliveries`, but the next delivery starts in a fresh workspace, so the earlier one is not reused. A job whose agent had already finished can be dead-lettered with `effect 'commit_push' failed: workspace for this delivery is gone; retry will rerun the agent`, and `dlq retry` then runs the agent again, spending its model cost a second time. Prefer draining.
+
+**Failure during maintenance.** The drain flag lives in the database and survives restarts, so workers started while it is set claim nothing until `factory resume`, and a stopped `factory drain --wait` leaves it set. `factory status` ends with `DRAINING (<n> job(s) still running)` while it is set.
+
 ## Dashboard
 
 `factory dashboard [--port <n>] [--host <addr>]` serves a page in the browser that shows where every chain is and who has to act next, so you do not have to combine `status`, `show` and `workers`. It listens on `127.0.0.1:4173` by default and runs until SIGINT or SIGTERM, then shuts down cleanly.
