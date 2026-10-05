@@ -192,8 +192,8 @@ export interface Overview {
   limits: { maxConcurrentJobs: number | null };
   /** The drain flag is set: workers claim nothing new. */
   draining: boolean;
-  /** `workers` counts alive workers only; `aliveWorkers` is an alias kept for one release; `stoppedWorkers` is the total of dead ones. */
-  summary: { workers: number; aliveWorkers: number; stoppedWorkers: number; runningJobs: number; waitingOnPerson: number };
+  /** `workers` counts alive workers only; `stoppedWorkers` is the total of dead ones. */
+  summary: { workers: number; stoppedWorkers: number; runningJobs: number; waitingOnPerson: number };
   openChains: ChainOverview[];
   finishedChains: ChainOverview[];
   totalCostUsd: number;
@@ -249,12 +249,13 @@ function subjectOf(key: string, state: Record<string, unknown>): { repo: string;
   return m ? { repo: m[1]!, issueNumber: Number(m[2]) } : null;
 }
 
-/** The drain flag; false for a database that predates the `control` table. */
-function readDraining(db: Db): boolean {
+/** The drain flag; false for a database that predates the `control` table. Any other error is rethrown. */
+export function readDraining(db: Db): boolean {
   try {
     return isDraining(db);
-  } catch {
-    return false;
+  } catch (e) {
+    if (e instanceof Error && /no such table: control\b/.test(e.message)) return false;
+    throw e;
   }
 }
 
@@ -398,7 +399,6 @@ export function buildOverview(
     draining: readDraining(db),
     summary: {
       workers: aliveWorkers.length,
-      aliveWorkers: aliveWorkers.length,
       stoppedWorkers: deadWorkers.length,
       runningJobs: openChains.reduce((n, c) => n + c.jobs.filter((j) => j.status === 'running').length, 0),
       waitingOnPerson: openChains.filter((c) => c.waitingOn?.kind === 'person_merge' || c.waitingOn?.kind === 'person_attention' || c.waitingOn?.kind === 'dead_letter').length,

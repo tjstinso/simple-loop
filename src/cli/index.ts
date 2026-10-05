@@ -468,7 +468,7 @@ async function runDashboard(
   const db = openReadOnlyDb(cfg.dbPath);
   let dash;
   try {
-    dash = await startDashboard({ db, host, port, ...(cfg.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: cfg.maxConcurrentJobs }) });
+    dash = await startDashboard({ db, host, port, ...(cfg.maxConcurrentJobs === undefined ? {} : { maxConcurrentJobs: cfg.maxConcurrentJobs }), ...(cfg.maintenanceMs === undefined ? {} : { maintenanceMs: cfg.maintenanceMs }) });
   } catch (e) {
     db.close();
     throw e;
