@@ -317,6 +317,29 @@ describe('fenced writes', () => {
     expect(requeueJob(db, 9999)).toBe(false);
   });
 
+  it("requeueJob with why 'worker stopping' counts one transient retry; other reasons do not", () => {
+    const db = mk();
+    const { job } = seed(db, 'a', 1);
+    const d1 = claimNext(db, 'w1', 10, 1000)!;
+    expect(requeueJob(db, job.id, { delivery: d1.delivery, why: 'something else' })).toBe(true);
+    expect(getJob(db, job.id).transientRetries).toBe(0);
+
+    const d2 = claimNext(db, 'w2', 20, 1000)!;
+    expect(requeueJob(db, job.id, { delivery: d2.delivery, why: 'worker stopping' })).toBe(true);
+    expect(getJob(db, job.id)).toMatchObject({ status: 'queued', delivery: 2, transientRetries: 1 });
+    const events = db.prepare(`SELECT detail FROM events WHERE kind = 'job.requeued' ORDER BY id`).all() as { detail: string }[];
+    expect(JSON.parse(events[1]!.detail)).toEqual({ why: 'worker stopping' });
+
+    // Not running: no change.
+    expect(requeueJob(db, job.id, { why: 'worker stopping' })).toBe(false);
+    expect(getJob(db, job.id).transientRetries).toBe(1);
+
+    // Stale delivery: no change.
+    claimNext(db, 'w3', 30, 1000)!;
+    expect(requeueJob(db, job.id, { delivery: d2.delivery, why: 'worker stopping' })).toBe(false);
+    expect(getJob(db, job.id).transientRetries).toBe(1);
+  });
+
   it('requeueJob returns false and changes nothing when the supplied delivery is stale', () => {
     const db = mk();
     const { job } = seed(db, 'a', 1);

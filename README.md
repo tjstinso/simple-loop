@@ -229,7 +229,7 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | `cloneUrlTemplate` | `https://github.com/{repo}.git` | Fetch and push URL; `{repo}` is replaced by `owner/name`. With `github.tokenEnv` it must be an `https://` URL without credentials. |
 | `github` | absent | Optional object: the factory's own GitHub identity, see "Running as its own GitHub identity". `tokenEnv` (variable holding the token), `expectLogin` (the login it must resolve to; required with `tokenEnv`), `commitName` and `commitEmail` (author and committer of factory commits). Without it nothing changes. |
 
-`delivery` counts every claim of the job, including claims after a worker's own stop handed the job back (SIGINT/SIGTERM), and `dlq retry` keeps the counter, so with the default `maxDeliveries` a job that was stopped twice, or retried after two deliveries, is dead-lettered the next time its lease expires. The squash merge method is the default of `GhCliHost`.
+`delivery` counts every claim of the job, but claims after a worker's own stop handed the job back (SIGINT/SIGTERM) are not counted against `maxDeliveries` (they are added to `transient_retries`), and `dlq retry` keeps the counter, so with the default `maxDeliveries` a job retried after two deliveries is dead-lettered the next time its lease expires. The squash merge method is the default of `GhCliHost`.
 
 ## Usage
 
