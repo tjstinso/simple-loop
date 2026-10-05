@@ -257,6 +257,12 @@ export class FakeGitHost implements GitHost {
     this.comments.set(n, [...(this.comments.get(n) ?? []), body]);
   }
 
+  async closeIssue(repo: string, n: number, comment: string): Promise<void> {
+    this.enter('closeIssue', [repo, n, comment]);
+    this.existsOrThrow(n);
+    this.comments.set(n, [...(this.comments.get(n) ?? []), comment]);
+  }
+
   async findIssueByMarker(repo: string, marker: string, label?: string): Promise<number | null> {
     this.enter('findIssueByMarker', [repo, marker, label]);
     const nums = [...this.issues.values()]

@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { FOLLOWUPS_DDL } from '../../../src/engines/software/followups.js';
 import { migrate, openDb } from '../../../src/kernel/db.js';
 import { createSoftwareEngine } from '../../../src/engines/software/index.js';
@@ -409,6 +409,40 @@ describe('software engine', () => {
       const { engine, host } = make();
       open(host, 'merged');
       expect(await engine.reconcile!(waiting())).toEqual({ outcome: 'completed', reason: 'Pull request #9 was merged' });
+    });
+
+    it('afterReconcile closes the issue naming the merged pull request', async () => {
+      const { engine, host } = make();
+      host.addIssue({ number: 7, title: 't', body: 'b', labels: [] });
+      open(host, 'merged');
+      await engine.afterReconcile!(waiting(), { outcome: 'completed', reason: 'Pull request #9 was merged' });
+      expect(host.calls.filter((c) => c.method === 'closeIssue')).toEqual([
+        { method: 'closeIssue', args: [REPO, 7, 'Closed by #9'] },
+      ]);
+    });
+
+    it('afterReconcile does not close the issue when the chain was cancelled', async () => {
+      const { engine, host } = make();
+      host.addIssue({ number: 7, title: 't', body: 'b', labels: [] });
+      open(host, 'closed');
+      await engine.afterReconcile!(waiting(), { outcome: 'cancelled', reason: 'closed without merging' });
+      expect(host.calls.some((c) => c.method === 'closeIssue')).toBe(false);
+    });
+
+    it('afterReconcile warns and succeeds when closing the issue fails', async () => {
+      const { engine, host } = make();
+      host.addIssue({ number: 7, title: 't', body: 'b', labels: [] });
+      open(host, 'merged');
+      host.failNext('closeIssue', new GitHostError('Forbidden', 403));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await expect(
+          engine.afterReconcile!(waiting(), { outcome: 'completed', reason: 'Pull request #9 was merged' }),
+        ).resolves.toBeUndefined();
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it('maps a pull request closed without merging to cancelled', async () => {
