@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { setTimeout } from 'node:timers/promises';
 import { ghAuthEnv, type GithubAuth } from './identity.js';
 
 export interface Issue {
@@ -610,7 +611,7 @@ export class GhCliHost implements GitHost {
   async getChecks(repo: string, sha: string): Promise<ChecksStatus> {
     if (!/^[0-9a-f]{7,64}$/i.test(sha)) throw new GitHostError(`not a commit sha: ${sha.slice(0, 80)}`);
     const MAX_RETRIES = 2;
-    const DELAY_MS = 50;
+    const DELAY_MS = 1000;
     for (let attempt = 1; ; attempt++) {
       try {
         const checks: CheckInfo[] = [];
@@ -630,7 +631,7 @@ export class GhCliHost implements GitHost {
         return { state: summarizeChecks(checks), checks };
       } catch (e) {
         if (e instanceof GitHostError && e.status === 404 && attempt <= MAX_RETRIES) {
-          await new Promise<void>((r) => setTimeout(r, DELAY_MS * attempt));
+          await setTimeout(DELAY_MS * attempt);
         } else {
           throw e;
         }
