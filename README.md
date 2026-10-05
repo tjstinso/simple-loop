@@ -428,6 +428,7 @@ When a chain is queued the software engine posts one short comment on the issue,
 | `factory:dead-letter` | issue | A job failed beyond what the kernel can recover; the factory also comments with the reason, error and job id. Removed by `dlq retry`, `dlq discard`, `cancel`, and the next execute job of a resubmitted issue. |
 | `factory:followup` | new issues | Issues the factory filed from `followups` in agent or reviewer output. Nothing queues them automatically. |
 | `factory:profile:automatic` | issue (set by you, before submit) | Selects the `automatic` profile. |
+| `factory:model:<alias>` | issue (set by you, before submit) | Selects the model for the chain's execute and review runs (`--model=<alias>`). The alias must be in `models.allowed`; more than one distinct model label, or an alias outside the allowlist, rejects the submit. See [Choosing the model by label](#choosing-the-model-by-label). |
 | `factory:engine:<id>` | `--label` value | Router label naming the engine. More than one distinct engine label is an error; an unknown id is an error. |
 
 Labels are set and removed explicitly, never toggled. GitHub creates a label on first use if the repository lacks it.
@@ -476,6 +477,25 @@ Two default policies ship:
 - `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `model: haiku`, `bare: true`, `settingSources: user`.
 
 The `model` key of the `claude-cli` config (optional, 1 to 100 characters matching `^[A-Za-z0-9][A-Za-z0-9._:\[\]/-]*$`, so it cannot be read as an option) is passed as `--model=<value>`: an alias such as `sonnet`, `haiku` or `opus`, or a full model id. When it is unset the claude CLI's default (or `ANTHROPIC_MODEL`) applies. The shipped defaults are `sonnet` for execute and `haiku` for review; change either without editing a policy file, for example `"policyOverrides": { "software-review": { "config": { "model": "sonnet" } } }`. Rule: every shipped policy must declare a `model` (a test enforces it).
+
+### Choosing the model by label
+
+An issue's labels can choose the model of its `claude-cli` runs, so cheap work runs on a cheap model without editing policies. The chain's labels are those of the issue at submit time, so its execute and review jobs always get the same model. The model is chosen in this order:
+
+1. a `factory:model:<alias>` label (for example `factory:model:haiku`);
+2. otherwise the first `models.byLabel` entry, in the key order of the config file, whose label is on the issue (by default `factory:followup` selects `haiku`);
+3. otherwise the policy's own `model` (the shipped `sonnet` for execute and `haiku` for review). Issues without these labels are unchanged.
+
+Anyone who can label an issue can pick a model, so labels may only choose from the operator's allowlist, in the optional `models` block of `factory.config.json` (strict; each alias matches the `model` pattern above):
+
+```json
+"models": {
+  "allowed": ["haiku", "sonnet"],
+  "byLabel": { "factory:followup": "haiku" }
+}
+```
+
+Both keys are shown with their defaults. Every `byLabel` value must be in `allowed`, otherwise the configuration is rejected naming the key (`models.byLabel.<label>`). Policies of other runners are not affected, and `factory policies` still shows the policies as written, not per-issue results. Two different `factory:model:*` labels fail with `multiple model labels: ...`, and an alias outside `allowed` fails with `model "<alias>" is not allowed (allowed: ...)`; both reject the submit (and show in the intake's rejection comment). A full model id cannot be chosen by label, only an allowed alias.
 
 `claude-cli` config fields (`src/runner/claude-cli.ts`):
 

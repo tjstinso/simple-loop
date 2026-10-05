@@ -50,6 +50,32 @@ export const IntakeSchema = z
   .strict();
 export type IntakeConfig = z.infer<typeof IntakeSchema>;
 
+/** The same pattern as the `model` key of the claude-cli config. */
+const ModelAliasSchema = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:[\]/-]*$/);
+
+/** Which models an issue label may select (`factory:model:<alias>` and `byLabel`); an operator allowlist. */
+export const ModelsSchema = z
+  .object({
+    allowed: z.array(ModelAliasSchema).default(['haiku', 'sonnet']),
+    byLabel: z.record(z.string().min(1), ModelAliasSchema).default({ 'factory:followup': 'haiku' }),
+  })
+  .strict()
+  .superRefine((m, ctx) => {
+    for (const [label, model] of Object.entries(m.byLabel)) {
+      if (!m.allowed.includes(model)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['byLabel', label],
+          message: `model "${model}" is not in models.allowed (${m.allowed.join(', ')})`,
+        });
+      }
+    }
+  });
+
 const ConfigSchema = z.object({
   dbPath: z.string().min(1).default('./factory.db'),
   policiesDir: z.string().min(1).optional(),
@@ -83,6 +109,7 @@ const ConfigSchema = z.object({
   cloneUrlTemplate: z.string().min(1).default('https://github.com/{repo}.git'),
   github: GithubSchema.optional(),
   intake: IntakeSchema.optional(),
+  models: ModelsSchema.default({ allowed: ['haiku', 'sonnet'], byLabel: { 'factory:followup': 'haiku' } }),
   repos: z.record(z.string().regex(/^[^/\s]+\/[^/\s]+$/, 'must be owner/name'), RepoToolSchema).optional(),
 }).superRefine((c, ctx) => {
   for (const [name, override] of Object.entries(c.policyOverrides ?? {})) {

@@ -1,5 +1,8 @@
 import { existsSync, readdirSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { ClaudeCliRunner } from '../../src/runner/claude-cli.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { GitHostError } from '../../src/engines/software/github.js';
 import { LABEL_DEAD_LETTER } from '../../src/engines/software/index.js';
@@ -885,5 +888,63 @@ describe('software engine scenarios', () => {
       expect(again.chain.id).not.toBe(chain.id);
       expect(h.chain(again.chain.id).status).toBe('active');
     });
+  });
+});
+
+describe('model selection by label', () => {
+  const STUB = resolve(import.meta.dirname, '../support/stub-claude.mjs');
+
+  it('runs both the execute and the review job with --model=haiku for factory:model:haiku', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'factory-model-'));
+    try {
+      const argvFile = join(dir, 'argv.jsonl');
+      const claude = (id: string, kind: string, model: string) => ({
+        id,
+        kind,
+        match: { labels: [] },
+        runner: 'claude-cli',
+        // Not bare: bare mode would demand a model credential in the environment.
+        config: {
+          prompt: `${kind} the change`,
+          allowedTools: ['Read'],
+          maxBudgetUsd: 1,
+          timeoutMs: 60_000,
+          inactivityTimeoutMs: 60_000,
+          resultFormat: kind === 'execute' ? 'execution' : 'json',
+          model,
+          bare: false,
+        },
+        default: true,
+      });
+      const fence = (obj: unknown) => 'done\n```json\n' + JSON.stringify(obj) + '\n```';
+      const runner = new ClaudeCliRunner({
+        bin: STUB,
+        env: {
+          STUB_MODE: 'scripted',
+          STUB_ARGV_FILE: argvFile,
+          STUB_RESULTS: JSON.stringify([
+            fence({ status: 'ok', summary: 'did it' }),
+            fence({ verdict: 'approve', feedback: 'lgtm' }),
+          ]),
+          STUB_WRITE_FILE: 'stub-change.txt',
+        },
+      });
+      const h = harness({
+        policies: [claude('x', 'execute', 'sonnet'), claude('r', 'review', 'sonnet')],
+        runners: [runner],
+      });
+      await h.submit(N, ['factory:model:haiku']);
+      await h.runUntilIdle();
+      expect(h.deadLetters()).toEqual([]);
+
+      const argvs = readFileSync(argvFile, 'utf8').trim().split('\n').map((l) => (JSON.parse(l) as { argv: string[] }).argv);
+      expect(argvs).toHaveLength(2);
+      for (const argv of argvs) {
+        expect(argv).toContain('--model=haiku');
+        expect(argv).not.toContain('--model=sonnet');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

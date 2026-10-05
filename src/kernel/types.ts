@@ -181,6 +181,11 @@ export interface Engine<S = unknown> {
   /** Everything the runner needs except `config`, which the kernel fills from the job's policy. */
   buildRunInput(chain: ChainView<S>, job: Job, workspace: Workspace): Promise<Omit<RunInput, 'config'>>;
   /**
+   * Optional: the labels the chain's policies are matched with. When present, the kernel applies
+   * the label-chosen model to the job's policy before running it (see `PolicyStore.match`).
+   */
+  policyLabels?(chain: ChainView<S>): string[];
+  /**
    * Optional: called after the runner's result was validated and recorded, in the delivery that ran
    * the runner, before the transition. `rerun(feedback)` runs the runner again in the same workspace
    * with `feedback` and returns the validated result. Returns the result to carry on with (the same

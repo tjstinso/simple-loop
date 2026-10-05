@@ -226,7 +226,8 @@ async function deliver(
     let input: RunInput;
     let runner;
     try {
-      const policy = deps.policies.byId(job.policyId);
+      const labels = engine.policyLabels?.(view);
+      const policy = labels === undefined ? deps.policies.byId(job.policyId) : deps.policies.forLabels(job.policyId, labels);
       runner = deps.runners.get(policy.runner);
       input = { ...(await engine.buildRunInput(view, job, workspace)), config: policy.config };
     } catch (e) {

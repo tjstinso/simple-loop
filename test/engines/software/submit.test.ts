@@ -126,6 +126,15 @@ describe('softwareSubmit', () => {
     await expect(softwareSubmit({ issueUrl: h.url }, h.deps)).rejects.toBe(e);
   });
 
+  it('rejects a disallowed or conflicting model label at submit', async () => {
+    const claude = (id: string, kind: string) => ({ ...policy(id, [], true, kind), runner: 'claude-cli' });
+    const policies = new PolicyStore([claude('x', 'execute'), claude('r', 'review')]);
+    const bad = setup({ labels: ['factory:model:opus'], policies });
+    await expect(softwareSubmit({ issueUrl: bad.url }, bad.deps)).rejects.toThrow('model "opus" is not allowed');
+    const two = setup({ labels: ['factory:model:haiku', 'factory:model:sonnet'], policies });
+    await expect(softwareSubmit({ issueUrl: two.url }, two.deps)).rejects.toThrow(/multiple model labels/);
+  });
+
   it('fails at submit, before any job exists, when no review policy or an ambiguous one matches', async () => {
     const none = setup({ policies: new PolicyStore([policy('p-default', [], true)]) });
     await expect(softwareSubmit({ issueUrl: none.url }, none.deps)).rejects.toBeInstanceOf(NoPolicyError);

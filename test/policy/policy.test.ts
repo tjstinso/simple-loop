@@ -118,3 +118,58 @@ describe('shipped policies', () => {
     expect(prompt).toMatch(/never use `--output`/i);
   });
 });
+
+describe('model selection by label', () => {
+  const claude = (id: string, kind: string, extra: Partial<Policy> = {}): Policy => ({
+    id,
+    kind,
+    match: { labels: [] },
+    runner: 'claude-cli',
+    config: { prompt: 'x', model: kind === 'review' ? 'haiku' : 'sonnet' },
+    default: true,
+    ...extra,
+  });
+  const models = { allowed: ['haiku', 'sonnet'], byLabel: { 'factory:followup': 'haiku', 'size:big': 'sonnet' } };
+  const store = () => new PolicyStore([claude('e', 'execute'), claude('r', 'review')], models);
+  const modelOf = (kind: string, labels: string[]) => (store().match(kind, labels).config as { model?: string }).model;
+
+  it.each([
+    ['no label', 'execute', [], 'sonnet'],
+    ['no label (review keeps its own)', 'review', [], 'haiku'],
+    ['factory:model:haiku', 'execute', ['factory:model:haiku'], 'haiku'],
+    ['factory:model:sonnet on review', 'review', ['factory:model:sonnet'], 'sonnet'],
+    ['factory:followup', 'execute', ['factory:followup'], 'haiku'],
+    ['explicit label wins over byLabel', 'execute', ['factory:followup', 'factory:model:sonnet'], 'sonnet'],
+    ['first byLabel entry in config order wins', 'execute', ['size:big', 'factory:followup'], 'haiku'],
+    ['the same model label twice', 'execute', ['factory:model:haiku', 'factory:model:haiku'], 'haiku'],
+  ])('%s', (_name, kind, labels, model) => {
+    expect(modelOf(kind, labels)).toBe(model);
+  });
+
+  it('rejects two different model labels', () => {
+    expect(() => store().match('execute', ['factory:model:haiku', 'factory:model:sonnet'])).toThrow(
+      /multiple model labels: factory:model:haiku, factory:model:sonnet/,
+    );
+  });
+
+  it('rejects an alias outside the allowlist', () => {
+    expect(() => store().match('execute', ['factory:model:opus'])).toThrow(
+      'model "opus" is not allowed (allowed: haiku, sonnet)',
+    );
+  });
+
+  it('leaves a policy of another runner untouched', () => {
+    const s = new PolicyStore([claude('e', 'execute', { runner: 'fake', config: { model: 'x' } })], models);
+    expect(s.match('execute', ['factory:model:haiku'])).toBe(s.byId('e'));
+  });
+
+  it('sets the model when the policy has none, and never mutates the stored policy', () => {
+    const stored = claude('e', 'execute', { config: { prompt: 'x' } });
+    const before = JSON.stringify(stored);
+    const s = new PolicyStore([stored], models);
+    const got = s.match('execute', ['factory:model:haiku']);
+    expect(got.config).toEqual({ prompt: 'x', model: 'haiku' });
+    expect(s.byId('e')).toBe(stored);
+    expect(JSON.stringify(stored)).toBe(before);
+  });
+});
