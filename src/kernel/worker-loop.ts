@@ -11,6 +11,7 @@ import {
   completeWaitingChain,
   getChain,
   getJob,
+  minAvailableAt,
   recordChainCheck,
   renewLease,
   requeueJob,
@@ -581,7 +582,16 @@ export function startWorker(deps: KernelDeps, opts: WorkerOptions = {}): Worker 
         await runJob(job);
         continue;
       }
-      await sleep(pollMs);
+      let sleepMs = pollMs;
+      try {
+        const earliest = minAvailableAt(db, clock());
+        if (earliest !== null) {
+          sleepMs = Math.min(pollMs, Math.max(0, earliest - clock()));
+        }
+      } catch (e) {
+        report(e);
+      }
+      await sleep(sleepMs);
     }
   };
   void loop().catch((e) => report(e));
