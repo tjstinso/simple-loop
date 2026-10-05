@@ -216,7 +216,7 @@ The build writes to `dist/`. `package.json` declares the `factory` bin as `dist/
 | `policyOverrides` | `{}` (no overrides) | Object keyed by policy name; see "Overriding policy settings". |
 | `workspaceRoot` | `./.factory/workspaces` | Root for the bare repository cache (`.cache/`) and the per-delivery worktrees (`<chainId>/j<jobId>-d<delivery>`). |
 | `defaultEngine` | `software` | Engine used when a submission names none. |
-| `defaultProfile` | `supervised` | `supervised` or `automatic`; used when the issue has no `factory:profile:automatic` label. |
+| `defaultProfile` | `supervised` | `supervised` or `automatic`; used when no profile label selects one (see [Choosing the profile by label](#choosing-the-profile-by-label)). |
 | `requiredSections` | `["## Goal", "## Acceptance criteria"]` | Lines that must appear in the issue body. |
 | `historyRetentionDays` | `30` | Positive number. Age after which exited child-process rows, resolved dead letters and filed follow-up rows are pruned. |
 | `keepWorktreeOnFailure` | `true` | Keep the worktree of a dead-lettered job for debugging. |
@@ -427,7 +427,8 @@ When a chain is queued the software engine posts one short comment on the issue,
 | `factory:needs-human` | issue | The factory raised an ask and waits for a person's answer (a legacy `needs_human` chain also carries it on the PR). |
 | `factory:dead-letter` | issue | A job failed beyond what the kernel can recover; the factory also comments with the reason, error and job id. Removed by `dlq retry`, `dlq discard`, `cancel`, and the next execute job of a resubmitted issue. |
 | `factory:followup` | new issues | Issues the factory filed from `followups` in agent or reviewer output. Nothing queues them automatically: a person labels one `factory:ready` to run it as lightweight work (no required sections). |
-| `factory:profile:automatic` | issue (set by you, before submit) | Selects the `automatic` profile. |
+| `factory:profile:<name>` | issue (set by you, before submit) | Selects the profile (`factory:profile:automatic` or `factory:profile:supervised`). The name must be in `profiles.allowed`; two such labels, or a name outside the allowlist, reject the submit. |
+| `factory:supervised` | issue (set by you, before submit) | Selects the `supervised` profile (no auto-merge; a person merges), via the default `profiles.byLabel`. See [Choosing the profile by label](#choosing-the-profile-by-label). |
 | `factory:model:<alias>` | issue (set by you, before submit) | Selects the model for the chain's execute and review runs (`--model=<alias>`). The alias must be in `models.allowed`; more than one distinct model label, or an alias outside the allowlist, rejects the submit. See [Choosing the model by label](#choosing-the-model-by-label). |
 | `factory:engine:<id>` | `--label` value | Router label naming the engine. More than one distinct engine label is an error; an unknown id is an error. |
 
@@ -479,6 +480,25 @@ Two default policies ship:
 - `policies/software-review.yaml` (`software-review`): tools `Read, Glob, Grep` plus `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git show:*)`, `Bash(git status:*)`, budget `maxBudgetUsd: 2`, `timeoutMs: 900000`, `inactivityTimeoutMs: 600000`, `resultFormat: json`, `model: haiku`, `bare: true`, `settingSources: user`.
 
 The `model` key of the `claude-cli` config (optional, 1 to 100 characters matching `^[A-Za-z0-9][A-Za-z0-9._:\[\]/-]*$`, so it cannot be read as an option) is passed as `--model=<value>`: an alias such as `sonnet`, `haiku` or `opus`, or a full model id. When it is unset the claude CLI's default (or `ANTHROPIC_MODEL`) applies. The shipped defaults are `sonnet` for execute and `haiku` for review; change either without editing a policy file, for example `"policyOverrides": { "software-review": { "config": { "model": "sonnet" } } }`. Rule: every shipped policy must declare a `model` (a test enforces it).
+
+### Choosing the profile by label
+
+An issue's labels can choose its profile, so lightweight or review-gate work can avoid auto-merge without changing `defaultProfile`. The profile is chosen at submit time, in this order:
+
+1. a `factory:profile:<name>` label (for example `factory:profile:automatic`);
+2. otherwise the first `profiles.byLabel` entry, in the key order of the config file, whose label is on the issue (by default `factory:supervised` selects `supervised`);
+3. otherwise `defaultProfile`.
+
+The result must be in the optional `profiles` block of `factory.config.json` (strict; both keys are shown with their defaults, and every `byLabel` value must be in `allowed`):
+
+```json
+"profiles": {
+  "allowed": ["automatic", "supervised"],
+  "byLabel": { "factory:supervised": "supervised" }
+}
+```
+
+Two different `factory:profile:*` labels fail the submit with `multiple profile labels: ...`, and a profile outside `allowed` with `profile "<name>" is not allowed`.
 
 ### Choosing the model by label
 

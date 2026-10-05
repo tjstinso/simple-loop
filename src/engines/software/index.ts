@@ -60,6 +60,8 @@ export interface SoftwareEngineDeps {
   db: Database.Database;
   config: {
     defaultProfile: 'supervised' | 'automatic';
+    /** Which profiles issue labels may select (default: both, `factory:supervised` selects `supervised`). */
+    profiles?: { allowed: string[]; byLabel: Record<string, string> };
     requiredSections: string[];
     /** Filed followup rows older than this are pruned (default 30). */
     historyRetentionDays?: number;
