@@ -2,6 +2,7 @@ import { hostname } from 'node:os';
 import type Database from 'better-sqlite3';
 import { chainEvents, type EventRow } from './events.js';
 import { costOf } from './queue.js';
+import { readProcessStartTime } from '../util/proc.js';
 
 type Db = Database.Database;
 
@@ -144,6 +145,8 @@ export interface LivenessProbe {
   host?: string;
   heartbeatMs?: number;
   pidExists?: (pid: number) => boolean;
+  /** Start time (clock ticks since boot) of a pid, null when unreadable. */
+  readStartTime?: (pid: number) => number | null;
 }
 
 /**
@@ -152,11 +155,16 @@ export interface LivenessProbe {
  * probed, so it is alive while its heartbeat is younger than twice the heartbeat interval.
  */
 export function isWorkerAlive(
-  w: { pid: number; host: string; last_seen_at: number },
+  w: { pid: number; host: string; last_seen_at: number; process_start_time?: string | null },
   now: number,
   probe: LivenessProbe = {},
 ): boolean {
-  if (w.host === (probe.host ?? hostname())) return (probe.pidExists ?? pidExists)(w.pid);
+  if (w.host === (probe.host ?? hostname())) {
+    // A recorded start time guards against pid reuse: a different (or unreadable) start time is dead.
+    const recorded = w.process_start_time ? Number(w.process_start_time) : 0;
+    if (recorded !== 0) return (probe.readStartTime ?? readProcessStartTime)(w.pid) === recorded;
+    return (probe.pidExists ?? pidExists)(w.pid);
+  }
   return now - w.last_seen_at < 2 * (probe.heartbeatMs ?? HEARTBEAT_MS);
 }
 
@@ -176,6 +184,7 @@ export function listWorkerViews(db: Db, now: number, probe: LivenessProbe = {}):
     pid: number;
     host: string;
     last_seen_at: number;
+    process_start_time: string | null;
     current_job_id: number | null;
     current_delivery: number | null;
   }[];

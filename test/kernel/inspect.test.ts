@@ -30,4 +30,24 @@ describe('isWorkerAlive', () => {
     expect(isWorkerAlive({ pid: process.pid, host: here, last_seen_at: 0 }, NOW)).toBe(true);
     expect(isWorkerAlive({ pid: 2 ** 22 + 12345, host: here, last_seen_at: NOW }, NOW)).toBe(false);
   });
+
+  it('is dead when the recorded start time differs (reused pid)', () => {
+    const w = { pid: 10, host: here, last_seen_at: NOW, process_start_time: '5000' };
+    expect(isWorkerAlive(w, NOW, { readStartTime: () => 9000, pidExists: exists })).toBe(false);
+  });
+
+  it('is alive when the recorded start time matches', () => {
+    const w = { pid: 10, host: here, last_seen_at: NOW, process_start_time: '5000' };
+    expect(isWorkerAlive(w, NOW, { readStartTime: () => 5000 })).toBe(true);
+  });
+
+  it('is dead when the start time cannot be read', () => {
+    const w = { pid: 10, host: here, last_seen_at: NOW, process_start_time: '5000' };
+    expect(isWorkerAlive(w, NOW, { readStartTime: () => null, pidExists: exists })).toBe(false);
+  });
+
+  it('falls back to the pid probe when no start time was recorded', () => {
+    const w = { pid: 10, host: here, last_seen_at: NOW, process_start_time: '0' };
+    expect(isWorkerAlive(w, NOW, { pidExists: exists })).toBe(true);
+  });
 });

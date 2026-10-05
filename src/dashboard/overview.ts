@@ -267,7 +267,7 @@ export function buildOverview(
 ): Overview {
   const staleCheckMs = STALE_CHECK_INTERVALS * (opts.maintenanceMs ?? MAINTENANCE_MS);
   const workerRows = db.prepare('SELECT * FROM workers ORDER BY id').all() as {
-    id: string; pid: number; host: string; last_seen_at: number; current_job_id: number | null; current_delivery: number | null;
+    id: string; pid: number; host: string; last_seen_at: number; process_start_time: string | null; current_job_id: number | null; current_delivery: number | null;
   }[];
   const workerAlive: Record<string, boolean> = {};
   const allWorkers: WorkerOverview[] = workerRows.map((w) => {
