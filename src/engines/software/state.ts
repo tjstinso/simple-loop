@@ -53,6 +53,8 @@ const SoftwareStateObject = z.object({
   ciActive: z.boolean().optional(),
   /** True once a CI round was approved and the checks of the pushed head are still to be seen (pass: success, fail: failure). */
   ciVerifying: z.boolean().optional(),
+  /** True when a CI round's latest execution had no new commits (used to skip ciVerifying on approval). */
+  ciRoundNoCommits: z.boolean().optional(),
   /** Circuit breakers per failure class (see breaker.ts). */
   breakers: BreakersSchema.optional(),
   /** A round the reviewer rejected while its breaker was open: retried when the cool-down passed. */

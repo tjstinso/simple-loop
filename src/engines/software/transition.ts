@@ -93,8 +93,13 @@ export function softwareTransition(
     }
     const review: NewJob = { type: 'review', attempt: state.attempt, policyKind: 'review', labels, payload: undefined };
     const lastSummary = r.summary.trim().slice(0, SUMMARY_KEPT);
+    const next = { ...state, labels, phase: 'reviewing' as const, lastSummary };
+    // If this execution had no new commits and we're in a CI round, note it for the approval transition.
+    if (state.ciActive && r.status === 'ok' && r.commitCount === 0) {
+      next.ciRoundNoCommits = true;
+    }
     return {
-      engineState: { ...state, labels, phase: 'reviewing', lastSummary },
+      engineState: next,
       chainStatus: 'active',
       newJobs: [review],
       effects: [
@@ -136,7 +141,16 @@ export function softwareTransition(
       // The round succeeded: its class closes. A CI fix only counts once the pushed head's checks pass.
       const succeeded: Breakers = { ...state.breakers, review: onSuccess(), ...(cls === 'ci' || cls === 'review' ? {} : { [cls]: onSuccess() }) };
       settled.breakers = succeeded;
-      if (cls === 'ci') settled.ciVerifying = true;
+      if (cls === 'ci') {
+        // If the CI round had no new commits, the checks are unchanged: complete without waiting for verification.
+        if (state.ciRoundNoCommits) {
+          settled.breakers = { ...settled.breakers, ci: onSuccess() };
+          delete settled.ciRoundNoCommits;
+        } else {
+          settled.ciVerifying = true;
+        }
+      }
+      delete settled.ciRoundNoCommits;
       if (profile.onApprove === 'merge') {
         return {
           // Auto-merge only: GitHub merges once the required checks pass and reconcile completes the chain.

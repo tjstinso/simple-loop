@@ -232,4 +232,37 @@ describe('revising the pull request when required checks fail', () => {
     expect(h.chain(chain.id).state).toMatchObject({ humanActive: true });
     expect(h.chain(chain.id).state.ciActive).toBeFalsy();
   });
+
+  it('completes a CI round with no new commit (reviewer approves unchanged)', async () => {
+    const h = harness();
+    const { chain, head } = await awaitingMerge(h);
+    h.host.setChecks(head, [failure('check (node 22)')]);
+    await h.maintain();
+
+    // Run execute: agent makes changes (writes a file).
+    await h.runOne();
+    expect(h.chain(chain.id).state).toMatchObject({ ciActive: true });
+
+    // Approve the fix (review job).
+    await h.runOne();
+    let s = h.chain(chain.id).state;
+    expect(s).toMatchObject({ phase: 'awaiting_merge', ciVerifying: true });
+
+    // Checks still fail, so another CI round starts. This time, agent makes NO changes.
+    const second = h.remoteHead(BRANCH)!;
+    h.host.setChecks(second, [failure('check (node 24)')]);
+    await h.maintain();
+
+    // Run execute: agent makes no changes (commitCount: 0).
+    h.scriptExecute(() => ({ status: 'ok', summary: 'no changes', commitCount: 0, commits: [] }));
+    await h.runOne();
+
+    // Approve the no-change fix (review job).
+    // The transition should not set ciVerifying when commitCount: 0.
+    await h.runOne();
+    s = h.chain(chain.id).state;
+    expect(s.phase).toBe('awaiting_merge');
+    expect(s.ciActive).toBeFalsy();
+    expect(s.ciVerifying).toBeFalsy();
+  });
 });
