@@ -277,4 +277,31 @@ describe('resolving merge conflicts on a waiting pull request', () => {
     expect(h.remoteFile(BRANCH, 'README.md')).toBe('resolved again');
     expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
   });
+
+  it('rechecks waiting PRs after conflict management changes the base branch', async () => {
+    const h = harness();
+    // Set up a waiting PR with conflicts
+    const { chain, pr } = await awaitingMerge(h);
+    h.remote.commit('main', 'README.md', 'main version\n');
+    h.host.setMergeable(pr, 'conflicting');
+
+    // Start conflict management
+    await h.maintain();
+    expect(h.chain(chain.id)).toMatchObject({ status: 'active', state: { phase: 'executing', conflictActive: true } });
+
+    // During conflict management, the factory's merge would update the base branch
+    // After conflict resolution, other waiting PRs should be rechecked
+    h.scriptExecute((input) => {
+      const readme = readFileSync(join(input.workspace.path, 'README.md'), 'utf8');
+      expect(readme).toContain('<<<<<<< ');
+      h.write(input, 'README.md', 'resolved\n');
+      return ok('resolved');
+    });
+    await h.runUntilIdle();
+
+    expect(h.chain(chain.id)).toMatchObject({ status: 'waiting', state: { phase: 'awaiting_merge' } });
+    // Verify the merge commit was created
+    const head = h.remoteHead(BRANCH);
+    expect(head).not.toBeNull();
+  });
 });

@@ -45,6 +45,8 @@ const SoftwareStateObject = z.object({
   conflictActive: z.boolean().optional(),
   /** Legacy (migrated away, cleared): the sticky flag of a conflict handed to a person. */
   conflictGaveUp: z.boolean().optional(),
+  /** True after a conflict round completes; prevents immediate re-checking to let GitHub compute mergeability (cleared on next reconciliation). */
+  conflictJustResolved: z.boolean().optional(),
   /** The commit the chain last pushed to its branch; CI is read for exactly this head. */
   lastPushedSha: z.string().optional(),
   /** Legacy (migrated away): lifetime counter of CI rounds. */
