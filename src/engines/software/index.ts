@@ -387,8 +387,9 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
    * The waiting chain's pull request stopped being mergeable: starts a conflict round (the base branch
    * is merged into the branch and the agent resolves the conflicts) unless the conflict breaker or the
    * chain budget holds it back. Null when there is nothing to do for conflicts (feedback is looked at next).
+   * If conflictJustResolved is true, skips starting a new conflict round to allow other PRs to settle.
    */
-  async function reconcileConflict(s: SoftwareState, chainId: number, pr: Pr): Promise<ReconcileOutcome<SoftwareState> | null> {
+  async function reconcileConflict(s: SoftwareState, chainId: number, pr: Pr, conflictJustResolved?: boolean): Promise<ReconcileOutcome<SoftwareState> | null> {
     const event = (kind: string, detail: Record<string, unknown>) =>
       recordEvent(deps.db, { at: deps.now(), chainId, kind, engine: 'software', detail });
     if (pr.mergeable === 'mergeable') {
@@ -419,6 +420,10 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
       next = { ...s, unknown_mergeability_attempts: undefined };
       delete next.unknown_mergeability_attempts;
     }
+    // If a conflict round just resolved in the previous pass, skip starting a new conflict round
+    // to let other waiting PRs settle after the base branch changed. This prevents rapidly cycling
+    // through conflict rounds when multiple PRs are affected by a base branch change.
+    if (conflictJustResolved) return null;
     const held = await gate(next, chainId, pr, 'conflict', { budget: true });
     if (held) return held;
     // A new base head after a success is a new problem: it starts a round without counting against the breaker.
@@ -516,7 +521,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         await deps.host.setLabels(s.repo, pr.number, ready, [LABEL_IN_PROGRESS]);
       }
       await deps.host.setLabels(s.repo, s.issueNumber, [], [LABEL_IN_PROGRESS]);
-      throw new HandBackError('nothing conflicts any more', { ...s, phase: 'awaiting_merge', conflictActive: false });
+      throw new HandBackError('nothing conflicts any more', { ...s, phase: 'awaiting_merge', conflictActive: false, conflictJustResolved: true });
     }
     const why = {
       binary: 'a conflicting file is binary',
@@ -1024,7 +1029,12 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
     },
 
     async reconcile(chain) {
-      const s = chain.state;
+      let s = chain.state;
+      // Clear conflictJustResolved flag at the start of reconciliation so it doesn't affect future passes
+      if (s.conflictJustResolved) {
+        s = { ...s };
+        delete s.conflictJustResolved;
+      }
       if (s.phase !== 'awaiting_merge' && s.phase !== 'needs_human' && s.phase !== 'needs_input') return { outcome: 'none' };
       let pr;
       try {
@@ -1043,7 +1053,7 @@ export function createSoftwareEngine(deps: SoftwareEngineDeps): SoftwareEngine {
         if (s.phase === 'needs_input') return reconcileAnswer(s, chain.id, pr);
         const fix = await reconcilePendingFix(s, chain.id, pr);
         if (fix) return fix;
-        const conflict = await reconcileConflict(s, chain.id, pr);
+        const conflict = await reconcileConflict(s, chain.id, pr, chain.state.conflictJustResolved);
         if (conflict) return conflict;
         const ci = await reconcileCi(s, chain.id, pr);
         return ci ?? reconcileFeedback(s, chain.id, pr);
